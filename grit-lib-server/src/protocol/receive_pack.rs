@@ -3,7 +3,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
 
-use async_trait::async_trait;
 use flate2::read::ZlibDecoder;
 use grit_lib::check_ref_format::{check_refname_format, RefNameOptions};
 use grit_lib::objects::{parse_commit, parse_tag, parse_tree, HashAlgo, ObjectId, ObjectKind};
@@ -14,8 +13,11 @@ use time::OffsetDateTime;
 
 use crate::cache::{EventPublisher, InvalidationEvent, InvalidationEventKind};
 use crate::error::{Error, Result};
+use crate::policy::{AuditEvent, AuditSink, PolicyActor, PolicyRefUpdate, RefUpdatePolicyContext};
 use crate::repository::ServerRepository;
 use crate::storage::{ReflogEntry, ServerStorage, StoredObject, StoredRef};
+
+pub use crate::policy::{AllowAllPushPolicy, ProtectedRefPolicy, PushPolicy, PushPolicyContext};
 
 /// Receive-pack capability advertised or requested on the wire.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -187,79 +189,8 @@ pub struct PushPlan {
     pub request: ReceivePackRequest,
     /// Objects decoded into the temporary quarantine.
     pub quarantine: Vec<QuarantinedObject>,
-}
-
-/// Context passed to push policy hooks for one command.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PushPolicyContext {
-    /// Tenant that owns the repository.
-    pub tenant: crate::ids::TenantId,
-    /// Repository being pushed to.
-    pub repository: crate::ids::RepositoryId,
-    /// Ref being updated.
-    pub refname: String,
-    /// Old object id from the client command.
-    pub old_oid: ObjectId,
-    /// New object id from the client command.
-    pub new_oid: ObjectId,
-    /// Derived command kind.
-    pub kind: PushCommandKind,
-}
-
-/// Policy hook used to reject protected or otherwise unauthorized ref updates.
-#[async_trait]
-pub trait PushPolicy: Send + Sync {
-    /// Check whether one receive-pack command may proceed.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::PushPolicyRejected`] or another typed error when the command is not
-    /// allowed.
-    async fn check(&self, context: &PushPolicyContext) -> Result<()>;
-}
-
-/// Push policy that accepts every command.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct AllowAllPushPolicy;
-
-#[async_trait]
-impl PushPolicy for AllowAllPushPolicy {
-    async fn check(&self, _context: &PushPolicyContext) -> Result<()> {
-        Ok(())
-    }
-}
-
-/// Simple protected-ref policy based on exact prefixes.
-#[derive(Clone, Debug, Default)]
-pub struct ProtectedRefPolicy {
-    protected_prefixes: Vec<String>,
-}
-
-impl ProtectedRefPolicy {
-    /// Create a policy that rejects updates to refs matching any prefix in `protected_prefixes`.
-    #[must_use]
-    pub fn new(protected_prefixes: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        Self {
-            protected_prefixes: protected_prefixes.into_iter().map(Into::into).collect(),
-        }
-    }
-}
-
-#[async_trait]
-impl PushPolicy for ProtectedRefPolicy {
-    async fn check(&self, context: &PushPolicyContext) -> Result<()> {
-        if self
-            .protected_prefixes
-            .iter()
-            .any(|prefix| context.refname.starts_with(prefix))
-        {
-            return Err(Error::PushPolicyRejected {
-                refname: context.refname.clone(),
-                reason: "protected ref".to_owned(),
-            });
-        }
-        Ok(())
-    }
+    /// Commit objects introduced by the push pack.
+    pub pushed_commits: Vec<ObjectId>,
 }
 
 /// Per-ref status after applying a push.
@@ -321,7 +252,12 @@ where
     ///
     /// Returns protocol, object closure, fast-forward, ref conflict, policy, backend, or object
     /// parsing errors.
-    pub async fn prepare_push<P>(&self, request: ReceivePackRequest, policy: &P) -> Result<PushPlan>
+    pub async fn prepare_push<P>(
+        &self,
+        request: ReceivePackRequest,
+        actor: &PolicyActor,
+        policy: &P,
+    ) -> Result<PushPlan>
     where
         P: PushPolicy,
     {
@@ -330,11 +266,79 @@ where
         let quarantined = quarantine_map(&quarantine);
         self.verify_closure(&request, &quarantined).await?;
         self.verify_fast_forwards(&request, &quarantined).await?;
-        self.check_policy(&request, policy).await?;
+        let pushed_commits = pushed_commit_ids(&quarantine);
+        let context = self.policy_context(&request, actor, &pushed_commits);
+        self.check_policy(&context, policy).await?;
         Ok(PushPlan {
             request,
             quarantine,
+            pushed_commits,
         })
+    }
+
+    /// Prepare, apply, audit, and run all receive-pack policy hooks for one push.
+    ///
+    /// `actor` is used for authorization, hooks, audit, and reflog identity. `timestamp` is
+    /// supplied by the caller to keep core logic deterministic. `publisher` receives ref
+    /// invalidation events after durable updates, and `audit` records accepted and rejected write
+    /// attempts through an explicit integration.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, authorization, policy, backend, audit, or invalidation publishing
+    /// errors.
+    pub async fn receive_push<P, E, A>(
+        &self,
+        request: ReceivePackRequest,
+        actor: PolicyActor,
+        timestamp: OffsetDateTime,
+        policy: &P,
+        publisher: &E,
+        audit: &A,
+    ) -> Result<ReceivePackReport>
+    where
+        P: PushPolicy,
+        E: EventPublisher,
+        A: AuditSink,
+    {
+        let request_for_audit = request.clone();
+        let plan = match self.prepare_push(request, &actor, policy).await {
+            Ok(plan) => plan,
+            Err(err) => {
+                let pushed_commits = decode_pack(&request_for_audit.pack, self.repo.hash_algo())
+                    .map(|quarantine| pushed_commit_ids(&quarantine))
+                    .unwrap_or_default();
+                let fallback_context =
+                    self.policy_context(&request_for_audit, &actor, &pushed_commits);
+                audit
+                    .record(&AuditEvent::rejected(
+                        &fallback_context,
+                        timestamp,
+                        err.to_string(),
+                    ))
+                    .await?;
+                return Err(err);
+            }
+        };
+
+        let context = self.policy_context(&plan.request, &actor, &plan.pushed_commits);
+        let report = match self
+            .apply_push(plan, actor.reflog_identity.as_str(), timestamp, publisher)
+            .await
+        {
+            Ok(report) => report,
+            Err(err) => {
+                audit
+                    .record(&AuditEvent::rejected(&context, timestamp, err.to_string()))
+                    .await?;
+                return Err(err);
+            }
+        };
+        policy.post_receive(&context).await?;
+        audit
+            .record(&AuditEvent::accepted(&context, timestamp))
+            .await?;
+        Ok(report)
     }
 
     /// Apply a prepared push using guarded ref updates, reflogs, and invalidation publishing.
@@ -520,21 +524,52 @@ where
         Ok(())
     }
 
-    async fn check_policy<P>(&self, request: &ReceivePackRequest, policy: &P) -> Result<()>
+    fn policy_context(
+        &self,
+        request: &ReceivePackRequest,
+        actor: &PolicyActor,
+        pushed_commits: &[ObjectId],
+    ) -> PushPolicyContext {
+        PushPolicyContext {
+            tenant: self.repo.tenant().clone(),
+            repository: self.repo.repository().clone(),
+            actor: actor.clone(),
+            updates: request
+                .commands
+                .iter()
+                .map(|command| {
+                    PolicyRefUpdate::new(
+                        command.refname.clone(),
+                        command.old_oid,
+                        command.new_oid,
+                        command.kind(),
+                    )
+                })
+                .collect(),
+            pushed_commits: pushed_commits.to_vec(),
+        }
+    }
+
+    async fn check_policy<P>(&self, context: &PushPolicyContext, policy: &P) -> Result<()>
     where
         P: PushPolicy,
     {
-        for command in &request.commands {
+        policy
+            .pre_receive(context)
+            .await?
+            .into_push_result("receive-pack")?;
+        for update in &context.updates {
+            let update_context = RefUpdatePolicyContext {
+                tenant: context.tenant.clone(),
+                repository: context.repository.clone(),
+                actor: context.actor.clone(),
+                update: update.clone(),
+                pushed_commits: context.pushed_commits.clone(),
+            };
             policy
-                .check(&PushPolicyContext {
-                    tenant: self.repo.tenant().clone(),
-                    repository: self.repo.repository().clone(),
-                    refname: command.refname.clone(),
-                    old_oid: command.old_oid,
-                    new_oid: command.new_oid,
-                    kind: command.kind(),
-                })
-                .await?;
+                .update(&update_context)
+                .await?
+                .into_push_result(update.refname.clone())?;
         }
         Ok(())
     }
@@ -789,6 +824,14 @@ fn quarantine_map(quarantine: &[QuarantinedObject]) -> HashMap<ObjectId, StoredO
     quarantine
         .iter()
         .map(|quarantined| (quarantined.oid, quarantined.object.clone()))
+        .collect()
+}
+
+fn pushed_commit_ids(quarantine: &[QuarantinedObject]) -> Vec<ObjectId> {
+    quarantine
+        .iter()
+        .filter(|quarantined| quarantined.object.kind == ObjectKind::Commit)
+        .map(|quarantined| quarantined.oid)
         .collect()
 }
 
