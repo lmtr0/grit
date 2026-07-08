@@ -14,6 +14,9 @@ default = []
 sqlx-postgres = ["dep:sqlx"]
 redis = ["dep:redis"]
 nats = ["dep:async-nats", "dep:futures-util"]
+live-sqlx-postgres-tests = ["sqlx-postgres"]
+live-redis-tests = ["redis"]
+live-nats-tests = ["nats"]
 
 [dependencies]
 async-trait.workspace = true
