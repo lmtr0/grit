@@ -315,6 +315,18 @@ where
         self.cache.invalidate_repository(tenant, repository).await
     }
 
+    async fn replace_tree_entries(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        entries: &[IndexedTreeEntry],
+    ) -> Result<()> {
+        self.storage
+            .replace_tree_entries(tenant, repository, entries)
+            .await?;
+        self.cache.invalidate_repository(tenant, repository).await
+    }
+
     async fn list_tree_entries(
         &self,
         tenant: &TenantId,

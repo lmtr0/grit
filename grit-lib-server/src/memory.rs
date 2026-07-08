@@ -380,6 +380,27 @@ impl BrowseIndex for MemoryBackend {
             .map_err(|_| Error::Backend("memory tree lock poisoned".to_owned()))
     }
 
+    async fn replace_tree_entries(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        entries: &[IndexedTreeEntry],
+    ) -> Result<()> {
+        let repo = repo_key(tenant, repository);
+        self.trees
+            .write()
+            .map(|mut trees| {
+                trees.retain(|(candidate_repo, _, _), _| candidate_repo != &repo);
+                for entry in entries {
+                    trees.insert(
+                        (repo.clone(), entry.tree_oid, entry.path.clone()),
+                        entry.clone(),
+                    );
+                }
+            })
+            .map_err(|_| Error::Backend("memory tree lock poisoned".to_owned()))
+    }
+
     async fn list_tree_entries(
         &self,
         tenant: &TenantId,

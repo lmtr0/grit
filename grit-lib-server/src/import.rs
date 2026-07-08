@@ -32,6 +32,77 @@ pub struct ImportReport {
     pub tree_entries: usize,
     /// Number of commit graph rows rebuilt from imported commits.
     pub commit_graph_entries: usize,
+    /// Number of refs removed because they no longer exist in the source repository.
+    pub pruned_refs: usize,
+    /// Progress checkpoints recorded during the import.
+    pub checkpoints: Vec<ImportCheckpoint>,
+}
+
+/// Options controlling repository import behavior.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportOptions {
+    /// Remove destination refs that are absent from the filesystem-backed source.
+    pub prune_deleted_refs: bool,
+    /// Emit and store checkpoints every `checkpoint_interval` imported objects.
+    pub checkpoint_interval: usize,
+}
+
+impl Default for ImportOptions {
+    fn default() -> Self {
+        Self {
+            prune_deleted_refs: true,
+            checkpoint_interval: 1_000,
+        }
+    }
+}
+
+/// Import progress checkpoint for large repository imports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportCheckpoint {
+    /// Number of unique objects imported when the checkpoint was emitted.
+    pub objects: usize,
+    /// Number of refs imported when the checkpoint was emitted.
+    pub refs: usize,
+    /// Number of tree entries indexed when the checkpoint was emitted.
+    pub tree_entries: usize,
+}
+
+/// Progress event emitted while importing a repository.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImportProgressEvent {
+    /// A config entry was copied.
+    ConfigEntry {
+        /// Config key that was imported.
+        key: String,
+    },
+    /// A ref was copied from the source repository.
+    Ref {
+        /// Ref name that was imported.
+        refname: String,
+    },
+    /// A destination ref was removed because it is absent from the source repository.
+    PrunedRef {
+        /// Ref name that was removed.
+        refname: String,
+    },
+    /// A reachable object was copied.
+    Object {
+        /// Object id that was imported.
+        oid: ObjectId,
+        /// Git object kind.
+        kind: ObjectKind,
+    },
+    /// Tree entries were indexed.
+    TreeEntries {
+        /// Root tree whose browse entries were indexed.
+        tree_oid: ObjectId,
+        /// Number of entries indexed in this batch.
+        entries: usize,
+    },
+    /// A progress checkpoint was reached.
+    Checkpoint(ImportCheckpoint),
+    /// Import completed.
+    Completed(ImportReport),
 }
 
 /// Import reachable repository data from a filesystem-backed [`Repository`].
@@ -46,11 +117,34 @@ pub async fn import_repository<S>(
 where
     S: ServerStorage,
 {
+    import_repository_with_options(destination, source, ImportOptions::default(), |_| Ok(())).await
+}
+
+/// Import reachable repository data with explicit options and progress reporting.
+///
+/// The `progress` callback receives events after durable writes complete. Returning an error from
+/// the callback aborts the import and returns that error.
+///
+/// # Errors
+///
+/// Returns errors from the source repository, destination storage, progress callback, or object
+/// parsing.
+pub async fn import_repository_with_options<S, P>(
+    destination: &crate::repository::ServerRepository<S>,
+    source: &Repository,
+    options: ImportOptions,
+    mut progress: P,
+) -> Result<ImportReport>
+where
+    S: ServerStorage,
+    P: FnMut(ImportProgressEvent) -> Result<()>,
+{
     let mut report = ImportReport {
-        config_entries: import_config(destination, source).await?,
+        config_entries: import_config(destination, source, &mut progress).await?,
         ..ImportReport::default()
     };
     let mut roots = Vec::new();
+    let mut imported_refs = HashSet::new();
 
     if let Ok(Some(target)) = refs::read_symbolic_ref(&source.git_dir, "HEAD") {
         destination
@@ -63,7 +157,11 @@ where
                 None,
             )
             .await?;
+        imported_refs.insert("HEAD".to_owned());
         report.refs += 1;
+        progress(ImportProgressEvent::Ref {
+            refname: "HEAD".to_owned(),
+        })?;
     } else if let Ok(oid) = refs::resolve_ref(&source.git_dir, "HEAD") {
         destination
             .storage()
@@ -75,8 +173,12 @@ where
                 None,
             )
             .await?;
+        imported_refs.insert("HEAD".to_owned());
         roots.push(ImportWork::Object(oid));
         report.refs += 1;
+        progress(ImportProgressEvent::Ref {
+            refname: "HEAD".to_owned(),
+        })?;
     }
 
     for (name, oid) in refs::list_refs(&source.git_dir, "refs/")? {
@@ -90,8 +192,29 @@ where
                 None,
             )
             .await?;
+        imported_refs.insert(name.clone());
         roots.push(ImportWork::Object(oid));
         report.refs += 1;
+        progress(ImportProgressEvent::Ref { refname: name })?;
+    }
+
+    if options.prune_deleted_refs {
+        for (refname, _) in destination.list_refs("").await? {
+            if imported_refs.contains(&refname) {
+                continue;
+            }
+            destination
+                .storage()
+                .delete_ref(
+                    destination.tenant(),
+                    destination.repository(),
+                    &refname,
+                    None,
+                )
+                .await?;
+            report.pruned_refs += 1;
+            progress(ImportProgressEvent::PrunedRef { refname })?;
+        }
     }
 
     let mut seen = HashSet::new();
@@ -118,6 +241,11 @@ where
                 )
                 .await?;
             report.objects += 1;
+            progress(ImportProgressEvent::Object {
+                oid,
+                kind: object.kind,
+            })?;
+            maybe_checkpoint(&options, &mut report, &mut progress)?;
         }
 
         match object.kind {
@@ -136,6 +264,10 @@ where
                     index_tree(destination, source, root, &prefix, &object.data, &mut stack)
                         .await?;
                 report.tree_entries += indexed;
+                progress(ImportProgressEvent::TreeEntries {
+                    tree_oid: root,
+                    entries: indexed,
+                })?;
             }
             ObjectKind::Tag => {
                 let tag = parse_tag(&object.data)?;
@@ -146,12 +278,14 @@ where
     }
 
     report.commit_graph_entries = destination.repair_commit_graph().await?;
+    progress(ImportProgressEvent::Completed(report.clone()))?;
     Ok(report)
 }
 
 async fn import_config<S>(
     destination: &crate::repository::ServerRepository<S>,
     source: &Repository,
+    progress: &mut impl FnMut(ImportProgressEvent) -> Result<()>,
 ) -> Result<usize>
 where
     S: ServerStorage,
@@ -171,9 +305,31 @@ where
                 value,
             )
             .await?;
+        progress(ImportProgressEvent::ConfigEntry {
+            key: entry.key.clone(),
+        })?;
         count += 1;
     }
     Ok(count)
+}
+
+fn maybe_checkpoint(
+    options: &ImportOptions,
+    report: &mut ImportReport,
+    progress: &mut impl FnMut(ImportProgressEvent) -> Result<()>,
+) -> Result<()> {
+    if options.checkpoint_interval == 0
+        || !report.objects.is_multiple_of(options.checkpoint_interval)
+    {
+        return Ok(());
+    }
+    let checkpoint = ImportCheckpoint {
+        objects: report.objects,
+        refs: report.refs,
+        tree_entries: report.tree_entries,
+    };
+    report.checkpoints.push(checkpoint.clone());
+    progress(ImportProgressEvent::Checkpoint(checkpoint))
 }
 
 async fn index_tree<S>(
