@@ -8,6 +8,9 @@ use grit_lib::objects::{parse_commit, parse_tag, HashAlgo, ObjectId, ObjectKind}
 use crate::cache::{EventPublisher, InvalidationEvent, InvalidationEventKind};
 use crate::error::{Error, Result};
 use crate::ids::{RepositoryId, TenantId};
+use crate::protocol::upload_pack::{
+    FetchPackPlan, FetchPackResponse, RefAdvertisement, UploadPackRequest, UploadPackService,
+};
 use crate::storage::{
     commit_time_from_identity, IndexedCommit, IndexedTreeEntry, ServerStorage, StoredObject,
     StoredRef,
@@ -18,12 +21,22 @@ use crate::views::{
 };
 
 /// Server-backed repository handle.
-#[derive(Clone)]
 pub struct ServerRepository<S> {
     tenant: TenantId,
     repository: RepositoryId,
     hash_algo: HashAlgo,
     storage: Arc<S>,
+}
+
+impl<S> Clone for ServerRepository<S> {
+    fn clone(&self) -> Self {
+        Self {
+            tenant: self.tenant.clone(),
+            repository: self.repository.clone(),
+            hash_algo: self.hash_algo,
+            storage: self.storage.clone(),
+        }
+    }
 }
 
 impl<S> ServerRepository<S>
@@ -643,6 +656,37 @@ where
             mode: entry.mode,
             data: object.data,
         }))
+    }
+
+    /// Advertise refs for upload-pack protocol v0/v1 clients.
+    ///
+    /// # Errors
+    ///
+    /// Returns backend or object parsing errors while resolving refs and peeled tags.
+    pub async fn advertise_refs(&self) -> Result<RefAdvertisement> {
+        UploadPackService::new(self.clone()).advertise_refs().await
+    }
+
+    /// Negotiate an upload-pack fetch request into an object plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns protocol, backend, or object parsing errors if the request cannot be served.
+    pub async fn negotiate_fetch(&self, request: UploadPackRequest) -> Result<FetchPackPlan> {
+        UploadPackService::new(self.clone())
+            .negotiate_fetch(request)
+            .await
+    }
+
+    /// Build a pack and wire response for an upload-pack fetch plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns backend, object parsing, compression, or protocol framing errors.
+    pub async fn build_fetch_pack(&self, plan: FetchPackPlan) -> Result<FetchPackResponse> {
+        UploadPackService::new(self.clone())
+            .build_fetch_pack(plan)
+            .await
     }
 
     async fn branch_view(&self, refname: String) -> Result<Option<BranchView>> {
