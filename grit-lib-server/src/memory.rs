@@ -11,7 +11,8 @@ use crate::error::{Error, Result};
 use crate::ids::{RepositoryId, TenantId};
 use crate::storage::{
     commit_time_from_identity, BrowseIndex, CommitGraphStore, ConfigStore, IndexedCommit,
-    IndexedTreeEntry, ObjectStore, RefStore, ReflogEntry, ReflogStore, StoredObject, StoredRef,
+    IndexedTreeEntry, ObjectStore, PackMetadata, PackObjectIndex, PackStore, RefStore, ReflogEntry,
+    ReflogStore, StoredObject, StoredPack, StoredRef,
 };
 
 type RepoKey = (TenantId, RepositoryId);
@@ -21,6 +22,7 @@ type ConfigKey = (RepoKey, String);
 type TreeKey = (RepoKey, ObjectId, String);
 type CommitKey = (RepoKey, ObjectId);
 type CacheEntryKey = (RepoKey, CacheKey);
+type PackKey = (RepoKey, Vec<u8>);
 
 /// In-memory repository backend.
 #[derive(Default)]
@@ -31,6 +33,8 @@ pub struct MemoryBackend {
     config: RwLock<BTreeMap<ConfigKey, String>>,
     trees: RwLock<BTreeMap<TreeKey, IndexedTreeEntry>>,
     commits: RwLock<BTreeMap<CommitKey, IndexedCommit>>,
+    packs: RwLock<HashMap<PackKey, StoredPack>>,
+    pack_sequence: RwLock<u64>,
     cache: RwLock<HashMap<CacheEntryKey, CacheValue>>,
     events: RwLock<Vec<InvalidationEvent>>,
 }
@@ -87,6 +91,41 @@ impl MemoryBackend {
             generation,
         }))
     }
+
+    fn next_pack_order(&self) -> Result<u64> {
+        let mut sequence = self
+            .pack_sequence
+            .write()
+            .map_err(|_| Error::Backend("memory pack sequence lock poisoned".to_owned()))?;
+        *sequence = sequence.saturating_add(1);
+        Ok(*sequence)
+    }
+
+    async fn newest_packed_object(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        oid: &ObjectId,
+    ) -> Result<Option<(PackMetadata, PackObjectIndex, Vec<u8>)>> {
+        let repo = repo_key(tenant, repository);
+        self.packs
+            .read()
+            .map(|packs| {
+                packs
+                    .iter()
+                    .filter(|((candidate_repo, _), pack)| {
+                        candidate_repo == &repo && pack.index.iter().any(|entry| entry.oid == *oid)
+                    })
+                    .filter_map(|(_, pack)| {
+                        pack.index
+                            .iter()
+                            .find(|entry| entry.oid == *oid)
+                            .map(|entry| (pack.metadata.clone(), entry.clone(), pack.data.clone()))
+                    })
+                    .max_by_key(|(metadata, _, _)| metadata.storage_order)
+            })
+            .map_err(|_| Error::Backend("memory pack lock poisoned".to_owned()))
+    }
 }
 
 #[async_trait]
@@ -97,6 +136,10 @@ impl ObjectStore for MemoryBackend {
         repository: &RepositoryId,
         oid: &ObjectId,
     ) -> Result<Option<StoredObject>> {
+        if let Some((_, index, data)) = self.newest_packed_object(tenant, repository, oid).await? {
+            return crate::packfile::read_object_at_offset(&data, index.offset, oid.algo())
+                .map(Some);
+        }
         self.objects
             .read()
             .map(|objects| objects.get(&(repo_key(tenant, repository), *oid)).cloned())
@@ -137,6 +180,13 @@ impl ObjectStore for MemoryBackend {
         repository: &RepositoryId,
         oid: &ObjectId,
     ) -> Result<bool> {
+        if self
+            .newest_packed_object(tenant, repository, oid)
+            .await?
+            .is_some()
+        {
+            return Ok(true);
+        }
         self.objects
             .read()
             .map(|objects| objects.contains_key(&(repo_key(tenant, repository), *oid)))
@@ -144,16 +194,7 @@ impl ObjectStore for MemoryBackend {
     }
 
     async fn count_objects(&self, tenant: &TenantId, repository: &RepositoryId) -> Result<usize> {
-        let repo = repo_key(tenant, repository);
-        self.objects
-            .read()
-            .map(|objects| {
-                objects
-                    .keys()
-                    .filter(|(candidate_repo, _)| candidate_repo == &repo)
-                    .count()
-            })
-            .map_err(|_| Error::Backend("memory object lock poisoned".to_owned()))
+        Ok(self.list_object_ids(tenant, repository, None).await?.len())
     }
 
     async fn list_object_ids(
@@ -163,20 +204,36 @@ impl ObjectStore for MemoryBackend {
         kind: Option<ObjectKind>,
     ) -> Result<Vec<(ObjectId, ObjectKind)>> {
         let repo = repo_key(tenant, repository);
-        self.objects
+        let mut ids = self
+            .objects
             .read()
             .map(|objects| {
-                let mut ids = objects
+                objects
                     .iter()
                     .filter(|((candidate_repo, _), object)| {
                         candidate_repo == &repo && kind.is_none_or(|kind| object.kind == kind)
                     })
                     .map(|((_, oid), object)| (*oid, object.kind))
-                    .collect::<Vec<_>>();
-                ids.sort_by_key(|(oid, _)| *oid);
-                ids
+                    .collect::<HashMap<_, _>>()
             })
-            .map_err(|_| Error::Backend("memory object lock poisoned".to_owned()))
+            .map_err(|_| Error::Backend("memory object lock poisoned".to_owned()))?;
+        for pack in self
+            .packs
+            .read()
+            .map_err(|_| Error::Backend("memory pack lock poisoned".to_owned()))?
+            .iter()
+            .filter(|((candidate_repo, _), _)| candidate_repo == &repo)
+            .map(|(_, pack)| pack.clone())
+        {
+            for entry in pack.index {
+                if kind.is_none_or(|kind| entry.kind == kind) {
+                    ids.entry(entry.oid).or_insert(entry.kind);
+                }
+            }
+        }
+        let mut ids = ids.into_iter().collect::<Vec<_>>();
+        ids.sort_by_key(|(oid, _)| *oid);
+        Ok(ids)
     }
 }
 
@@ -554,6 +611,150 @@ impl CommitGraphStore for MemoryBackend {
                 commits
             })
             .map_err(|_| Error::Backend("memory commit graph lock poisoned".to_owned()))
+    }
+}
+
+#[async_trait]
+impl PackStore for MemoryBackend {
+    async fn write_pack(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        pack: &StoredPack,
+    ) -> Result<PackMetadata> {
+        let repo = repo_key(tenant, repository);
+        let key = (repo, pack.metadata.pack_checksum.clone());
+        let mut packs = self
+            .packs
+            .write()
+            .map_err(|_| Error::Backend("memory pack lock poisoned".to_owned()))?;
+        if let Some(existing) = packs.get(&key) {
+            return Ok(existing.metadata.clone());
+        }
+        let mut stored = pack.clone();
+        stored.metadata.storage_order = self.next_pack_order()?;
+        let metadata = stored.metadata.clone();
+        packs.insert(key, stored);
+        Ok(metadata)
+    }
+
+    async fn read_pack_metadata(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        pack_checksum: &[u8],
+    ) -> Result<Option<PackMetadata>> {
+        self.packs
+            .read()
+            .map(|packs| {
+                packs
+                    .get(&(repo_key(tenant, repository), pack_checksum.to_vec()))
+                    .map(|pack| pack.metadata.clone())
+            })
+            .map_err(|_| Error::Backend("memory pack lock poisoned".to_owned()))
+    }
+
+    async fn read_pack_data(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        pack_checksum: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        self.packs
+            .read()
+            .map(|packs| {
+                packs
+                    .get(&(repo_key(tenant, repository), pack_checksum.to_vec()))
+                    .map(|pack| pack.data.clone())
+            })
+            .map_err(|_| Error::Backend("memory pack lock poisoned".to_owned()))
+    }
+
+    async fn find_packed_object(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        oid: &ObjectId,
+    ) -> Result<Option<(PackMetadata, PackObjectIndex)>> {
+        Ok(self
+            .newest_packed_object(tenant, repository, oid)
+            .await?
+            .map(|(metadata, index, _)| (metadata, index)))
+    }
+
+    async fn read_pack_index_at_offset(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        pack_checksum: &[u8],
+        offset: u64,
+    ) -> Result<Option<PackObjectIndex>> {
+        self.packs
+            .read()
+            .map(|packs| {
+                packs
+                    .get(&(repo_key(tenant, repository), pack_checksum.to_vec()))
+                    .and_then(|pack| {
+                        pack.index
+                            .iter()
+                            .find(|entry| entry.offset == offset)
+                            .cloned()
+                    })
+            })
+            .map_err(|_| Error::Backend("memory pack lock poisoned".to_owned()))
+    }
+
+    async fn list_packs(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+    ) -> Result<Vec<PackMetadata>> {
+        let repo = repo_key(tenant, repository);
+        self.packs
+            .read()
+            .map(|packs| {
+                let mut metadata = packs
+                    .iter()
+                    .filter(|((candidate_repo, _), _)| candidate_repo == &repo)
+                    .map(|(_, pack)| pack.metadata.clone())
+                    .collect::<Vec<_>>();
+                metadata.sort_by_key(|pack| pack.storage_order);
+                metadata
+            })
+            .map_err(|_| Error::Backend("memory pack lock poisoned".to_owned()))
+    }
+
+    async fn list_pack_objects(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        pack_checksum: Option<&[u8]>,
+    ) -> Result<Vec<(PackMetadata, PackObjectIndex)>> {
+        let repo = repo_key(tenant, repository);
+        self.packs
+            .read()
+            .map(|packs| {
+                let mut rows = packs
+                    .iter()
+                    .filter(|((candidate_repo, checksum), _)| {
+                        candidate_repo == &repo
+                            && pack_checksum.is_none_or(|wanted| checksum.as_slice() == wanted)
+                    })
+                    .flat_map(|(_, pack)| {
+                        pack.index
+                            .iter()
+                            .map(|entry| (pack.metadata.clone(), entry.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                rows.sort_by(|left, right| {
+                    left.0
+                        .storage_order
+                        .cmp(&right.0.storage_order)
+                        .then_with(|| left.1.offset.cmp(&right.1.offset))
+                });
+                rows
+            })
+            .map_err(|_| Error::Backend("memory pack lock poisoned".to_owned()))
     }
 }
 

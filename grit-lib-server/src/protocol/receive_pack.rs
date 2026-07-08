@@ -360,6 +360,9 @@ where
     where
         P: EventPublisher,
     {
+        if !plan.request.pack.is_empty() {
+            self.repo.write_pack(&plan.request.pack).await?;
+        }
         for quarantined in &plan.quarantine {
             self.repo
                 .storage()

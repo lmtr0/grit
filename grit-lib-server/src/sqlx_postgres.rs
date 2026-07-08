@@ -12,7 +12,8 @@ use crate::error::{Error, Result};
 use crate::ids::{RepositoryId, TenantId};
 use crate::storage::{
     BrowseIndex, CommitGraphStore, ConfigStore, IndexedCommit, IndexedTreeEntry, ObjectStore,
-    RefStore, ReflogEntry, ReflogStore, StoredObject, StoredRef,
+    PackMetadata, PackObjectIndex, PackStore, RefStore, ReflogEntry, ReflogStore, StoredObject,
+    StoredPack, StoredRef,
 };
 
 /// SQL migration statements for the initial server storage schema.
@@ -100,6 +101,28 @@ pub const MIGRATIONS: &[&str] = &[
         parent_order integer not null,
         primary key (tenant_id, repository_id, commit_oid, parent_order)
     )",
+    "create table if not exists grit_packs (
+        tenant_id text not null,
+        repository_id text not null,
+        pack_checksum text not null,
+        index_checksum text not null,
+        data bytea not null,
+        object_count integer not null,
+        size_bytes bigint not null,
+        storage_order bigserial not null,
+        primary key (tenant_id, repository_id, pack_checksum)
+    )",
+    "create table if not exists grit_pack_objects (
+        tenant_id text not null,
+        repository_id text not null,
+        pack_checksum text not null,
+        oid text not null,
+        kind text not null,
+        offset bigint not null,
+        size bigint not null,
+        compressed_size bigint not null,
+        primary key (tenant_id, repository_id, pack_checksum, offset)
+    )",
     "create index if not exists grit_repositories_listing_idx
         on grit_repositories (tenant_id, archived_at, repository_id)
         where deleted_at is null",
@@ -113,6 +136,10 @@ pub const MIGRATIONS: &[&str] = &[
         on grit_commits (tenant_id, repository_id, commit_time desc, commit_oid)",
     "create index if not exists grit_commit_parents_parent_idx
         on grit_commit_parents (tenant_id, repository_id, parent_oid, commit_oid)",
+    "create index if not exists grit_pack_objects_oid_idx
+        on grit_pack_objects (tenant_id, repository_id, oid)",
+    "create index if not exists grit_packs_repo_order_idx
+        on grit_packs (tenant_id, repository_id, storage_order)",
 ];
 
 /// Repository metadata stored by the SQL backend.
@@ -565,6 +592,72 @@ fn row_to_repository(row: &sqlx::postgres::PgRow) -> Result<PgRepositoryRow> {
     })
 }
 
+fn row_to_pack_metadata(row: &sqlx::postgres::PgRow) -> Result<PackMetadata> {
+    let pack_checksum: String = row.try_get("pack_checksum")?;
+    let index_checksum: String = row.try_get("index_checksum")?;
+    let object_count: i32 = row.try_get("object_count")?;
+    let size_bytes: i64 = row.try_get("size_bytes")?;
+    let storage_order: i64 = row.try_get("storage_order")?;
+    if object_count < 0 || size_bytes < 0 || storage_order < 0 {
+        return Err(Error::Backend(
+            "pack metadata contains negative numeric fields".to_owned(),
+        ));
+    }
+    Ok(PackMetadata {
+        pack_checksum: hex_to_bytes(&pack_checksum)?,
+        index_checksum: hex_to_bytes(&index_checksum)?,
+        object_count: object_count as u32,
+        size_bytes: size_bytes as u64,
+        storage_order: storage_order as u64,
+    })
+}
+
+fn row_to_pack_object_index(row: &sqlx::postgres::PgRow) -> Result<PackObjectIndex> {
+    let oid: String = row.try_get("oid")?;
+    let kind: String = row.try_get("kind")?;
+    let offset: i64 = row.try_get("offset")?;
+    let size: i64 = row.try_get("size")?;
+    let compressed_size: i64 = row.try_get("compressed_size")?;
+    if offset < 0 || size < 0 || compressed_size < 0 {
+        return Err(Error::Backend(
+            "pack object index contains negative numeric fields".to_owned(),
+        ));
+    }
+    Ok(PackObjectIndex {
+        oid: ObjectId::from_hex(&oid)?,
+        kind: name_to_kind(&kind)?,
+        offset: offset as u64,
+        size: size as u64,
+        compressed_size: compressed_size as u64,
+    })
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn hex_to_bytes(value: &str) -> Result<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        return Err(Error::Backend("hex value has odd length".to_owned()));
+    }
+    value
+        .as_bytes()
+        .chunks(2)
+        .map(|chunk| {
+            let text = std::str::from_utf8(chunk)
+                .map_err(|err| Error::Backend(format!("invalid hex bytes: {err}")))?;
+            u8::from_str_radix(text, 16)
+                .map_err(|err| Error::Backend(format!("invalid hex byte '{text}': {err}")))
+        })
+        .collect()
+}
+
 fn repository_key(tenant: &TenantId, repository: &RepositoryId) -> String {
     format!("{tenant}/{repository}")
 }
@@ -621,6 +714,8 @@ async fn rename_repository_in_transaction(
         "grit_tree_entries",
         "grit_commits",
         "grit_commit_parents",
+        "grit_packs",
+        "grit_pack_objects",
     ] {
         let sql = format!(
             "update {table}
@@ -678,6 +773,8 @@ async fn delete_repository_in_transaction(
         "grit_tree_entries",
         "grit_commits",
         "grit_commit_parents",
+        "grit_packs",
+        "grit_pack_objects",
     ] {
         let sql = format!("delete from {table} where tenant_id = $1 and repository_id = $2");
         sqlx::query(&sql)
@@ -973,6 +1070,75 @@ async fn upsert_tree_entries_in_transaction(
     Ok(())
 }
 
+async fn write_pack_in_transaction(
+    tx: &mut Transaction<'static, Postgres>,
+    tenant: &TenantId,
+    repository: &RepositoryId,
+    pack: &StoredPack,
+) -> Result<PackMetadata> {
+    let object_count = i32::try_from(pack.metadata.object_count)
+        .map_err(|_| Error::Backend("pack object count exceeds i32".to_owned()))?;
+    let size_bytes = i64::try_from(pack.metadata.size_bytes)
+        .map_err(|_| Error::Backend("pack size exceeds i64".to_owned()))?;
+    let pack_checksum = bytes_to_hex(&pack.metadata.pack_checksum);
+    let index_checksum = bytes_to_hex(&pack.metadata.index_checksum);
+    let row = sqlx::query(
+        "insert into grit_packs
+            (tenant_id, repository_id, pack_checksum, index_checksum, data,
+             object_count, size_bytes)
+         values ($1, $2, $3, $4, $5, $6, $7)
+         on conflict (tenant_id, repository_id, pack_checksum)
+         do update set pack_checksum = excluded.pack_checksum
+         returning pack_checksum, index_checksum, object_count, size_bytes, storage_order",
+    )
+    .bind(tenant.as_str())
+    .bind(repository.as_str())
+    .bind(&pack_checksum)
+    .bind(&index_checksum)
+    .bind(&pack.data)
+    .bind(object_count)
+    .bind(size_bytes)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    sqlx::query(
+        "delete from grit_pack_objects
+         where tenant_id = $1 and repository_id = $2 and pack_checksum = $3",
+    )
+    .bind(tenant.as_str())
+    .bind(repository.as_str())
+    .bind(&pack_checksum)
+    .execute(&mut **tx)
+    .await?;
+
+    for entry in &pack.index {
+        let offset = i64::try_from(entry.offset)
+            .map_err(|_| Error::Backend("pack object offset exceeds i64".to_owned()))?;
+        let size = i64::try_from(entry.size)
+            .map_err(|_| Error::Backend("pack object size exceeds i64".to_owned()))?;
+        let compressed_size = i64::try_from(entry.compressed_size)
+            .map_err(|_| Error::Backend("pack object compressed size exceeds i64".to_owned()))?;
+        sqlx::query(
+            "insert into grit_pack_objects
+                (tenant_id, repository_id, pack_checksum, oid, kind, offset, size,
+                 compressed_size)
+             values ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(tenant.as_str())
+        .bind(repository.as_str())
+        .bind(&pack_checksum)
+        .bind(entry.oid.to_hex())
+        .bind(kind_to_name(entry.kind))
+        .bind(offset)
+        .bind(size)
+        .bind(compressed_size)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    row_to_pack_metadata(&row)
+}
+
 #[async_trait]
 impl ObjectStore for PgServerStorage {
     async fn read_object(
@@ -991,15 +1157,28 @@ impl ObjectStore for PgServerStorage {
         .fetch_optional(&self.pool)
         .await?;
 
-        row.map(|row| {
-            let kind: String = row.try_get("kind")?;
-            let data: Vec<u8> = row.try_get("data")?;
-            Ok(StoredObject {
-                kind: name_to_kind(&kind)?,
-                data,
+        if let Some(object) = row
+            .map(|row| {
+                let kind: String = row.try_get("kind")?;
+                let data: Vec<u8> = row.try_get("data")?;
+                Ok::<StoredObject, Error>(StoredObject {
+                    kind: name_to_kind(&kind)?,
+                    data,
+                })
             })
-        })
-        .transpose()
+            .transpose()?
+        {
+            return Ok(Some(object));
+        }
+        let Some((metadata, index)) = self.find_packed_object(tenant, repository, oid).await?
+        else {
+            return Ok(None);
+        };
+        let data = self
+            .read_pack_data(tenant, repository, &metadata.pack_checksum)
+            .await?
+            .ok_or_else(|| Error::Backend("pack index points at missing pack data".to_owned()))?;
+        crate::packfile::read_object_at_offset(&data, index.offset, oid.algo()).map(Some)
     }
 
     async fn write_object(
@@ -1025,6 +1204,9 @@ impl ObjectStore for PgServerStorage {
             "select exists(
                 select 1 from grit_objects
                 where tenant_id = $1 and repository_id = $2 and oid = $3
+                union all
+                select 1 from grit_pack_objects
+                where tenant_id = $1 and repository_id = $2 and oid = $3
              )",
         )
         .bind(tenant.as_str())
@@ -1037,8 +1219,13 @@ impl ObjectStore for PgServerStorage {
 
     async fn count_objects(&self, tenant: &TenantId, repository: &RepositoryId) -> Result<usize> {
         let count: i64 = sqlx::query_scalar(
-            "select count(*) from grit_objects
-             where tenant_id = $1 and repository_id = $2",
+            "select count(*) from (
+                select oid from grit_objects
+                where tenant_id = $1 and repository_id = $2
+                union
+                select oid from grit_pack_objects
+                where tenant_id = $1 and repository_id = $2
+             ) objects",
         )
         .bind(tenant.as_str())
         .bind(repository.as_str())
@@ -1055,8 +1242,14 @@ impl ObjectStore for PgServerStorage {
     ) -> Result<Vec<(ObjectId, ObjectKind)>> {
         let rows = if let Some(kind) = kind {
             sqlx::query(
-                "select oid, kind from grit_objects
-                 where tenant_id = $1 and repository_id = $2 and kind = $3
+                "select oid, min(kind) as kind from (
+                    select oid, kind from grit_objects
+                    where tenant_id = $1 and repository_id = $2 and kind = $3
+                    union
+                    select oid, kind from grit_pack_objects
+                    where tenant_id = $1 and repository_id = $2 and kind = $3
+                 ) objects
+                 group by oid
                  order by oid",
             )
             .bind(tenant.as_str())
@@ -1066,8 +1259,14 @@ impl ObjectStore for PgServerStorage {
             .await?
         } else {
             sqlx::query(
-                "select oid, kind from grit_objects
-                 where tenant_id = $1 and repository_id = $2
+                "select oid, min(kind) as kind from (
+                    select oid, kind from grit_objects
+                    where tenant_id = $1 and repository_id = $2
+                    union
+                    select oid, kind from grit_pack_objects
+                    where tenant_id = $1 and repository_id = $2
+                 ) objects
+                 group by oid
                  order by oid",
             )
             .bind(tenant.as_str())
@@ -1546,5 +1745,172 @@ impl CommitGraphStore for PgServerStorage {
             });
         }
         Ok(commits)
+    }
+}
+
+#[async_trait]
+impl PackStore for PgServerStorage {
+    async fn write_pack(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        pack: &StoredPack,
+    ) -> Result<PackMetadata> {
+        let mut tx = self.pool.begin().await?;
+        let metadata = write_pack_in_transaction(&mut tx, tenant, repository, pack).await?;
+        tx.commit().await?;
+        Ok(metadata)
+    }
+
+    async fn read_pack_metadata(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        pack_checksum: &[u8],
+    ) -> Result<Option<PackMetadata>> {
+        let row = sqlx::query(
+            "select pack_checksum, index_checksum, object_count, size_bytes, storage_order
+             from grit_packs
+             where tenant_id = $1 and repository_id = $2 and pack_checksum = $3",
+        )
+        .bind(tenant.as_str())
+        .bind(repository.as_str())
+        .bind(bytes_to_hex(pack_checksum))
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(row_to_pack_metadata).transpose()
+    }
+
+    async fn read_pack_data(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        pack_checksum: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        sqlx::query_scalar(
+            "select data from grit_packs
+             where tenant_id = $1 and repository_id = $2 and pack_checksum = $3",
+        )
+        .bind(tenant.as_str())
+        .bind(repository.as_str())
+        .bind(bytes_to_hex(pack_checksum))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn find_packed_object(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        oid: &ObjectId,
+    ) -> Result<Option<(PackMetadata, PackObjectIndex)>> {
+        let row = sqlx::query(
+            "select p.pack_checksum, p.index_checksum, p.object_count, p.size_bytes,
+                    p.storage_order, o.oid, o.kind, o.offset, o.size, o.compressed_size
+             from grit_pack_objects o
+             join grit_packs p
+               on p.tenant_id = o.tenant_id
+              and p.repository_id = o.repository_id
+              and p.pack_checksum = o.pack_checksum
+             where o.tenant_id = $1 and o.repository_id = $2 and o.oid = $3
+             order by p.storage_order desc
+             limit 1",
+        )
+        .bind(tenant.as_str())
+        .bind(repository.as_str())
+        .bind(oid.to_hex())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref()
+            .map(|row| Ok((row_to_pack_metadata(row)?, row_to_pack_object_index(row)?)))
+            .transpose()
+    }
+
+    async fn read_pack_index_at_offset(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        pack_checksum: &[u8],
+        offset: u64,
+    ) -> Result<Option<PackObjectIndex>> {
+        let offset = i64::try_from(offset)
+            .map_err(|_| Error::Backend("pack object offset exceeds i64".to_owned()))?;
+        let row = sqlx::query(
+            "select oid, kind, offset, size, compressed_size
+             from grit_pack_objects
+             where tenant_id = $1 and repository_id = $2 and pack_checksum = $3 and offset = $4",
+        )
+        .bind(tenant.as_str())
+        .bind(repository.as_str())
+        .bind(bytes_to_hex(pack_checksum))
+        .bind(offset)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(row_to_pack_object_index).transpose()
+    }
+
+    async fn list_packs(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+    ) -> Result<Vec<PackMetadata>> {
+        let rows = sqlx::query(
+            "select pack_checksum, index_checksum, object_count, size_bytes, storage_order
+             from grit_packs
+             where tenant_id = $1 and repository_id = $2
+             order by storage_order",
+        )
+        .bind(tenant.as_str())
+        .bind(repository.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(row_to_pack_metadata).collect()
+    }
+
+    async fn list_pack_objects(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        pack_checksum: Option<&[u8]>,
+    ) -> Result<Vec<(PackMetadata, PackObjectIndex)>> {
+        let rows = if let Some(pack_checksum) = pack_checksum {
+            sqlx::query(
+                "select p.pack_checksum, p.index_checksum, p.object_count, p.size_bytes,
+                        p.storage_order, o.oid, o.kind, o.offset, o.size, o.compressed_size
+                 from grit_pack_objects o
+                 join grit_packs p
+                   on p.tenant_id = o.tenant_id
+                  and p.repository_id = o.repository_id
+                  and p.pack_checksum = o.pack_checksum
+                 where o.tenant_id = $1 and o.repository_id = $2 and o.pack_checksum = $3
+                 order by p.storage_order, o.offset",
+            )
+            .bind(tenant.as_str())
+            .bind(repository.as_str())
+            .bind(bytes_to_hex(pack_checksum))
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "select p.pack_checksum, p.index_checksum, p.object_count, p.size_bytes,
+                        p.storage_order, o.oid, o.kind, o.offset, o.size, o.compressed_size
+                 from grit_pack_objects o
+                 join grit_packs p
+                   on p.tenant_id = o.tenant_id
+                  and p.repository_id = o.repository_id
+                  and p.pack_checksum = o.pack_checksum
+                 where o.tenant_id = $1 and o.repository_id = $2
+                 order by p.storage_order, o.offset",
+            )
+            .bind(tenant.as_str())
+            .bind(repository.as_str())
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        rows.iter()
+            .map(|row| Ok((row_to_pack_metadata(row)?, row_to_pack_object_index(row)?)))
+            .collect()
     }
 }
