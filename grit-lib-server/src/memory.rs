@@ -582,6 +582,20 @@ impl Cache for MemoryBackend {
             })
             .map_err(|_| Error::Cache("memory cache lock poisoned".to_owned()))
     }
+
+    async fn invalidate_repository(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+    ) -> Result<()> {
+        let repo = repo_key(tenant, repository);
+        self.cache
+            .write()
+            .map(|mut cache| {
+                cache.retain(|(candidate_repo, _), _| candidate_repo != &repo);
+            })
+            .map_err(|_| Error::Cache("memory cache lock poisoned".to_owned()))
+    }
 }
 
 #[async_trait]

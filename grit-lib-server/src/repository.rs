@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use grit_lib::objects::{parse_commit, parse_tag, HashAlgo, ObjectId, ObjectKind};
 
-use crate::cache::{CacheKey, EventPublisher, InvalidationEvent};
+use crate::cache::{EventPublisher, InvalidationEvent, InvalidationEventKind};
 use crate::error::{Error, Result};
 use crate::ids::{RepositoryId, TenantId};
 use crate::storage::{
@@ -558,7 +558,7 @@ where
             }
         }
         let mut repaired = commits.into_values().collect::<Vec<_>>();
-        repaired.sort_by(|left, right| left.oid.cmp(&right.oid));
+        repaired.sort_by_key(|left| left.oid);
         let count = repaired.len();
         self.storage
             .replace_commit_graph(&self.tenant, &self.repository, &repaired)
@@ -828,7 +828,11 @@ where
             generation,
         };
         self.storage
-            .upsert_commits(&self.tenant, &self.repository, &[commit.clone()])
+            .upsert_commits(
+                &self.tenant,
+                &self.repository,
+                std::slice::from_ref(&commit),
+            )
             .await?;
         indexed.insert(oid, commit.clone());
         Ok(commit)
@@ -974,22 +978,14 @@ where
             .write_ref(&self.tenant, &self.repository, refname, value, expected)
             .await?;
         publisher
-            .publish_invalidation(InvalidationEvent {
-                tenant: self.tenant.clone(),
-                repository: self.repository.clone(),
-                keys: vec![
-                    CacheKey::Ref(refname.to_owned()),
-                    CacheKey::RefList(ref_parent_prefix(refname)),
-                ],
-            })
+            .publish_invalidation(InvalidationEvent::new(
+                self.tenant.clone(),
+                self.repository.clone(),
+                InvalidationEventKind::RefWrite {
+                    refname: refname.to_owned(),
+                },
+            ))
             .await
-    }
-}
-
-fn ref_parent_prefix(refname: &str) -> String {
-    match refname.rsplit_once('/') {
-        Some((parent, _)) => format!("{parent}/"),
-        None => String::new(),
     }
 }
 
