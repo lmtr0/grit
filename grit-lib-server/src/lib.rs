@@ -26,11 +26,12 @@ pub mod prelude {
     pub use crate::import::{import_repository, ImportReport};
     pub use crate::repository::ServerRepository;
     pub use crate::storage::{
-        BrowseIndex, ConfigStore, ObjectStore, RefStore, ReflogEntry, ReflogStore, StoredObject,
-        StoredRef,
+        BrowseIndex, CommitGraphStore, ConfigStore, IndexedCommit, ObjectStore, RefStore,
+        ReflogEntry, ReflogStore, StoredObject, StoredRef,
     };
     pub use crate::views::{
-        BlobView, BranchView, CommitSummary, CompareInputs, DiscoveredFile, RepositorySummary,
-        TagView, TreeEntryView, TreeView,
+        BlobView, BranchView, CommitComparison, CommitHistoryOptions, CommitHistoryPage,
+        CommitSummary, CompareInputs, DiscoveredFile, RepositorySummary, TagView, TreeEntryView,
+        TreeView,
     };
 }

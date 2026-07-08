@@ -12,8 +12,9 @@ use grit_lib_server::import::import_repository;
 use grit_lib_server::memory::MemoryBackend;
 use grit_lib_server::repository::ServerRepository;
 use grit_lib_server::storage::{
-    BrowseIndex, IndexedTreeEntry, ObjectStore, RefStore, StoredObject, StoredRef,
+    BrowseIndex, CommitGraphStore, IndexedTreeEntry, ObjectStore, RefStore, StoredObject, StoredRef,
 };
+use grit_lib_server::views::CommitHistoryOptions;
 
 fn ids() -> grit_lib_server::error::Result<(TenantId, RepositoryId)> {
     Ok((TenantId::new("tenant-a")?, RepositoryId::new("repo-a")?))
@@ -29,6 +30,14 @@ struct ImportedFixture {
     script: ObjectId,
     symlink: ObjectId,
     annotated_tag: ObjectId,
+}
+
+struct GraphFixture {
+    repo: ServerRepository<MemoryBackend>,
+    base: ObjectId,
+    left: ObjectId,
+    right: ObjectId,
+    merge: ObjectId,
 }
 
 async fn import_hosting_fixture() -> grit_lib_server::error::Result<ImportedFixture> {
@@ -159,6 +168,116 @@ async fn import_hosting_fixture() -> grit_lib_server::error::Result<ImportedFixt
         symlink,
         annotated_tag,
     })
+}
+
+async fn import_graph_fixture() -> grit_lib_server::error::Result<GraphFixture> {
+    let temp = tempfile::tempdir().map_err(grit_lib::error::Error::from)?;
+    let source = init_repository(temp.path(), false, "main", None, "files")?;
+    refs::write_symbolic_ref(&source.git_dir, "HEAD", "refs/heads/main")?;
+
+    let readme_base = source.odb.write(ObjectKind::Blob, b"base\n")?;
+    let readme_left = source.odb.write(ObjectKind::Blob, b"left\n")?;
+    let readme_merge = source.odb.write(ObjectKind::Blob, b"merge\n")?;
+    let other_right = source.odb.write(ObjectKind::Blob, b"right\n")?;
+
+    let base_tree = source.odb.write(
+        ObjectKind::Tree,
+        &serialize_tree(&[TreeEntry {
+            mode: 0o100644,
+            name: b"README.md".to_vec(),
+            oid: readme_base,
+        }]),
+    )?;
+    let left_tree = source.odb.write(
+        ObjectKind::Tree,
+        &serialize_tree(&[TreeEntry {
+            mode: 0o100644,
+            name: b"README.md".to_vec(),
+            oid: readme_left,
+        }]),
+    )?;
+    let right_tree = source.odb.write(
+        ObjectKind::Tree,
+        &serialize_tree(&[
+            TreeEntry {
+                mode: 0o100644,
+                name: b"README.md".to_vec(),
+                oid: readme_base,
+            },
+            TreeEntry {
+                mode: 0o100644,
+                name: b"other.txt".to_vec(),
+                oid: other_right,
+            },
+        ]),
+    )?;
+    let merge_tree = source.odb.write(
+        ObjectKind::Tree,
+        &serialize_tree(&[
+            TreeEntry {
+                mode: 0o100644,
+                name: b"README.md".to_vec(),
+                oid: readme_merge,
+            },
+            TreeEntry {
+                mode: 0o100644,
+                name: b"other.txt".to_vec(),
+                oid: other_right,
+            },
+        ]),
+    )?;
+
+    let base = write_fixture_commit(&source, base_tree, Vec::new(), 1_700_000_000, "base")?;
+    let left = write_fixture_commit(&source, left_tree, vec![base], 1_700_000_100, "left")?;
+    let right = write_fixture_commit(&source, right_tree, vec![base], 1_700_000_200, "right")?;
+    let merge = write_fixture_commit(
+        &source,
+        merge_tree,
+        vec![left, right],
+        1_700_000_300,
+        "merge",
+    )?;
+
+    refs::write_ref(&source.git_dir, "refs/heads/main", &merge)?;
+    refs::write_ref(&source.git_dir, "refs/heads/left", &left)?;
+    refs::write_ref(&source.git_dir, "refs/heads/right", &right)?;
+
+    let (tenant, repository) = ids()?;
+    let backend = Arc::new(MemoryBackend::new());
+    let repo = ServerRepository::new(tenant, repository, HashAlgo::Sha1, backend);
+    import_repository(&repo, &source).await?;
+
+    Ok(GraphFixture {
+        repo,
+        base,
+        left,
+        right,
+        merge,
+    })
+}
+
+fn write_fixture_commit(
+    source: &grit_lib::repo::Repository,
+    tree: ObjectId,
+    parents: Vec<ObjectId>,
+    timestamp: i64,
+    subject: &str,
+) -> grit_lib::error::Result<ObjectId> {
+    let ident = format!("A U Thor <a@example.com> {timestamp} +0000");
+    let commit = CommitData {
+        tree,
+        parents,
+        author: ident.clone(),
+        committer: ident,
+        author_raw: Vec::new(),
+        committer_raw: Vec::new(),
+        encoding: None,
+        message: format!("{subject}\n"),
+        raw_message: None,
+    };
+    source
+        .odb
+        .write(ObjectKind::Commit, &serialize_commit(&commit))
 }
 
 #[tokio::test]
@@ -386,6 +505,274 @@ async fn hosting_views_work_for_imported_memory_repository() -> grit_lib_server:
         repo.blob_at("main", "bin").await,
         Err(grit_lib_server::error::Error::UnexpectedObjectKind { .. })
     ));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_history_paginates_in_deterministic_order() -> grit_lib_server::error::Result<()> {
+    let fixture = import_graph_fixture().await?;
+
+    let first_page = fixture
+        .repo
+        .commit_history(
+            "main",
+            CommitHistoryOptions {
+                offset: 0,
+                limit: Some(2),
+                path: None,
+            },
+        )
+        .await?;
+    assert_eq!(
+        first_page
+            .commits
+            .iter()
+            .map(|commit| commit.oid)
+            .collect::<Vec<_>>(),
+        vec![fixture.merge, fixture.right]
+    );
+    assert_eq!(first_page.next_offset, Some(2));
+    assert_eq!(first_page.total_estimate, 4);
+
+    let second_page = fixture
+        .repo
+        .commit_history(
+            "main",
+            CommitHistoryOptions {
+                offset: 2,
+                limit: Some(2),
+                path: None,
+            },
+        )
+        .await?;
+    assert_eq!(
+        second_page
+            .commits
+            .iter()
+            .map(|commit| commit.oid)
+            .collect::<Vec<_>>(),
+        vec![fixture.left, fixture.base]
+    );
+    assert_eq!(second_page.next_offset, None);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn graph_queries_handle_parents_children_ancestors_and_merge_base(
+) -> grit_lib_server::error::Result<()> {
+    let fixture = import_graph_fixture().await?;
+
+    let parents = fixture.repo.commit_parents("main").await?;
+    assert_eq!(
+        parents.iter().map(|commit| commit.oid).collect::<Vec<_>>(),
+        vec![fixture.left, fixture.right]
+    );
+
+    let mut children = fixture
+        .repo
+        .commit_children(&fixture.base.to_hex())
+        .await?
+        .into_iter()
+        .map(|commit| commit.oid)
+        .collect::<Vec<_>>();
+    children.sort();
+    let mut expected = vec![fixture.left, fixture.right];
+    expected.sort();
+    assert_eq!(children, expected);
+
+    assert!(
+        fixture
+            .repo
+            .is_ancestor(&fixture.base.to_hex(), "main")
+            .await?
+    );
+    assert!(
+        !fixture
+            .repo
+            .is_ancestor(&fixture.right.to_hex(), &fixture.left.to_hex())
+            .await?
+    );
+    assert_eq!(
+        fixture
+            .repo
+            .merge_base("left", "right")
+            .await?
+            .map(|commit| commit.oid),
+        Some(fixture.base)
+    );
+    assert_eq!(
+        fixture
+            .repo
+            .merge_base("left", "main")
+            .await?
+            .map(|commit| commit.oid),
+        Some(fixture.left)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn reachability_count_and_compare_use_graph_index() -> grit_lib_server::error::Result<()> {
+    let fixture = import_graph_fixture().await?;
+
+    let reachable = fixture.repo.reachable_from(&["left", "right"]).await?;
+    let reachable = reachable
+        .iter()
+        .map(|commit| commit.oid)
+        .collect::<Vec<_>>();
+    assert!(reachable.contains(&fixture.left));
+    assert!(reachable.contains(&fixture.right));
+    assert!(reachable.contains(&fixture.base));
+    assert!(!reachable.contains(&fixture.merge));
+
+    assert_eq!(fixture.repo.commit_count_estimate("main").await?, 4);
+
+    let comparison = fixture.repo.compare_commits("right", "main").await?;
+    assert_eq!(comparison.base.oid, fixture.right);
+    assert_eq!(comparison.head.oid, fixture.merge);
+    assert_eq!(
+        comparison.merge_base.as_ref().map(|commit| commit.oid),
+        Some(fixture.right)
+    );
+    assert_eq!(comparison.ahead_by, 2);
+    assert_eq!(comparison.behind_by, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_history_filters_by_path_when_tree_index_is_available(
+) -> grit_lib_server::error::Result<()> {
+    let fixture = import_hosting_fixture().await?;
+
+    let readme = fixture
+        .repo
+        .commit_history(
+            "main",
+            CommitHistoryOptions {
+                offset: 0,
+                limit: None,
+                path: Some("README.md".to_owned()),
+            },
+        )
+        .await?;
+    assert_eq!(
+        readme
+            .commits
+            .iter()
+            .map(|commit| commit.oid)
+            .collect::<Vec<_>>(),
+        vec![fixture.head_commit, fixture.base_commit]
+    );
+
+    let license = fixture
+        .repo
+        .commit_history(
+            "main",
+            CommitHistoryOptions {
+                offset: 0,
+                limit: None,
+                path: Some("LICENSE".to_owned()),
+            },
+        )
+        .await?;
+    assert_eq!(
+        license
+            .commits
+            .iter()
+            .map(|commit| commit.oid)
+            .collect::<Vec<_>>(),
+        vec![fixture.head_commit]
+    );
+
+    let missing = fixture
+        .repo
+        .commit_history(
+            "main",
+            CommitHistoryOptions {
+                offset: 0,
+                limit: None,
+                path: Some("missing.txt".to_owned()),
+            },
+        )
+        .await?;
+    assert!(missing.commits.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_graph_can_be_repaired_from_stored_objects() -> grit_lib_server::error::Result<()> {
+    let (tenant, repository) = ids()?;
+    let backend = Arc::new(MemoryBackend::new());
+    let repo = ServerRepository::new(tenant, repository, HashAlgo::Sha1, backend.clone());
+    let tree = StoredObject::new(ObjectKind::Tree, serialize_tree(&[]));
+    let tree_oid = tree.object_id(HashAlgo::Sha1);
+    backend
+        .write_object(repo.tenant(), repo.repository(), &tree_oid, &tree)
+        .await?;
+
+    let first_data = CommitData {
+        tree: tree_oid,
+        parents: Vec::new(),
+        author: "A U Thor <a@example.com> 1700000000 +0000".to_owned(),
+        committer: "A U Thor <a@example.com> 1700000000 +0000".to_owned(),
+        author_raw: Vec::new(),
+        committer_raw: Vec::new(),
+        encoding: None,
+        message: "first\n".to_owned(),
+        raw_message: None,
+    };
+    let first = StoredObject::new(ObjectKind::Commit, serialize_commit(&first_data));
+    let first_oid = first.object_id(HashAlgo::Sha1);
+    let second_data = CommitData {
+        tree: tree_oid,
+        parents: vec![first_oid],
+        author: "A U Thor <a@example.com> 1700000100 +0000".to_owned(),
+        committer: "A U Thor <a@example.com> 1700000100 +0000".to_owned(),
+        author_raw: Vec::new(),
+        committer_raw: Vec::new(),
+        encoding: None,
+        message: "second\n".to_owned(),
+        raw_message: None,
+    };
+    let second = StoredObject::new(ObjectKind::Commit, serialize_commit(&second_data));
+    let second_oid = second.object_id(HashAlgo::Sha1);
+
+    backend
+        .write_object(repo.tenant(), repo.repository(), &first_oid, &first)
+        .await?;
+    backend
+        .write_object(repo.tenant(), repo.repository(), &second_oid, &second)
+        .await?;
+    backend
+        .replace_commit_graph(repo.tenant(), repo.repository(), &[])
+        .await?;
+    backend
+        .write_ref(
+            repo.tenant(),
+            repo.repository(),
+            "refs/heads/main",
+            &StoredRef::Direct(second_oid),
+            None,
+        )
+        .await?;
+
+    assert!(backend
+        .list_indexed_commits(repo.tenant(), repo.repository())
+        .await?
+        .is_empty());
+    assert_eq!(repo.repair_commit_graph().await?, 2);
+    assert_eq!(
+        backend
+            .commit_parents(repo.tenant(), repo.repository(), &second_oid)
+            .await?,
+        vec![first_oid]
+    );
+    assert_eq!(repo.commit_count_estimate("main").await?, 2);
 
     Ok(())
 }
