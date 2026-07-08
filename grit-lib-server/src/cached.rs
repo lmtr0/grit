@@ -105,6 +105,19 @@ where
         }
         self.storage.object_exists(tenant, repository, oid).await
     }
+
+    async fn count_objects(&self, tenant: &TenantId, repository: &RepositoryId) -> Result<usize> {
+        self.storage.count_objects(tenant, repository).await
+    }
+
+    async fn list_object_ids(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        kind: Option<ObjectKind>,
+    ) -> Result<Vec<(ObjectId, ObjectKind)>> {
+        self.storage.list_object_ids(tenant, repository, kind).await
+    }
 }
 
 #[async_trait]

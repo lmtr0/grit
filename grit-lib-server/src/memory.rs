@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
 
 use async_trait::async_trait;
-use grit_lib::objects::ObjectId;
+use grit_lib::objects::{ObjectId, ObjectKind};
 
 use crate::cache::{Cache, CacheKey, CacheValue, EventPublisher, InvalidationEvent};
 use crate::error::{Error, Result};
@@ -97,6 +97,42 @@ impl ObjectStore for MemoryBackend {
         self.objects
             .read()
             .map(|objects| objects.contains_key(&(repo_key(tenant, repository), *oid)))
+            .map_err(|_| Error::Backend("memory object lock poisoned".to_owned()))
+    }
+
+    async fn count_objects(&self, tenant: &TenantId, repository: &RepositoryId) -> Result<usize> {
+        let repo = repo_key(tenant, repository);
+        self.objects
+            .read()
+            .map(|objects| {
+                objects
+                    .keys()
+                    .filter(|(candidate_repo, _)| candidate_repo == &repo)
+                    .count()
+            })
+            .map_err(|_| Error::Backend("memory object lock poisoned".to_owned()))
+    }
+
+    async fn list_object_ids(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        kind: Option<ObjectKind>,
+    ) -> Result<Vec<(ObjectId, ObjectKind)>> {
+        let repo = repo_key(tenant, repository);
+        self.objects
+            .read()
+            .map(|objects| {
+                let mut ids = objects
+                    .iter()
+                    .filter(|((candidate_repo, _), object)| {
+                        candidate_repo == &repo && kind.is_none_or(|kind| object.kind == kind)
+                    })
+                    .map(|((_, oid), object)| (*oid, object.kind))
+                    .collect::<Vec<_>>();
+                ids.sort_by_key(|(oid, _)| *oid);
+                ids
+            })
             .map_err(|_| Error::Backend("memory object lock poisoned".to_owned()))
     }
 }
