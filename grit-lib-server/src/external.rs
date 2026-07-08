@@ -2,10 +2,13 @@
 
 use std::collections::HashMap;
 use std::sync::RwLock;
+use std::time::Duration;
 
 use async_trait::async_trait;
+use time::OffsetDateTime;
 
 use crate::error::{Error, Result};
+use crate::views::SignedContentUrl;
 
 /// Immutable byte storage used by hybrid repository backends.
 #[async_trait]
@@ -57,10 +60,41 @@ pub trait ExternalByteStore: Send + Sync {
     async fn delete(&self, key: &str) -> Result<()>;
 }
 
+/// Creates signed URLs for direct client reads from an external byte store.
+#[async_trait]
+pub trait ContentUrlSigner: Send + Sync {
+    /// Return a signed URL for reading `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns signer backend errors or invalid expiration errors.
+    async fn presign_get(
+        &self,
+        key: &str,
+        issued_at: OffsetDateTime,
+        expires_in: Duration,
+    ) -> Result<SignedContentUrl>;
+}
+
 /// In-memory byte store for tests and local prototyping.
 #[derive(Default)]
 pub struct MemoryByteStore {
     bytes: RwLock<HashMap<String, Vec<u8>>>,
+}
+
+/// Deterministic signer for tests and local prototyping.
+pub struct StaticContentUrlSigner {
+    base_url: String,
+}
+
+impl StaticContentUrlSigner {
+    /// Create a signer that appends storage keys to `base_url`.
+    #[must_use]
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+        }
+    }
 }
 
 impl MemoryByteStore {
@@ -145,4 +179,58 @@ impl ExternalByteStore for MemoryByteStore {
             })
             .map_err(|_| Error::Backend("memory byte store lock poisoned".to_owned()))
     }
+}
+
+#[async_trait]
+impl ContentUrlSigner for StaticContentUrlSigner {
+    async fn presign_get(
+        &self,
+        key: &str,
+        issued_at: OffsetDateTime,
+        expires_in: Duration,
+    ) -> Result<SignedContentUrl> {
+        let expires_at = add_std_duration(issued_at, expires_in)?;
+        Ok(SignedContentUrl {
+            method: "GET".to_owned(),
+            url: format!(
+                "{}/{}?signed=1",
+                self.base_url.trim_end_matches('/'),
+                encode_url_path(key)
+            ),
+            headers: Vec::new(),
+            expires_at,
+        })
+    }
+}
+
+pub(crate) fn add_std_duration(
+    instant: OffsetDateTime,
+    duration: Duration,
+) -> Result<OffsetDateTime> {
+    let seconds = i64::try_from(duration.as_secs())
+        .map_err(|_| Error::Backend("signed URL duration exceeds i64 seconds".to_owned()))?;
+    let nanos = i32::try_from(duration.subsec_nanos())
+        .map_err(|_| Error::Backend("signed URL duration nanos exceeds i32".to_owned()))?;
+    instant
+        .checked_add(time::Duration::new(seconds, nanos))
+        .ok_or_else(|| Error::Backend("signed URL expiration timestamp overflow".to_owned()))
+}
+
+fn encode_url_path(path: &str) -> String {
+    path.split('/')
+        .map(encode_url_component)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn encode_url_component(component: &str) -> String {
+    let mut out = String::new();
+    for byte in component.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }

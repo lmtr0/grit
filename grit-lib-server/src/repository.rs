@@ -7,6 +7,7 @@ use grit_lib::objects::{parse_commit, parse_tag, parse_tree, HashAlgo, ObjectId,
 
 use crate::cache::{EventPublisher, InvalidationEvent, InvalidationEventKind};
 use crate::error::{Error, Result};
+use crate::external::{ContentUrlSigner, ExternalByteStore};
 use crate::ids::{RepositoryId, TenantId};
 use crate::maintenance::{ConsistencyReport, ExportOptions, ExportReport};
 use crate::policy::{AuditSink, PolicyActor};
@@ -21,6 +22,7 @@ use crate::storage::{
     RepackPlan, ServerStorage, StoredObject, StoredRef,
 };
 use crate::views::{
+    BlobContentDelivery, BlobContentView, BlobDownloadOptions, BlobDownloadView, BlobMetadataView,
     BlobView, BranchView, CommitComparison, CommitHistoryOptions, CommitHistoryPage, CommitSummary,
     CompareInputs, DiscoveredFile, RepositorySummary, TagView, TreeEntryView, TreeView,
 };
@@ -451,18 +453,7 @@ where
     /// Returns [`Error::PathNotFound`] for missing paths, [`Error::UnexpectedObjectKind`] when the
     /// path names a tree or non-blob object, plus backend and object parsing errors.
     pub async fn blob_at(&self, revision: &str, path: &str) -> Result<BlobView> {
-        let root = self.resolve_tree_root(revision).await?;
-        let path = normalize_tree_path(path);
-        let entry = self
-            .tree_entry(&root, &path)
-            .await?
-            .ok_or_else(|| Error::PathNotFound(path.clone()))?;
-        if entry.kind != ObjectKind::Blob {
-            return Err(Error::UnexpectedObjectKind {
-                expected: "blob",
-                actual: object_kind_name(entry.kind),
-            });
-        }
+        let (root, path, entry) = self.resolve_blob_entry(revision, path).await?;
         let object = self
             .storage
             .read_blob_at_path(&self.tenant, &self.repository, &root, &path)
@@ -480,6 +471,84 @@ where
             mode: entry.mode,
             data: object.data,
         })
+    }
+
+    /// Return blob metadata for `revision` at `path` without transferring file contents.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PathNotFound`] for missing paths, [`Error::UnexpectedObjectKind`] when the
+    /// path names a tree or non-blob object, plus backend errors.
+    pub async fn blob_metadata_at(&self, revision: &str, path: &str) -> Result<BlobMetadataView> {
+        let (_, path, entry) = self.resolve_blob_entry(revision, path).await?;
+        Ok(BlobMetadataView {
+            oid: entry.oid,
+            path,
+            mode: entry.mode,
+            size: entry.size,
+        })
+    }
+
+    /// Return blob contents inline or as a signed direct-download URL.
+    ///
+    /// The repository still resolves refs and paths, validates the object kind, and reads the blob
+    /// bytes once when a signed URL needs materialized raw blob contents.
+    ///
+    /// # Errors
+    ///
+    /// Returns backend errors, signer errors, or typed path/object errors.
+    pub async fn blob_content_at<B, U>(
+        &self,
+        revision: &str,
+        path: &str,
+        byte_store: &B,
+        signer: &U,
+        options: BlobDownloadOptions,
+    ) -> Result<BlobContentView>
+    where
+        B: ExternalByteStore,
+        U: ContentUrlSigner,
+    {
+        let (root, path, entry) = self.resolve_blob_entry(revision, path).await?;
+        let inline_threshold = u64::try_from(options.inline_threshold)
+            .map_err(|_| Error::Backend("blob inline threshold exceeds u64".to_owned()))?;
+        let object = self
+            .storage
+            .read_blob_at_path(&self.tenant, &self.repository, &root, &path)
+            .await?
+            .ok_or_else(|| Error::PathNotFound(path.clone()))?;
+        if object.kind != ObjectKind::Blob {
+            return Err(Error::UnexpectedObjectKind {
+                expected: "blob",
+                actual: object_kind_name(object.kind),
+            });
+        }
+        let size = u64::try_from(object.data.len())
+            .map_err(|_| Error::Backend("blob content size exceeds u64".to_owned()))?;
+        let auto_inline = matches!(options.delivery, BlobContentDelivery::Auto)
+            && (entry.size.is_some_and(|size| size <= inline_threshold)
+                || size <= inline_threshold);
+        if matches!(options.delivery, BlobContentDelivery::Inline) || auto_inline {
+            return Ok(BlobContentView::Inline(BlobView {
+                oid: entry.oid,
+                path,
+                mode: entry.mode,
+                data: object.data,
+            }));
+        }
+
+        let key = self.blob_content_key(&options.key_prefix, &entry.oid);
+        byte_store.put_if_absent(&key, &object.data).await?;
+        let signed_url = signer
+            .presign_get(&key, options.issued_at, options.expires_in)
+            .await?;
+        Ok(BlobContentView::Redirect(BlobDownloadView {
+            oid: entry.oid,
+            path,
+            mode: entry.mode,
+            size,
+            signed_url,
+        }))
     }
 
     /// Discover conventional files in a revision.
@@ -1075,6 +1144,41 @@ where
     async fn resolve_tree_root(&self, revision: &str) -> Result<ObjectId> {
         let oid = self.resolve_object_or_ref(revision).await?;
         self.tree_root_for_object(&oid, 0).await
+    }
+
+    async fn resolve_blob_entry(
+        &self,
+        revision: &str,
+        path: &str,
+    ) -> Result<(ObjectId, String, IndexedTreeEntry)> {
+        let root = self.resolve_tree_root(revision).await?;
+        let path = normalize_tree_path(path);
+        let entry = self
+            .tree_entry(&root, &path)
+            .await?
+            .ok_or_else(|| Error::PathNotFound(path.clone()))?;
+        if entry.kind != ObjectKind::Blob {
+            return Err(Error::UnexpectedObjectKind {
+                expected: "blob",
+                actual: object_kind_name(entry.kind),
+            });
+        }
+        Ok((root, path, entry))
+    }
+
+    fn blob_content_key(&self, key_prefix: &str, oid: &ObjectId) -> String {
+        let key = format!(
+            "tenants/{}/repositories/{}/blobs/{}/{}",
+            self.tenant.as_str(),
+            self.repository.as_str(),
+            oid.algo().name(),
+            oid.to_hex()
+        );
+        if key_prefix.is_empty() {
+            key
+        } else {
+            format!("{}/{key}", key_prefix.trim_matches('/'))
+        }
     }
 
     async fn tree_root_for_object(

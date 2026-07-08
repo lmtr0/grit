@@ -9,6 +9,7 @@ use grit_lib::odb::Odb;
 use grit_lib::refs;
 use grit_lib::repo::init_repository;
 use grit_lib_server::cached::CachedStorage;
+use grit_lib_server::external::{MemoryByteStore, StaticContentUrlSigner};
 use grit_lib_server::ids::{RepositoryId, TenantId};
 use grit_lib_server::import::{
     import_repository, import_repository_with_options, ImportOptions, ImportProgressEvent,
@@ -19,8 +20,12 @@ use grit_lib_server::repository::ServerRepository;
 use grit_lib_server::storage::{
     BrowseIndex, CommitGraphStore, IndexedTreeEntry, ObjectStore, RefStore, StoredObject, StoredRef,
 };
-use grit_lib_server::views::CommitHistoryOptions;
+use grit_lib_server::views::{
+    BlobContentDelivery, BlobContentView, BlobDownloadOptions, CommitHistoryOptions,
+};
 use sha1::{Digest as _, Sha1};
+use std::time::Duration;
+use time::OffsetDateTime;
 
 fn ids() -> grit_lib_server::error::Result<(TenantId, RepositoryId)> {
     Ok((TenantId::new("tenant-a")?, RepositoryId::new("repo-a")?))
@@ -558,6 +563,87 @@ async fn hosting_views_work_for_imported_memory_repository() -> grit_lib_server:
         Err(grit_lib_server::error::Error::UnexpectedObjectKind { .. })
     ));
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn blob_metadata_and_content_delivery_support_signed_urls(
+) -> grit_lib_server::error::Result<()> {
+    let fixture = import_hosting_fixture().await?;
+    let repo = &fixture.repo;
+    let issued_at = OffsetDateTime::from_unix_timestamp(1_700_000_000)
+        .map_err(|err| grit_lib_server::error::Error::Backend(format!("test timestamp: {err}")))?;
+
+    let metadata = repo.blob_metadata_at("main", "README.md").await?;
+    assert_eq!(metadata.oid, fixture.readme);
+    assert_eq!(metadata.path, "README.md");
+    assert_eq!(metadata.size, Some(16));
+
+    let inline = repo
+        .blob_content_at(
+            "main",
+            "README.md",
+            &MemoryByteStore::new(),
+            &StaticContentUrlSigner::new("https://objects.example"),
+            BlobDownloadOptions {
+                delivery: BlobContentDelivery::Auto,
+                inline_threshold: 1024,
+                expires_in: Duration::from_secs(60),
+                issued_at,
+                key_prefix: "raw".to_owned(),
+            },
+        )
+        .await?;
+    match inline {
+        BlobContentView::Inline(blob) => {
+            assert_eq!(blob.oid, fixture.readme);
+            assert_eq!(blob.data, b"# Demo\n\nUpdated\n");
+        }
+        BlobContentView::Redirect(_) => {
+            return Err(grit_lib_server::error::Error::Backend(
+                "small blob should be returned inline".to_owned(),
+            ));
+        }
+    }
+
+    let bytes = MemoryByteStore::new();
+    let signer = StaticContentUrlSigner::new("https://objects.example");
+    let signed = repo
+        .blob_content_at(
+            "main",
+            "README.md",
+            &bytes,
+            &signer,
+            BlobDownloadOptions {
+                delivery: BlobContentDelivery::SignedUrl,
+                inline_threshold: 0,
+                expires_in: Duration::from_secs(60),
+                issued_at,
+                key_prefix: "raw".to_owned(),
+            },
+        )
+        .await?;
+    match signed {
+        BlobContentView::Redirect(download) => {
+            assert_eq!(download.oid, fixture.readme);
+            assert_eq!(download.size, 16);
+            assert_eq!(download.signed_url.method, "GET");
+            assert!(download
+                .signed_url
+                .url
+                .contains("raw/tenants/tenant-a/repositories/repo-a/blobs/sha1/"));
+            assert_eq!(
+                download.signed_url.expires_at.unix_timestamp(),
+                1_700_000_060
+            );
+        }
+        BlobContentView::Inline(_) => {
+            return Err(grit_lib_server::error::Error::Backend(
+                "forced signed URL should not return inline content".to_owned(),
+            ));
+        }
+    }
+    assert_eq!(bytes.len()?, 1);
     Ok(())
 }
 

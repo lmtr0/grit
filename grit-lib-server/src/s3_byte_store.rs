@@ -1,10 +1,14 @@
 //! Amazon S3 byte store for externalized repository payloads.
 
 use async_trait::async_trait;
+use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use time::OffsetDateTime;
 
 use crate::error::{Error, Result};
-use crate::external::ExternalByteStore;
+use crate::external::{add_std_duration, ContentUrlSigner, ExternalByteStore};
+use crate::views::SignedContentUrl;
 
 /// External byte store backed by Amazon S3 or an S3-compatible service.
 #[derive(Clone)]
@@ -116,10 +120,55 @@ impl ExternalByteStore for S3ByteStore {
     }
 }
 
+#[async_trait]
+impl ContentUrlSigner for S3ByteStore {
+    async fn presign_get(
+        &self,
+        key: &str,
+        issued_at: OffsetDateTime,
+        expires_in: Duration,
+    ) -> Result<SignedContentUrl> {
+        let config = PresigningConfig::builder()
+            .start_time(system_time_from_offset(issued_at)?)
+            .expires_in(expires_in)
+            .build()
+            .map_err(|err| Error::Backend(format!("build s3 presigning config: {err}")))?;
+        let request = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .presigned(config)
+            .await
+            .map_err(|err| Error::Backend(format!("presign s3 object {key}: {err}")))?;
+        Ok(SignedContentUrl {
+            method: request.method().to_owned(),
+            url: request.uri().to_owned(),
+            headers: request
+                .headers()
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect(),
+            expires_at: add_std_duration(issued_at, expires_in)?,
+        })
+    }
+}
+
 fn is_missing_object_error<E>(err: &E) -> bool
 where
     E: std::fmt::Display,
 {
     let text = err.to_string();
     text.contains("NoSuchKey") || text.contains("NotFound")
+}
+
+fn system_time_from_offset(value: OffsetDateTime) -> Result<SystemTime> {
+    let seconds = value.unix_timestamp();
+    if seconds < 0 {
+        return Err(Error::Backend(
+            "signed URL issue time is before unix epoch".to_owned(),
+        ));
+    }
+    UNIX_EPOCH
+        .checked_add(Duration::new(seconds as u64, value.nanosecond()))
+        .ok_or_else(|| Error::Backend("signed URL issue time exceeds system time".to_owned()))
 }
