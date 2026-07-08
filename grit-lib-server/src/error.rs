@@ -18,6 +18,9 @@ pub enum Error {
     /// A requested repository was not found.
     #[error("repository not found: {0}")]
     RepositoryNotFound(String),
+    /// A repository could not be created or renamed because the destination exists.
+    #[error("repository already exists: {0}")]
+    RepositoryAlreadyExists(String),
     /// A requested ref was not found.
     #[error("ref not found: {0}")]
     RefNotFound(String),
