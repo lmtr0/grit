@@ -8,6 +8,9 @@
 pub mod cache;
 pub mod cached;
 pub mod error;
+pub mod external;
+#[cfg(feature = "externalized-postgres")]
+pub mod externalized;
 pub mod ids;
 pub mod import;
 pub mod layered;
@@ -21,6 +24,8 @@ pub mod protocol;
 #[cfg(feature = "redis")]
 pub mod redis_cache;
 pub mod repository;
+#[cfg(feature = "s3")]
+pub mod s3_byte_store;
 #[cfg(feature = "sqlx-postgres")]
 pub mod sqlx_postgres;
 pub mod storage;
@@ -34,6 +39,9 @@ pub mod prelude {
     };
     pub use crate::cached::CachedStorage;
     pub use crate::error::{Error, Result};
+    pub use crate::external::{ExternalByteStore, MemoryByteStore};
+    #[cfg(feature = "externalized-postgres")]
+    pub use crate::externalized::{ExternalStorageOptions, PgExternalizedStorage};
     pub use crate::ids::{RepositoryId, TenantId};
     pub use crate::import::{
         import_repository, import_repository_with_options, ImportCheckpoint, ImportOptions,
@@ -63,6 +71,8 @@ pub mod prelude {
     #[cfg(feature = "redis")]
     pub use crate::redis_cache::RedisCache;
     pub use crate::repository::ServerRepository;
+    #[cfg(feature = "s3")]
+    pub use crate::s3_byte_store::S3ByteStore;
     pub use crate::storage::{
         BrowseIndex, CommitGraphStore, ConfigStore, IndexedCommit, ObjectStore, PackMetadata,
         PackObjectIndex, PackStore, PackedObject, RefStore, ReflogEntry, ReflogStore, RepackPlan,

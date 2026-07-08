@@ -39,10 +39,20 @@ pub const MIGRATIONS: &[&str] = &[
         repository_id text not null,
         oid text not null,
         kind text not null,
-        data bytea not null,
+        data bytea,
+        storage_backend text not null default 'database',
+        storage_key text,
         created_at timestamptz not null default now(),
-        primary key (tenant_id, repository_id, oid)
+        primary key (tenant_id, repository_id, oid),
+        check ((storage_backend = 'database' and data is not null and storage_key is null)
+            or (storage_backend <> 'database' and data is null and storage_key is not null))
     )",
+    "alter table grit_objects
+        alter column data drop not null",
+    "alter table grit_objects
+        add column if not exists storage_backend text not null default 'database'",
+    "alter table grit_objects
+        add column if not exists storage_key text",
     "create table if not exists grit_refs (
         tenant_id text not null,
         repository_id text not null,
@@ -106,12 +116,22 @@ pub const MIGRATIONS: &[&str] = &[
         repository_id text not null,
         pack_checksum text not null,
         index_checksum text not null,
-        data bytea not null,
+        data bytea,
+        storage_backend text not null default 'database',
+        storage_key text,
         object_count integer not null,
         size_bytes bigint not null,
         storage_order bigserial not null,
-        primary key (tenant_id, repository_id, pack_checksum)
+        primary key (tenant_id, repository_id, pack_checksum),
+        check ((storage_backend = 'database' and data is not null and storage_key is null)
+            or (storage_backend <> 'database' and data is null and storage_key is not null))
     )",
+    "alter table grit_packs
+        alter column data drop not null",
+    "alter table grit_packs
+        add column if not exists storage_backend text not null default 'database'",
+    "alter table grit_packs
+        add column if not exists storage_key text",
     "create table if not exists grit_pack_objects (
         tenant_id text not null,
         repository_id text not null,
@@ -1148,7 +1168,7 @@ impl ObjectStore for PgServerStorage {
         oid: &ObjectId,
     ) -> Result<Option<StoredObject>> {
         let row = sqlx::query(
-            "select kind, data from grit_objects
+            "select kind, data, storage_backend, storage_key from grit_objects
              where tenant_id = $1 and repository_id = $2 and oid = $3",
         )
         .bind(tenant.as_str())
@@ -1160,7 +1180,17 @@ impl ObjectStore for PgServerStorage {
         if let Some(object) = row
             .map(|row| {
                 let kind: String = row.try_get("kind")?;
-                let data: Vec<u8> = row.try_get("data")?;
+                let data: Option<Vec<u8>> = row.try_get("data")?;
+                let storage_backend: String = row.try_get("storage_backend")?;
+                let storage_key: Option<String> = row.try_get("storage_key")?;
+                let Some(data) = data else {
+                    return Err(Error::Backend(format!(
+                        "object {} is stored in external backend {} at {}; use externalized storage",
+                        oid.to_hex(),
+                        storage_backend,
+                        storage_key.unwrap_or_else(|| "<missing key>".to_owned())
+                    )));
+                };
                 Ok::<StoredObject, Error>(StoredObject {
                     kind: name_to_kind(&kind)?,
                     data,
@@ -1787,16 +1817,31 @@ impl PackStore for PgServerStorage {
         repository: &RepositoryId,
         pack_checksum: &[u8],
     ) -> Result<Option<Vec<u8>>> {
-        sqlx::query_scalar(
-            "select data from grit_packs
+        let row = sqlx::query(
+            "select data, storage_backend, storage_key from grit_packs
              where tenant_id = $1 and repository_id = $2 and pack_checksum = $3",
         )
         .bind(tenant.as_str())
         .bind(repository.as_str())
         .bind(bytes_to_hex(pack_checksum))
         .fetch_optional(&self.pool)
-        .await
-        .map_err(Into::into)
+        .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let data: Option<Vec<u8>> = row.try_get("data")?;
+        if let Some(data) = data {
+            return Ok(Some(data));
+        }
+        let storage_backend: String = row.try_get("storage_backend")?;
+        let storage_key: Option<String> = row.try_get("storage_key")?;
+        Err(Error::Backend(format!(
+            "pack {} is stored in external backend {} at {}; use externalized storage",
+            bytes_to_hex(pack_checksum),
+            storage_backend,
+            storage_key.unwrap_or_else(|| "<missing key>".to_owned())
+        )))
     }
 
     async fn find_packed_object(

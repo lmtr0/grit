@@ -505,6 +505,19 @@ where
             .await
     }
 
+    async fn read_pack_range(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        pack_checksum: &[u8],
+        start: u64,
+        len: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        self.storage
+            .read_pack_range(tenant, repository, pack_checksum, start, len)
+            .await
+    }
+
     async fn find_packed_object(
         &self,
         tenant: &TenantId,

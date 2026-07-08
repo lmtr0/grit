@@ -97,6 +97,29 @@ pub(crate) fn read_object_at_offset(
     Ok(decode_pack_object_at(pack, &mut cursor, trailer_start, hash_algo)?.object)
 }
 
+pub(crate) fn read_object_from_pack_range(
+    range: &[u8],
+    expected_oid: &ObjectId,
+    absolute_offset: u64,
+    hash_algo: HashAlgo,
+) -> Result<StoredObject> {
+    let mut cursor = 0usize;
+    let decoded = decode_pack_object_at(range, &mut cursor, range.len(), hash_algo)?;
+    if decoded.index.offset != 0 {
+        return Err(Error::Protocol(
+            "partial pack object decoder did not start at range boundary".to_owned(),
+        ));
+    }
+    if decoded.index.oid != *expected_oid {
+        return Err(Error::Protocol(format!(
+            "pack object at offset {absolute_offset} decoded as {}, expected {}",
+            decoded.index.oid.to_hex(),
+            expected_oid.to_hex()
+        )));
+    }
+    Ok(decoded.object)
+}
+
 pub(crate) fn serialize_pack(
     objects: &[(ObjectId, StoredObject)],
     hash_algo: HashAlgo,
