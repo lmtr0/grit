@@ -8,6 +8,9 @@ use grit_lib::objects::{parse_commit, parse_tag, HashAlgo, ObjectId, ObjectKind}
 use crate::cache::{EventPublisher, InvalidationEvent, InvalidationEventKind};
 use crate::error::{Error, Result};
 use crate::ids::{RepositoryId, TenantId};
+use crate::protocol::receive_pack::{
+    PushPlan, PushPolicy, ReceivePackReport, ReceivePackRequest, ReceivePackService,
+};
 use crate::protocol::upload_pack::{
     FetchPackPlan, FetchPackResponse, RefAdvertisement, UploadPackRequest, UploadPackService,
 };
@@ -686,6 +689,41 @@ where
     pub async fn build_fetch_pack(&self, plan: FetchPackPlan) -> Result<FetchPackResponse> {
         UploadPackService::new(self.clone())
             .build_fetch_pack(plan)
+            .await
+    }
+
+    /// Parse, quarantine, and validate a receive-pack push request.
+    ///
+    /// # Errors
+    ///
+    /// Returns protocol, object closure, fast-forward, ref conflict, policy, backend, or object
+    /// parsing errors.
+    pub async fn prepare_push<P>(&self, request: ReceivePackRequest, policy: &P) -> Result<PushPlan>
+    where
+        P: PushPolicy,
+    {
+        ReceivePackService::new(self.clone())
+            .prepare_push(request, policy)
+            .await
+    }
+
+    /// Apply a prepared receive-pack push and publish ref invalidations.
+    ///
+    /// # Errors
+    ///
+    /// Returns backend, compare-and-swap conflict, reflog, or invalidation publishing errors.
+    pub async fn apply_push<P>(
+        &self,
+        plan: PushPlan,
+        actor: &str,
+        timestamp: time::OffsetDateTime,
+        publisher: &P,
+    ) -> Result<ReceivePackReport>
+    where
+        P: EventPublisher,
+    {
+        ReceivePackService::new(self.clone())
+            .apply_push(plan, actor, timestamp, publisher)
             .await
     }
 

@@ -27,6 +27,32 @@ pub enum Error {
     /// A compare-and-swap ref update failed because the stored value changed.
     #[error("ref update conflict: {0}")]
     RefConflict(String),
+    /// A ref cannot be created because another ref occupies its namespace.
+    #[error("ref namespace conflict: {refname} conflicts with {existing}")]
+    RefNamespaceConflict {
+        /// Ref that was being created or updated.
+        refname: String,
+        /// Existing or queued ref that conflicts with `refname`.
+        existing: String,
+    },
+    /// A branch update was rejected because it is not a fast-forward.
+    #[error("non-fast-forward update rejected for {refname}: {old_oid} -> {new_oid}")]
+    NonFastForward {
+        /// Ref that was rejected.
+        refname: String,
+        /// Current branch tip.
+        old_oid: String,
+        /// Proposed branch tip.
+        new_oid: String,
+    },
+    /// A push policy hook rejected a ref update.
+    #[error("push policy rejected {refname}: {reason}")]
+    PushPolicyRejected {
+        /// Ref that was rejected.
+        refname: String,
+        /// Policy-provided reason.
+        reason: String,
+    },
     /// A requested object was not found.
     #[error("object not found: {0}")]
     ObjectNotFound(String),
