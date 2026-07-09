@@ -39,5 +39,8 @@ async-nats = { version = "0.42", optional = true }
 futures-util = { version = "0.3", optional = true }
 
 [dev-dependencies]
+anyhow.workspace = true
+axum = "0.8"
+clap.workspace = true
 tempfile.workspace = true
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["full"] }

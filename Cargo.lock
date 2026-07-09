@@ -1629,10 +1629,13 @@ dependencies = [
 name = "grit-lib-server"
 version = "0.5.0"
 dependencies = [
+ "anyhow",
  "async-nats",
  "async-trait",
  "aws-config",
  "aws-sdk-s3",
+ "axum",
+ "clap",
  "flate2",
  "futures-util",
  "grit-lib",
