@@ -18,7 +18,7 @@ use grit_lib::objects::HashAlgo;
 use grit_lib::repo::Repository;
 use grit_lib_server::{
     ids::{RepositoryId, TenantId},
-    import::import_repository,
+    import::{import_repository_with_options, ImportOptions, ImportProgressEvent},
     memory::MemoryBackend,
     policy::{AllowAllPushPolicy, NoopAuditSink, PolicyActor},
     protocol::{
@@ -61,7 +61,33 @@ async fn main() -> Result<()> {
         HashAlgo::Sha1,
         storage.clone(),
     );
-    let report = import_repository(&repo, &source).await?;
+    println!("importing repository");
+
+    let mut last_tree_entry_report = 0;
+    let report =
+        import_repository_with_options(&repo, &source, ImportOptions::default(), |event| {
+            match event {
+                ImportProgressEvent::Checkpoint(checkpoint) => {
+                    println!(
+                        "imported {} objects, {} refs, {} tree entries",
+                        checkpoint.objects, checkpoint.refs, checkpoint.tree_entries
+                    );
+                }
+                ImportProgressEvent::TreeEntries { entries, .. } => {
+                    last_tree_entry_report += entries;
+                    if last_tree_entry_report >= 25_000 {
+                        println!("indexed another {last_tree_entry_report} tree entries");
+                        last_tree_entry_report = 0;
+                    }
+                }
+                ImportProgressEvent::Completed(_) => {
+                    println!("finalizing import");
+                }
+                _ => {}
+            }
+            Ok(())
+        })
+        .await?;
     println!(
         "imported {} refs, {} objects, {} tree entries",
         report.refs, report.objects, report.tree_entries
