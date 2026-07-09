@@ -1,0 +1,56 @@
+name: grit-dev-services
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "${GRIT_LIB_SERVER_REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 1s
+      retries: 30
+    volumes:
+      - redis-data:/data
+
+  nats:
+    image: nats:2-alpine
+    command: ["--http_port", "8222"]
+    ports:
+      - "${GRIT_LIB_SERVER_NATS_PORT:-4222}:4222"
+      - "${GRIT_LIB_SERVER_NATS_HTTP_PORT:-8222}:8222"
+
+  minio:
+    image: quay.io/minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-gritadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-gritadmin123}
+    ports:
+      - "${GRIT_LIB_SERVER_MINIO_PORT:-9000}:9000"
+      - "${GRIT_LIB_SERVER_MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-gritadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-gritadmin123}
+      MINIO_BUCKET: ${MINIO_BUCKET:-grit-server}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        until mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"; do
+          sleep 1
+        done
+        mc mb --ignore-existing "local/$$MINIO_BUCKET"
+        mc anonymous set none "local/$$MINIO_BUCKET"
+
+volumes:
+  redis-data:
+  minio-data:
