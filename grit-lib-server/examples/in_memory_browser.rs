@@ -7,7 +7,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -15,8 +15,10 @@ use axum::{
 };
 use clap::Parser;
 use grit_lib::objects::HashAlgo;
+use grit_lib::pkt_line;
 use grit_lib::repo::Repository;
 use grit_lib_server::{
+    error::Error,
     ids::{RepositoryId, TenantId},
     import::{import_repository_with_options, ImportOptions, ImportProgressEvent},
     memory::MemoryBackend,
@@ -103,6 +105,7 @@ async fn main() -> Result<()> {
         .route("/blob/{rev}/{*path}", get(blob))
         .route("/blob-text/{rev}/{*path}", get(blob_text))
         .route("/blob-meta/{rev}/{*path}", get(blob_meta))
+        .route("/info/refs", get(info_refs))
         .route("/git-upload-pack/info-refs", get(upload_pack_refs))
         .route("/git-upload-pack", post(upload_pack))
         .route("/git-receive-pack", post(receive_pack))
@@ -110,6 +113,20 @@ async fn main() -> Result<()> {
 
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
     println!("listening on http://{}", listener.local_addr()?);
+    println!(" Endpoint GET /summary");
+    println!(" Endpoint GET /branches");
+    println!(" Endpoint GET /tags");
+    println!(" Endpoint GET /commits/{{rev}}");
+    println!(" Endpoint GET /tree/{{rev}}");
+    println!(" Endpoint GET /tree/{{rev}}/{{*path}}");
+    println!(" Endpoint GET /blob/{{rev}}/{{*path}}");
+    println!(" Endpoint GET /blob-text/{{rev}}/{{*path}}");
+    println!(" Endpoint GET /blob-meta/{{rev}}/{{*path}}");
+    println!(" Endpoint GET /info/refs?service=git-upload-pack");
+    println!(" Endpoint GET /info/refs?service=git-receive-pack");
+    println!(" Endpoint GET /git-upload-pack/info-refs");
+    println!(" Endpoint POST /git-upload-pack");
+    println!(" Endpoint POST /git-receive-pack");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -189,15 +206,50 @@ async fn blob_meta(
     )))
 }
 
+async fn info_refs(
+    State(state): State<AppState>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    match query.get("service").map(String::as_str) {
+        Some("git-upload-pack") => upload_pack_advertisement(state).await,
+        Some("git-receive-pack") => receive_pack_advertisement(state).await,
+        Some(service) => {
+            Err(Error::Protocol(format!("unsupported smart HTTP service '{service}'")).into())
+        }
+        None => Err(Error::Protocol("missing smart HTTP service".to_owned()).into()),
+    }
+}
+
 async fn upload_pack_refs(State(state): State<AppState>) -> Result<Response, AppError> {
+    upload_pack_advertisement(state).await
+}
+
+async fn upload_pack_advertisement(state: AppState) -> Result<Response, AppError> {
     let service = UploadPackService::new(state.repo.clone());
     let advertisement = service.advertise_refs().await?;
-    let body = advertisement.to_pkt_lines(state.repo.hash_algo())?;
+    let refs = advertisement.to_pkt_lines(state.repo.hash_algo())?;
+    let body = smart_http_advertisement("git-upload-pack", refs)?;
     Ok((
         StatusCode::OK,
         [(
             header::CONTENT_TYPE,
             "application/x-git-upload-pack-advertisement",
+        )],
+        body,
+    )
+        .into_response())
+}
+
+async fn receive_pack_advertisement(state: AppState) -> Result<Response, AppError> {
+    let service = ReceivePackService::new(state.repo.clone());
+    let advertisement = service.advertise_refs().await?;
+    let refs = advertisement.to_pkt_lines(state.repo.hash_algo())?;
+    let body = smart_http_advertisement("git-receive-pack", refs)?;
+    Ok((
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "application/x-git-receive-pack-advertisement",
         )],
         body,
     )
@@ -240,4 +292,15 @@ async fn receive_pack(State(state): State<AppState>, body: Bytes) -> Result<Resp
         report.to_pkt_lines()?,
     )
         .into_response())
+}
+
+fn smart_http_advertisement(
+    service: &str,
+    refs: Vec<u8>,
+) -> grit_lib_server::error::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    pkt_line::write_line(&mut body, &format!("# service={service}"))?;
+    pkt_line::write_flush(&mut body)?;
+    body.extend_from_slice(&refs);
+    Ok(body)
 }

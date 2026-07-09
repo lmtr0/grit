@@ -88,6 +88,62 @@ impl ReceivePackCapability {
     }
 }
 
+/// One ref advertised by receive-pack.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReceivePackAdvertisedRef {
+    /// Full ref name, such as `refs/heads/main`.
+    pub name: String,
+    /// Object id the ref resolves to.
+    pub oid: ObjectId,
+}
+
+/// Receive-pack ref advertisement for protocol v0/v1 callers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReceivePackRefAdvertisement {
+    /// Advertised refs in wire order.
+    pub refs: Vec<ReceivePackAdvertisedRef>,
+    /// Capabilities attached to the first advertisement line.
+    pub capabilities: Vec<ReceivePackCapability>,
+}
+
+impl ReceivePackRefAdvertisement {
+    /// Serialize this advertisement as pkt-lines.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if pkt-line framing fails.
+    pub fn to_pkt_lines(&self, hash_algo: HashAlgo) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut refs = self.refs.iter();
+        let capabilities = self
+            .capabilities
+            .iter()
+            .map(ReceivePackCapability::as_wire_token)
+            .collect::<Vec<_>>()
+            .join(" ");
+        if let Some(first) = refs.next() {
+            pkt_line::write_packet_raw(
+                &mut out,
+                format!("{} {}\0{}\n", first.oid.to_hex(), first.name, capabilities).as_bytes(),
+            )?;
+            for advertised in refs {
+                pkt_line::write_line(
+                    &mut out,
+                    &format!("{} {}", advertised.oid.to_hex(), advertised.name),
+                )?;
+            }
+        } else {
+            let zero = ObjectId::null(hash_algo).to_hex();
+            pkt_line::write_packet_raw(
+                &mut out,
+                format!("{zero} capabilities^{{}}\0{capabilities}\n").as_bytes(),
+            )?;
+        }
+        pkt_line::write_flush(&mut out)?;
+        Ok(out)
+    }
+}
+
 /// Kind of ref update described by a receive-pack command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PushCommandKind {
@@ -244,6 +300,28 @@ where
     #[must_use]
     pub fn new(repo: ServerRepository<S>) -> Self {
         Self { repo }
+    }
+
+    /// Advertise repository refs for protocol v0/v1 pushes.
+    ///
+    /// # Errors
+    ///
+    /// Returns backend errors while resolving refs.
+    pub async fn advertise_refs(&self) -> Result<ReceivePackRefAdvertisement> {
+        let mut refs = Vec::new();
+        let mut listed = self.repo.list_refs("refs/").await?;
+        listed.sort_by(|left, right| left.0.cmp(&right.0));
+        for (refname, value) in listed {
+            let Some(oid) = resolve_stored_ref(&self.repo, &refname, value).await? else {
+                continue;
+            };
+            refs.push(ReceivePackAdvertisedRef { name: refname, oid });
+        }
+
+        Ok(ReceivePackRefAdvertisement {
+            refs,
+            capabilities: default_capabilities(self.repo.hash_algo()),
+        })
     }
 
     /// Parse, quarantine, and validate a push request before applying it.
@@ -694,6 +772,33 @@ fn validate_oid_algorithm(oid: ObjectId, hash_algo: HashAlgo) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn default_capabilities(hash_algo: HashAlgo) -> Vec<ReceivePackCapability> {
+    let mut capabilities = vec![
+        ReceivePackCapability::ReportStatus,
+        ReceivePackCapability::DeleteRefs,
+        ReceivePackCapability::Atomic,
+        ReceivePackCapability::Agent("grit-lib-server".to_owned()),
+    ];
+    if hash_algo != HashAlgo::Sha1 {
+        capabilities.push(ReceivePackCapability::ObjectFormat(hash_algo));
+    }
+    capabilities
+}
+
+async fn resolve_stored_ref<S>(
+    repo: &ServerRepository<S>,
+    refname: &str,
+    value: StoredRef,
+) -> Result<Option<ObjectId>>
+where
+    S: ServerStorage,
+{
+    match value {
+        StoredRef::Direct(oid) => Ok(Some(oid)),
+        StoredRef::Symbolic(_) => repo.resolve_ref(refname).await,
+    }
 }
 
 fn decode_pack(pack: &[u8], hash_algo: HashAlgo) -> Result<Vec<QuarantinedObject>> {

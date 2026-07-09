@@ -176,6 +176,34 @@ fn actor() -> PolicyActor {
 }
 
 #[tokio::test]
+async fn advertises_receive_pack_refs_and_push_capabilities() -> Result<()> {
+    let fixture = receive_fixture().await?;
+    let service = grit_lib_server::protocol::receive_pack::ReceivePackService::new(fixture.repo);
+    let advertisement = service.advertise_refs().await?;
+
+    assert!(advertisement
+        .refs
+        .iter()
+        .any(|advertised| advertised.name == "refs/heads/main"
+            && advertised.oid == fixture.base_commit));
+    assert!(advertisement
+        .capabilities
+        .contains(&ReceivePackCapability::ReportStatus));
+    assert!(advertisement
+        .capabilities
+        .contains(&ReceivePackCapability::DeleteRefs));
+    assert!(!advertisement
+        .capabilities
+        .contains(&ReceivePackCapability::OfsDelta));
+    assert!(
+        String::from_utf8_lossy(&advertisement.to_pkt_lines(HashAlgo::Sha1)?)
+            .contains("refs/heads/main")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn parses_receive_pack_commands_capabilities_and_pack() -> Result<()> {
     let fixture = receive_fixture().await?;
     let mut input = Vec::new();
