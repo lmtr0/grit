@@ -55,3 +55,26 @@ async fn pack_store_default_range_reads_slice_from_full_pack() -> grit_lib_serve
     assert_eq!(range, b"PACK");
     Ok(())
 }
+
+#[cfg(feature = "s3")]
+#[tokio::test]
+#[ignore = "requires GRIT_LIB_SERVER_S3_BUCKET and a live S3-compatible service"]
+async fn s3_byte_store_live_round_trip() -> grit_lib_server::error::Result<()> {
+    let Ok(bucket) = std::env::var("GRIT_LIB_SERVER_S3_BUCKET") else {
+        return Ok(());
+    };
+    let store = grit_lib_server::s3_byte_store::S3ByteStore::from_env(bucket).await?;
+    let key = format!("live-s3-{}-payload", std::process::id());
+
+    store.delete(&key).await?;
+    store.put_if_absent(&key, b"abcdef").await?;
+    store.put_if_absent(&key, b"ignored").await?;
+
+    assert_eq!(store.get(&key).await?, Some(b"abcdef".to_vec()));
+    assert_eq!(store.get_range(&key, 2, 3).await?, Some(b"cde".to_vec()));
+    assert_eq!(store.get_range(&key, 20, 3).await?, Some(Vec::new()));
+
+    store.delete(&key).await?;
+    assert_eq!(store.get(&key).await?, None);
+    Ok(())
+}

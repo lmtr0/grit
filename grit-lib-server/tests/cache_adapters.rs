@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use grit_lib::objects::{ObjectId, ObjectKind};
 #[cfg(feature = "nats")]
@@ -284,7 +285,16 @@ async fn redis_cache_live_round_trip() -> grit_lib_server::error::Result<()> {
         return Ok(());
     };
     let (tenant, repository) = ids()?;
-    let cache = grit_lib_server::redis_cache::RedisCache::connect(&url).await?;
+    let cache = grit_lib_server::redis_cache::RedisCache::connect_with_options(
+        &url,
+        grit_lib_server::redis_cache::RedisCacheOptions {
+            connection_timeout: Duration::from_secs(1),
+            response_timeout: Duration::from_secs(1),
+            connection_retries: 0,
+            ..grit_lib_server::redis_cache::RedisCacheOptions::default()
+        },
+    )
+    .await?;
     let key = CacheKey::Config("core.defaultBranch".to_owned());
     let value = CacheValue::typed(CacheValueKind::Config, br#""main""#);
 
