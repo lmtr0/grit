@@ -63,8 +63,9 @@ pub mod prelude {
     };
     pub use crate::protocol::receive_pack::{
         AllowAllPushPolicy, ProtectedRefPolicy, PushCommandKind, PushCommandStatus, PushPlan,
-        PushPolicy, PushPolicyContext, QuarantinedObject, ReceivePackCapability,
-        ReceivePackCommand, ReceivePackReport, ReceivePackRequest, ReceivePackService,
+        PushPolicy, PushPolicyContext, QuarantinedObject, ReceivePackAdvertisedRef,
+        ReceivePackCapability, ReceivePackCommand, ReceivePackRefAdvertisement, ReceivePackReport,
+        ReceivePackRequest, ReceivePackService,
     };
     pub use crate::protocol::upload_pack::{
         AdvertisedRef, FetchPackPlan, FetchPackResponse, GitProtocolVersion, RefAdvertisement,

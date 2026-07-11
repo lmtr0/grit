@@ -7,6 +7,7 @@ use flate2::read::ZlibDecoder;
 use grit_lib::check_ref_format::{check_refname_format, RefNameOptions};
 use grit_lib::objects::{parse_commit, parse_tag, parse_tree, HashAlgo, ObjectId, ObjectKind};
 use grit_lib::pkt_line;
+use grit_lib::unpack_objects::apply_delta;
 use sha1::{Digest as Sha1Digest, Sha1};
 use sha2::{Digest as Sha2Digest, Sha256};
 use time::OffsetDateTime;
@@ -85,6 +86,62 @@ impl ReceivePackCapability {
             Self::ObjectFormat(algo) => format!("object-format={}", algo.name()),
             Self::Other(value) => value.clone(),
         }
+    }
+}
+
+/// One ref advertised by receive-pack.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReceivePackAdvertisedRef {
+    /// Full ref name, such as `refs/heads/main`.
+    pub name: String,
+    /// Object id the ref resolves to.
+    pub oid: ObjectId,
+}
+
+/// Receive-pack ref advertisement for protocol v0/v1 callers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReceivePackRefAdvertisement {
+    /// Advertised refs in wire order.
+    pub refs: Vec<ReceivePackAdvertisedRef>,
+    /// Capabilities attached to the first advertisement line.
+    pub capabilities: Vec<ReceivePackCapability>,
+}
+
+impl ReceivePackRefAdvertisement {
+    /// Serialize this advertisement as pkt-lines.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if pkt-line framing fails.
+    pub fn to_pkt_lines(&self, hash_algo: HashAlgo) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut refs = self.refs.iter();
+        let capabilities = self
+            .capabilities
+            .iter()
+            .map(ReceivePackCapability::as_wire_token)
+            .collect::<Vec<_>>()
+            .join(" ");
+        if let Some(first) = refs.next() {
+            pkt_line::write_packet_raw(
+                &mut out,
+                format!("{} {}\0{}\n", first.oid.to_hex(), first.name, capabilities).as_bytes(),
+            )?;
+            for advertised in refs {
+                pkt_line::write_line(
+                    &mut out,
+                    &format!("{} {}", advertised.oid.to_hex(), advertised.name),
+                )?;
+            }
+        } else {
+            let zero = ObjectId::null(hash_algo).to_hex();
+            pkt_line::write_packet_raw(
+                &mut out,
+                format!("{zero} capabilities^{{}}\0{capabilities}\n").as_bytes(),
+            )?;
+        }
+        pkt_line::write_flush(&mut out)?;
+        Ok(out)
     }
 }
 
@@ -182,6 +239,13 @@ pub struct QuarantinedObject {
     pub object: StoredObject,
 }
 
+struct PendingDelta {
+    offset: usize,
+    base_oid: Option<ObjectId>,
+    base_offset: Option<usize>,
+    delta_data: Vec<u8>,
+}
+
 /// Validated push plan ready to apply.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PushPlan {
@@ -246,6 +310,28 @@ where
         Self { repo }
     }
 
+    /// Advertise repository refs for protocol v0/v1 pushes.
+    ///
+    /// # Errors
+    ///
+    /// Returns backend errors while resolving refs.
+    pub async fn advertise_refs(&self) -> Result<ReceivePackRefAdvertisement> {
+        let mut refs = Vec::new();
+        let mut listed = self.repo.list_refs("refs/").await?;
+        listed.sort_by(|left, right| left.0.cmp(&right.0));
+        for (refname, value) in listed {
+            let Some(oid) = resolve_stored_ref(&self.repo, &refname, value).await? else {
+                continue;
+            };
+            refs.push(ReceivePackAdvertisedRef { name: refname, oid });
+        }
+
+        Ok(ReceivePackRefAdvertisement {
+            refs,
+            capabilities: default_capabilities(self.repo.hash_algo()),
+        })
+    }
+
     /// Parse, quarantine, and validate a push request before applying it.
     ///
     /// # Errors
@@ -262,7 +348,7 @@ where
         P: PushPolicy,
     {
         self.validate_commands(&request).await?;
-        let quarantine = decode_pack(&request.pack, self.repo.hash_algo())?;
+        let quarantine = self.decode_pack(&request.pack).await?;
         let quarantined = quarantine_map(&quarantine);
         self.verify_closure(&request, &quarantined).await?;
         self.verify_fast_forwards(&request, &quarantined).await?;
@@ -305,7 +391,9 @@ where
         let plan = match self.prepare_push(request, &actor, policy).await {
             Ok(plan) => plan,
             Err(err) => {
-                let pushed_commits = decode_pack(&request_for_audit.pack, self.repo.hash_algo())
+                let pushed_commits = self
+                    .decode_pack(&request_for_audit.pack)
+                    .await
                     .map(|quarantine| pushed_commit_ids(&quarantine))
                     .unwrap_or_default();
                 let fallback_context =
@@ -360,9 +448,6 @@ where
     where
         P: EventPublisher,
     {
-        if !plan.request.pack.is_empty() {
-            self.repo.write_pack(&plan.request.pack).await?;
-        }
         for quarantined in &plan.quarantine {
             self.repo
                 .storage()
@@ -622,6 +707,140 @@ where
             .ok_or_else(|| Error::ObjectNotFound(oid.to_hex()))
     }
 
+    async fn decode_pack(&self, pack: &[u8]) -> Result<Vec<QuarantinedObject>> {
+        if pack.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let hash_algo = self.repo.hash_algo();
+        let trailer_len = hash_algo.len();
+        if pack.len() < 12 + trailer_len {
+            return Err(Error::Protocol("pack stream is too short".to_owned()));
+        }
+        let trailer_start = pack.len() - trailer_len;
+        verify_pack_trailer(&pack[..trailer_start], &pack[trailer_start..], hash_algo)?;
+        if &pack[..4] != b"PACK" {
+            return Err(Error::Protocol(
+                "pack stream has invalid signature".to_owned(),
+            ));
+        }
+        let version = read_u32_be(pack, 4)?;
+        if version != 2 && version != 3 {
+            return Err(Error::Protocol(format!(
+                "unsupported pack version {version}"
+            )));
+        }
+
+        let count = read_u32_be(pack, 8)? as usize;
+        let mut cursor = 12usize;
+        let mut by_offset = HashMap::new();
+        let mut by_oid = HashMap::new();
+        let mut pending = Vec::new();
+
+        for _ in 0..count {
+            let object_offset = cursor;
+            let (type_code, size) = read_type_and_size(pack, &mut cursor, trailer_start)?;
+            match type_code {
+                1..=4 => {
+                    let kind = object_kind_from_pack_type(type_code)?;
+                    let data = read_zlib_data(pack, &mut cursor, trailer_start, size)?;
+                    let object = StoredObject::new(kind, data.clone());
+                    let oid = object.object_id(hash_algo);
+                    by_offset.insert(object_offset, (kind, data.clone()));
+                    by_oid.insert(oid, (kind, data));
+                }
+                6 => {
+                    let negative_offset = read_ofs_delta_offset(pack, &mut cursor, trailer_start)?;
+                    let base_offset =
+                        object_offset.checked_sub(negative_offset).ok_or_else(|| {
+                            Error::Protocol("ofs-delta base offset underflow".to_owned())
+                        })?;
+                    let delta_data = read_zlib_data(pack, &mut cursor, trailer_start, size)?;
+                    pending.push(PendingDelta {
+                        offset: object_offset,
+                        base_oid: None,
+                        base_offset: Some(base_offset),
+                        delta_data,
+                    });
+                }
+                7 => {
+                    let base = read_pack_slice(pack, &mut cursor, trailer_start, hash_algo.len())?;
+                    let base_oid = ObjectId::from_bytes(base)?;
+                    let delta_data = read_zlib_data(pack, &mut cursor, trailer_start, size)?;
+                    pending.push(PendingDelta {
+                        offset: object_offset,
+                        base_oid: Some(base_oid),
+                        base_offset: None,
+                        delta_data,
+                    });
+                }
+                other => {
+                    return Err(Error::Protocol(format!(
+                        "unknown packed-object type {other}"
+                    )));
+                }
+            }
+        }
+
+        if cursor != trailer_start {
+            return Err(Error::Protocol(
+                "pack stream has trailing bytes before checksum".to_owned(),
+            ));
+        }
+
+        let mut remaining = pending;
+        loop {
+            if remaining.is_empty() {
+                break;
+            }
+
+            let before = remaining.len();
+            let mut still_pending = Vec::new();
+            for delta in remaining {
+                let base = if let Some(base_offset) = delta.base_offset {
+                    by_offset.get(&base_offset).cloned()
+                } else if let Some(base_oid) = delta.base_oid {
+                    if let Some(base) = by_oid.get(&base_oid) {
+                        Some(base.clone())
+                    } else {
+                        self.repo
+                            .read_object(&base_oid)
+                            .await?
+                            .map(|object| (object.kind, object.data))
+                    }
+                } else {
+                    None
+                };
+
+                if let Some((base_kind, base_data)) = base {
+                    let data = apply_delta(&base_data, &delta.delta_data)?;
+                    let object = StoredObject::new(base_kind, data.clone());
+                    let oid = object.object_id(hash_algo);
+                    by_offset.insert(delta.offset, (base_kind, data.clone()));
+                    by_oid.insert(oid, (base_kind, data));
+                } else {
+                    still_pending.push(delta);
+                }
+            }
+
+            remaining = still_pending;
+            if remaining.len() == before {
+                return Err(Error::Protocol(format!(
+                    "{} delta object(s) could not be resolved",
+                    remaining.len()
+                )));
+            }
+        }
+
+        Ok(by_oid
+            .into_iter()
+            .map(|(oid, (kind, data))| QuarantinedObject {
+                oid,
+                object: StoredObject::new(kind, data),
+            })
+            .collect())
+    }
+
     async fn append_reflog(
         &self,
         command: &ReceivePackCommand,
@@ -696,61 +915,31 @@ fn validate_oid_algorithm(oid: ObjectId, hash_algo: HashAlgo) -> Result<()> {
     Ok(())
 }
 
-fn decode_pack(pack: &[u8], hash_algo: HashAlgo) -> Result<Vec<QuarantinedObject>> {
-    if pack.is_empty() {
-        return Ok(Vec::new());
+fn default_capabilities(hash_algo: HashAlgo) -> Vec<ReceivePackCapability> {
+    let mut capabilities = vec![
+        ReceivePackCapability::ReportStatus,
+        ReceivePackCapability::DeleteRefs,
+        ReceivePackCapability::Atomic,
+        ReceivePackCapability::Agent("grit-lib-server".to_owned()),
+    ];
+    if hash_algo != HashAlgo::Sha1 {
+        capabilities.push(ReceivePackCapability::ObjectFormat(hash_algo));
     }
-    let trailer_len = hash_algo.len();
-    if pack.len() < 12 + trailer_len {
-        return Err(Error::Protocol("pack stream is too short".to_owned()));
+    capabilities
+}
+
+async fn resolve_stored_ref<S>(
+    repo: &ServerRepository<S>,
+    refname: &str,
+    value: StoredRef,
+) -> Result<Option<ObjectId>>
+where
+    S: ServerStorage,
+{
+    match value {
+        StoredRef::Direct(oid) => Ok(Some(oid)),
+        StoredRef::Symbolic(_) => repo.resolve_ref(refname).await,
     }
-    let trailer_start = pack.len() - trailer_len;
-    verify_pack_trailer(&pack[..trailer_start], &pack[trailer_start..], hash_algo)?;
-    if &pack[..4] != b"PACK" {
-        return Err(Error::Protocol(
-            "pack stream has invalid signature".to_owned(),
-        ));
-    }
-    let version = read_u32_be(pack, 4)?;
-    if version != 2 && version != 3 {
-        return Err(Error::Protocol(format!(
-            "unsupported pack version {version}"
-        )));
-    }
-    let count = read_u32_be(pack, 8)? as usize;
-    let mut cursor = 12usize;
-    let mut objects = Vec::with_capacity(count);
-    for _ in 0..count {
-        let (type_code, size) = read_type_and_size(pack, &mut cursor, trailer_start)?;
-        let kind = object_kind_from_pack_type(type_code)?;
-        let mut decoder = ZlibDecoder::new(&pack[cursor..trailer_start]);
-        let mut data = Vec::with_capacity(size);
-        decoder.read_to_end(&mut data)?;
-        let consumed = decoder.total_in() as usize;
-        if consumed == 0 {
-            return Err(Error::Protocol(
-                "pack object has empty zlib stream".to_owned(),
-            ));
-        }
-        if data.len() != size {
-            return Err(Error::Protocol(format!(
-                "pack object size mismatch: expected {size}, got {}",
-                data.len()
-            )));
-        }
-        cursor = cursor
-            .checked_add(consumed)
-            .ok_or_else(|| Error::Protocol("pack cursor overflow".to_owned()))?;
-        let object = StoredObject::new(kind, data);
-        let oid = object.object_id(hash_algo);
-        objects.push(QuarantinedObject { oid, object });
-    }
-    if cursor != trailer_start {
-        return Err(Error::Protocol(
-            "pack stream has trailing bytes before checksum".to_owned(),
-        ));
-    }
-    Ok(objects)
 }
 
 fn verify_pack_trailer(body: &[u8], trailer: &[u8], hash_algo: HashAlgo) -> Result<()> {
@@ -799,6 +988,64 @@ fn read_type_and_size(pack: &[u8], cursor: &mut usize, end: usize) -> Result<(u8
     Ok((type_code, size))
 }
 
+fn read_ofs_delta_offset(pack: &[u8], cursor: &mut usize, end: usize) -> Result<usize> {
+    let mut byte = read_pack_byte(pack, cursor, end)?;
+    let mut value = (byte & 0x7f) as usize;
+    while byte & 0x80 != 0 {
+        byte = read_pack_byte(pack, cursor, end)?;
+        value = value
+            .checked_add(1)
+            .and_then(|value| value.checked_shl(7))
+            .and_then(|value| value.checked_add((byte & 0x7f) as usize))
+            .ok_or_else(|| Error::Protocol("ofs-delta offset overflow".to_owned()))?;
+    }
+    Ok(value)
+}
+
+fn read_pack_slice<'a>(
+    pack: &'a [u8],
+    cursor: &mut usize,
+    end: usize,
+    len: usize,
+) -> Result<&'a [u8]> {
+    let next = cursor
+        .checked_add(len)
+        .ok_or_else(|| Error::Protocol("pack cursor overflow".to_owned()))?;
+    if next > end {
+        return Err(Error::Protocol("pack stream truncated".to_owned()));
+    }
+    let slice = &pack[*cursor..next];
+    *cursor = next;
+    Ok(slice)
+}
+
+fn read_zlib_data(
+    pack: &[u8],
+    cursor: &mut usize,
+    end: usize,
+    expected_size: usize,
+) -> Result<Vec<u8>> {
+    let mut decoder = ZlibDecoder::new(&pack[*cursor..end]);
+    let mut data = Vec::with_capacity(expected_size);
+    decoder.read_to_end(&mut data)?;
+    let consumed = decoder.total_in() as usize;
+    if consumed == 0 {
+        return Err(Error::Protocol(
+            "pack object has empty zlib stream".to_owned(),
+        ));
+    }
+    if data.len() != expected_size {
+        return Err(Error::Protocol(format!(
+            "pack object size mismatch: expected {expected_size}, got {}",
+            data.len()
+        )));
+    }
+    *cursor = cursor
+        .checked_add(consumed)
+        .ok_or_else(|| Error::Protocol("pack cursor overflow".to_owned()))?;
+    Ok(data)
+}
+
 fn read_pack_byte(pack: &[u8], cursor: &mut usize, end: usize) -> Result<u8> {
     if *cursor >= end {
         return Err(Error::Protocol("pack stream truncated".to_owned()));
@@ -814,9 +1061,6 @@ fn object_kind_from_pack_type(type_code: u8) -> Result<ObjectKind> {
         2 => Ok(ObjectKind::Tree),
         3 => Ok(ObjectKind::Blob),
         4 => Ok(ObjectKind::Tag),
-        6 | 7 => Err(Error::Protocol(
-            "delta objects are not supported by receive-pack yet".to_owned(),
-        )),
         other => Err(Error::Protocol(format!(
             "unknown packed-object type {other}"
         ))),

@@ -6,14 +6,14 @@ use grit_lib::objects::{
     serialize_commit, serialize_tag, serialize_tree, CommitData, HashAlgo, ObjectId, ObjectKind,
     TagData, TreeEntry,
 };
-use grit_lib::pkt_line;
+use grit_lib::{delta_encode::encode_prefix_extension_delta, pkt_line};
 use grit_lib_server::cache::InvalidationEventKind;
 use grit_lib_server::error::{Error, Result};
 use grit_lib_server::ids::{RepositoryId, TenantId};
 use grit_lib_server::memory::MemoryBackend;
 use grit_lib_server::policy::{
-    AuditEvent, AuditOutcome, AuditSink, AuthorizationContext, AuthorizationProvider, PolicyActor,
-    PolicyDecision, RefUpdatePolicyContext, RepositoryPolicy,
+    AuditEvent, AuditOutcome, AuditSink, AuthorizationContext, AuthorizationProvider,
+    NoopAuditSink, PolicyActor, PolicyDecision, RefUpdatePolicyContext, RepositoryPolicy,
 };
 use grit_lib_server::protocol::receive_pack::{
     AllowAllPushPolicy, ProtectedRefPolicy, PushPolicy, PushPolicyContext, ReceivePackCapability,
@@ -31,6 +31,7 @@ fn ids() -> Result<(TenantId, RepositoryId)> {
 struct ReceiveFixture {
     repo: ServerRepository<MemoryBackend>,
     backend: Arc<MemoryBackend>,
+    base_blob: ObjectId,
     base_commit: ObjectId,
 }
 
@@ -75,6 +76,7 @@ async fn receive_fixture() -> Result<ReceiveFixture> {
     Ok(ReceiveFixture {
         repo,
         backend,
+        base_blob,
         base_commit: base_commit_oid,
     })
 }
@@ -150,6 +152,37 @@ fn pack(objects: &[StoredObject]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+fn pack_with_ref_delta(
+    whole_objects: &[StoredObject],
+    base_oid: ObjectId,
+    delta: &[u8],
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"PACK");
+    out.extend_from_slice(&2u32.to_be_bytes());
+    let count = u32::try_from(whole_objects.len() + 1)
+        .map_err(|_| Error::Protocol("too many test objects".to_owned()))?;
+    out.extend_from_slice(&count.to_be_bytes());
+
+    for object in whole_objects {
+        encode_pack_object_header(&mut out, pack_type_code(object.kind), object.data.len());
+        let mut encoder = ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &object.data)?;
+        out.extend_from_slice(&encoder.finish()?);
+    }
+
+    encode_pack_object_header(&mut out, 7, delta.len());
+    out.extend_from_slice(base_oid.as_bytes());
+    let mut encoder = ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut encoder, delta)?;
+    out.extend_from_slice(&encoder.finish()?);
+
+    let mut hasher = Sha1::new();
+    hasher.update(&out);
+    out.extend_from_slice(&hasher.finalize());
+    Ok(out)
+}
+
 fn request(commands: Vec<ReceivePackCommand>, pack: Vec<u8>) -> ReceivePackRequest {
     ReceivePackRequest {
         commands,
@@ -173,6 +206,34 @@ fn timestamp() -> Result<OffsetDateTime> {
 
 fn actor() -> PolicyActor {
     PolicyActor::new("tester", "tester <tester@example.com>")
+}
+
+#[tokio::test]
+async fn advertises_receive_pack_refs_and_push_capabilities() -> Result<()> {
+    let fixture = receive_fixture().await?;
+    let service = grit_lib_server::protocol::receive_pack::ReceivePackService::new(fixture.repo);
+    let advertisement = service.advertise_refs().await?;
+
+    assert!(advertisement
+        .refs
+        .iter()
+        .any(|advertised| advertised.name == "refs/heads/main"
+            && advertised.oid == fixture.base_commit));
+    assert!(advertisement
+        .capabilities
+        .contains(&ReceivePackCapability::ReportStatus));
+    assert!(advertisement
+        .capabilities
+        .contains(&ReceivePackCapability::DeleteRefs));
+    assert!(!advertisement
+        .capabilities
+        .contains(&ReceivePackCapability::OfsDelta));
+    assert!(
+        String::from_utf8_lossy(&advertisement.to_pkt_lines(HashAlgo::Sha1)?)
+            .contains("refs/heads/main")
+    );
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -257,6 +318,57 @@ async fn fast_forward_push_updates_ref_reflog_and_events() -> Result<()> {
             InvalidationEventKind::RefWrite { refname } if refname == "refs/heads/main"
         )
     }));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn fast_forward_push_accepts_ref_delta_against_existing_object() -> Result<()> {
+    let fixture = receive_fixture().await?;
+    let target_blob = StoredObject::new(ObjectKind::Blob, b"base\nnext\n");
+    let target_blob_oid = target_blob.object_id(HashAlgo::Sha1);
+    let tree = StoredObject::new(
+        ObjectKind::Tree,
+        serialize_tree(&[TreeEntry {
+            mode: 0o100644,
+            name: b"README.md".to_vec(),
+            oid: target_blob_oid,
+        }]),
+    );
+    let tree_oid = tree.object_id(HashAlgo::Sha1);
+    let commit = commit_object(tree_oid, vec![fixture.base_commit], 1_700_000_100, "delta");
+    let commit_oid = commit.object_id(HashAlgo::Sha1);
+    let delta = encode_prefix_extension_delta(b"base\n", &target_blob.data)?;
+    let push = request(
+        vec![command(fixture.base_commit, commit_oid, "refs/heads/main")],
+        pack_with_ref_delta(&[tree, commit], fixture.base_blob, &delta)?,
+    );
+
+    let report = fixture
+        .repo
+        .receive_push(
+            push,
+            actor(),
+            timestamp()?,
+            &AllowAllPushPolicy,
+            fixture.backend.as_ref(),
+            &NoopAuditSink,
+        )
+        .await?;
+
+    assert_eq!(report.unpacked_objects, 3);
+    assert_eq!(
+        fixture.repo.resolve_ref("refs/heads/main").await?,
+        Some(commit_oid)
+    );
+    assert_eq!(
+        fixture
+            .repo
+            .read_object(&target_blob_oid)
+            .await?
+            .map(|object| object.data),
+        Some(target_blob.data)
+    );
 
     Ok(())
 }
