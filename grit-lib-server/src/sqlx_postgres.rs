@@ -206,6 +206,56 @@ impl ObjectStore for PgServerStorage {
         .await?;
         Ok(exists)
     }
+
+    async fn count_objects(&self, tenant: &TenantId, repository: &RepositoryId) -> Result<usize> {
+        let count: i64 = sqlx::query_scalar(
+            "select count(*) from grit_objects
+             where tenant_id = $1 and repository_id = $2",
+        )
+        .bind(tenant.as_str())
+        .bind(repository.as_str())
+        .fetch_one(&self.pool)
+        .await?;
+        usize::try_from(count).map_err(|_| Error::Backend("object count exceeds usize".to_owned()))
+    }
+
+    async fn list_object_ids(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        kind: Option<ObjectKind>,
+    ) -> Result<Vec<(ObjectId, ObjectKind)>> {
+        let rows = if let Some(kind) = kind {
+            sqlx::query(
+                "select oid, kind from grit_objects
+                 where tenant_id = $1 and repository_id = $2 and kind = $3
+                 order by oid",
+            )
+            .bind(tenant.as_str())
+            .bind(repository.as_str())
+            .bind(kind_to_name(kind))
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "select oid, kind from grit_objects
+                 where tenant_id = $1 and repository_id = $2
+                 order by oid",
+            )
+            .bind(tenant.as_str())
+            .bind(repository.as_str())
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        rows.into_iter()
+            .map(|row| {
+                let oid: String = row.try_get("oid")?;
+                let kind: String = row.try_get("kind")?;
+                Ok((ObjectId::from_hex(&oid)?, name_to_kind(&kind)?))
+            })
+            .collect()
+    }
 }
 
 #[async_trait]

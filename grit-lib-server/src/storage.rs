@@ -116,6 +116,17 @@ pub trait ObjectStore: Send + Sync {
         repository: &RepositoryId,
         oid: &ObjectId,
     ) -> Result<bool>;
+
+    /// Count objects stored for a repository.
+    async fn count_objects(&self, tenant: &TenantId, repository: &RepositoryId) -> Result<usize>;
+
+    /// List object ids, optionally restricted by Git object kind.
+    async fn list_object_ids(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        kind: Option<ObjectKind>,
+    ) -> Result<Vec<(ObjectId, ObjectKind)>>;
 }
 
 /// Reference storage operations for one hosted repository.

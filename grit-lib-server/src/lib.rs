@@ -29,5 +29,8 @@ pub mod prelude {
         BrowseIndex, ConfigStore, ObjectStore, RefStore, ReflogEntry, ReflogStore, StoredObject,
         StoredRef,
     };
-    pub use crate::views::{BlobView, CommitSummary, TreeEntryView};
+    pub use crate::views::{
+        BlobView, BranchView, CommitSummary, CompareInputs, DiscoveredFile, RepositorySummary,
+        TagView, TreeEntryView, TreeView,
+    };
 }
