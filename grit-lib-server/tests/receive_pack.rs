@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use flate2::write::ZlibEncoder;
@@ -11,9 +11,13 @@ use grit_lib_server::cache::InvalidationEventKind;
 use grit_lib_server::error::{Error, Result};
 use grit_lib_server::ids::{RepositoryId, TenantId};
 use grit_lib_server::memory::MemoryBackend;
+use grit_lib_server::policy::{
+    AuditEvent, AuditOutcome, AuditSink, AuthorizationContext, AuthorizationProvider, PolicyActor,
+    PolicyDecision, RefUpdatePolicyContext, RepositoryPolicy,
+};
 use grit_lib_server::protocol::receive_pack::{
-    AllowAllPushPolicy, PushPolicy, PushPolicyContext, ReceivePackCapability, ReceivePackCommand,
-    ReceivePackRequest,
+    AllowAllPushPolicy, ProtectedRefPolicy, PushPolicy, PushPolicyContext, ReceivePackCapability,
+    ReceivePackCommand, ReceivePackRequest,
 };
 use grit_lib_server::repository::ServerRepository;
 use grit_lib_server::storage::{RefStore, ReflogStore, StoredObject, StoredRef};
@@ -167,6 +171,10 @@ fn timestamp() -> Result<OffsetDateTime> {
         .map_err(|err| Error::Backend(err.to_string()))
 }
 
+fn actor() -> PolicyActor {
+    PolicyActor::new("tester", "tester <tester@example.com>")
+}
+
 #[tokio::test]
 async fn parses_receive_pack_commands_capabilities_and_pack() -> Result<()> {
     let fixture = receive_fixture().await?;
@@ -210,7 +218,7 @@ async fn fast_forward_push_updates_ref_reflog_and_events() -> Result<()> {
 
     let plan = fixture
         .repo
-        .prepare_push(request, &AllowAllPushPolicy)
+        .prepare_push(request, &actor(), &AllowAllPushPolicy)
         .await?;
     assert!(fixture.repo.read_object(&commit_oid).await?.is_none());
 
@@ -276,7 +284,7 @@ async fn non_fast_forward_branch_update_is_rejected() -> Result<()> {
 
     let err = fixture
         .repo
-        .prepare_push(request, &AllowAllPushPolicy)
+        .prepare_push(request, &actor(), &AllowAllPushPolicy)
         .await
         .err()
         .ok_or_else(|| Error::Backend("non-fast-forward push unexpectedly passed".to_owned()))?;
@@ -306,7 +314,7 @@ async fn creates_and_deletes_branch() -> Result<()> {
     );
     let create_plan = fixture
         .repo
-        .prepare_push(create, &AllowAllPushPolicy)
+        .prepare_push(create, &actor(), &AllowAllPushPolicy)
         .await?;
     fixture
         .repo
@@ -332,7 +340,7 @@ async fn creates_and_deletes_branch() -> Result<()> {
     );
     let delete_plan = fixture
         .repo
-        .prepare_push(delete, &AllowAllPushPolicy)
+        .prepare_push(delete, &actor(), &AllowAllPushPolicy)
         .await?;
     fixture
         .repo
@@ -380,7 +388,7 @@ async fn updates_tag_without_fast_forward_check() -> Result<()> {
     );
     let plan = fixture
         .repo
-        .prepare_push(update, &AllowAllPushPolicy)
+        .prepare_push(update, &actor(), &AllowAllPushPolicy)
         .await?;
     fixture
         .repo
@@ -414,7 +422,7 @@ async fn missing_object_is_rejected_before_refs_change() -> Result<()> {
 
     let err = fixture
         .repo
-        .prepare_push(push, &AllowAllPushPolicy)
+        .prepare_push(push, &actor(), &AllowAllPushPolicy)
         .await
         .err()
         .ok_or_else(|| Error::Backend("missing object push unexpectedly passed".to_owned()))?;
@@ -429,11 +437,99 @@ struct RejectAllPolicy;
 
 #[async_trait]
 impl PushPolicy for RejectAllPolicy {
-    async fn check(&self, context: &PushPolicyContext) -> Result<()> {
-        Err(Error::PushPolicyRejected {
-            refname: context.refname.clone(),
-            reason: "test policy".to_owned(),
-        })
+    async fn update(&self, _context: &RefUpdatePolicyContext) -> Result<PolicyDecision> {
+        Ok(PolicyDecision::deny("test policy"))
+    }
+}
+
+#[derive(Default)]
+struct RecordingAuditSink {
+    events: Mutex<Vec<AuditEvent>>,
+}
+
+impl RecordingAuditSink {
+    fn events(&self) -> Result<Vec<AuditEvent>> {
+        self.events
+            .lock()
+            .map(|events| events.clone())
+            .map_err(|_| Error::Backend("audit event lock poisoned".to_owned()))
+    }
+}
+
+#[async_trait]
+impl AuditSink for RecordingAuditSink {
+    async fn record(&self, event: &AuditEvent) -> Result<()> {
+        self.events
+            .lock()
+            .map(|mut events| events.push(event.clone()))
+            .map_err(|_| Error::Backend("audit event lock poisoned".to_owned()))
+    }
+}
+
+struct DenyAuthorization;
+
+#[async_trait]
+impl AuthorizationProvider for DenyAuthorization {
+    async fn check(&self, _context: &AuthorizationContext) -> Result<PolicyDecision> {
+        Ok(PolicyDecision::deny("no write permission"))
+    }
+}
+
+#[derive(Default)]
+struct RecordingHookPolicy {
+    pre_receive_count: Mutex<usize>,
+    update_refs: Mutex<Vec<String>>,
+    post_receive_count: Mutex<usize>,
+}
+
+impl RecordingHookPolicy {
+    fn counts(&self) -> Result<(usize, Vec<String>, usize)> {
+        let pre_receive_count = *self
+            .pre_receive_count
+            .lock()
+            .map_err(|_| Error::Backend("pre-receive lock poisoned".to_owned()))?;
+        let update_refs = self
+            .update_refs
+            .lock()
+            .map(|refs| refs.clone())
+            .map_err(|_| Error::Backend("update hook lock poisoned".to_owned()))?;
+        let post_receive_count = *self
+            .post_receive_count
+            .lock()
+            .map_err(|_| Error::Backend("post-receive lock poisoned".to_owned()))?;
+        Ok((pre_receive_count, update_refs, post_receive_count))
+    }
+}
+
+#[async_trait]
+impl PushPolicy for RecordingHookPolicy {
+    async fn pre_receive(&self, context: &PushPolicyContext) -> Result<PolicyDecision> {
+        assert_eq!(context.actor.id, "tester");
+        assert_eq!(context.updates.len(), 1);
+        self.pre_receive_count
+            .lock()
+            .map(|mut count| *count += 1)
+            .map_err(|_| Error::Backend("pre-receive lock poisoned".to_owned()))?;
+        Ok(PolicyDecision::Allow)
+    }
+
+    async fn update(&self, context: &RefUpdatePolicyContext) -> Result<PolicyDecision> {
+        assert_eq!(context.actor.id, "tester");
+        assert_eq!(context.pushed_commits.len(), 1);
+        self.update_refs
+            .lock()
+            .map(|mut refs| refs.push(context.update.refname.clone()))
+            .map_err(|_| Error::Backend("update hook lock poisoned".to_owned()))?;
+        Ok(PolicyDecision::Allow)
+    }
+
+    async fn post_receive(&self, context: &PushPolicyContext) -> Result<()> {
+        assert_eq!(context.actor.id, "tester");
+        assert_eq!(context.pushed_commits.len(), 1);
+        self.post_receive_count
+            .lock()
+            .map(|mut count| *count += 1)
+            .map_err(|_| Error::Backend("post-receive lock poisoned".to_owned()))
     }
 }
 
@@ -448,7 +544,7 @@ async fn policy_rejection_blocks_push() -> Result<()> {
 
     let err = fixture
         .repo
-        .prepare_push(push, &RejectAllPolicy)
+        .prepare_push(push, &actor(), &RejectAllPolicy)
         .await
         .err()
         .ok_or_else(|| Error::Backend("policy rejection unexpectedly passed".to_owned()))?;
@@ -459,6 +555,154 @@ async fn policy_rejection_blocks_push() -> Result<()> {
     assert_eq!(
         fixture.repo.resolve_ref("refs/heads/main").await?,
         Some(fixture.base_commit)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn receive_push_runs_hooks_and_audits_accepted_write() -> Result<()> {
+    let fixture = receive_fixture().await?;
+    let audit = RecordingAuditSink::default();
+    let hooks = RecordingHookPolicy::default();
+    let (blob, _, tree, _, commit, commit_oid) = advanced_objects(fixture.base_commit, b"next\n");
+    let push = request(
+        vec![command(fixture.base_commit, commit_oid, "refs/heads/main")],
+        pack(&[blob, tree, commit])?,
+    );
+
+    let report = fixture
+        .repo
+        .receive_push(
+            push,
+            actor(),
+            timestamp()?,
+            &hooks,
+            fixture.backend.as_ref(),
+            &audit,
+        )
+        .await?;
+    assert_eq!(report.unpacked_objects, 3);
+    assert_eq!(
+        fixture.repo.resolve_ref("refs/heads/main").await?,
+        Some(commit_oid)
+    );
+
+    let (pre_receive_count, update_refs, post_receive_count) = hooks.counts()?;
+    assert_eq!(pre_receive_count, 1);
+    assert_eq!(update_refs, vec!["refs/heads/main"]);
+    assert_eq!(post_receive_count, 1);
+
+    let events = audit.events()?;
+    assert_eq!(events.len(), 1);
+    assert!(matches!(events[0].outcome, AuditOutcome::Accepted));
+    assert_eq!(events[0].actor.id, "tester");
+    assert_eq!(events[0].updates[0].refname, "refs/heads/main");
+    assert_eq!(events[0].pushed_commits, vec![commit_oid]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn authorization_denial_blocks_push_and_audits_rejection() -> Result<()> {
+    let fixture = receive_fixture().await?;
+    let audit = RecordingAuditSink::default();
+    let policy = RepositoryPolicy::new(DenyAuthorization, AllowAllPushPolicy);
+    let (blob, _, tree, _, commit, commit_oid) = advanced_objects(fixture.base_commit, b"next\n");
+    let push = request(
+        vec![command(fixture.base_commit, commit_oid, "refs/heads/main")],
+        pack(&[blob, tree, commit])?,
+    );
+
+    let err = fixture
+        .repo
+        .receive_push(
+            push,
+            actor(),
+            timestamp()?,
+            &policy,
+            fixture.backend.as_ref(),
+            &audit,
+        )
+        .await
+        .err()
+        .ok_or_else(|| Error::Backend("authorization denial unexpectedly passed".to_owned()))?;
+    assert!(matches!(err, Error::AuthorizationDenied { actor, .. } if actor == "tester"));
+    assert_eq!(
+        fixture.repo.resolve_ref("refs/heads/main").await?,
+        Some(fixture.base_commit)
+    );
+
+    let events = audit.events()?;
+    assert_eq!(events.len(), 1);
+    assert!(matches!(events[0].outcome, AuditOutcome::Rejected { .. }));
+    assert_eq!(events[0].updates[0].refname, "refs/heads/main");
+    assert_eq!(events[0].pushed_commits, vec![commit_oid]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn protected_branch_and_tag_policies_reject_updates() -> Result<()> {
+    let fixture = receive_fixture().await?;
+    let (blob, _, tree, _, commit, commit_oid) = advanced_objects(fixture.base_commit, b"next\n");
+    let protected_branch = request(
+        vec![command(fixture.base_commit, commit_oid, "refs/heads/main")],
+        pack(&[blob, tree, commit])?,
+    );
+
+    let branch_err = fixture
+        .repo
+        .prepare_push(
+            protected_branch,
+            &actor(),
+            &ProtectedRefPolicy::branches(["main"]),
+        )
+        .await
+        .err()
+        .ok_or_else(|| Error::Backend("protected branch unexpectedly passed".to_owned()))?;
+    assert!(matches!(
+        branch_err,
+        Error::PushPolicyRejected { refname, .. } if refname == "refs/heads/main"
+    ));
+
+    let tag_payload = StoredObject::new(ObjectKind::Blob, b"tag payload\n");
+    let tag_oid = tag_payload.object_id(HashAlgo::Sha1);
+    let protected_tag = request(
+        vec![command(
+            ObjectId::null(HashAlgo::Sha1),
+            tag_oid,
+            "refs/tags/v1",
+        )],
+        pack(&[tag_payload])?,
+    );
+
+    let tag_err = fixture
+        .repo
+        .prepare_push(protected_tag, &actor(), &ProtectedRefPolicy::tags(["v1"]))
+        .await
+        .err()
+        .ok_or_else(|| Error::Backend("protected tag unexpectedly passed".to_owned()))?;
+    assert!(matches!(
+        tag_err,
+        Error::PushPolicyRejected { refname, .. } if refname == "refs/tags/v1"
+    ));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_only_apis_do_not_require_authorization_provider() -> Result<()> {
+    let fixture = receive_fixture().await?;
+
+    let summary = fixture.repo.summary().await?;
+    assert_eq!(summary.refs_count, 2);
+    assert_eq!(
+        summary
+            .default_branch
+            .ok_or_else(|| Error::Backend("missing default branch".to_owned()))?
+            .refname,
+        "refs/heads/main"
     );
 
     Ok(())
@@ -480,10 +724,13 @@ async fn concurrent_push_conflict_is_typed() -> Result<()> {
         vec![command(fixture.base_commit, right_oid, "refs/heads/main")],
         pack(&[right_blob, right_tree, right_commit])?,
     );
-    let left_plan = fixture.repo.prepare_push(left, &AllowAllPushPolicy).await?;
+    let left_plan = fixture
+        .repo
+        .prepare_push(left, &actor(), &AllowAllPushPolicy)
+        .await?;
     let right_plan = fixture
         .repo
-        .prepare_push(right, &AllowAllPushPolicy)
+        .prepare_push(right, &actor(), &AllowAllPushPolicy)
         .await?;
 
     fixture

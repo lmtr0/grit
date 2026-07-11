@@ -8,6 +8,7 @@ use grit_lib::objects::{parse_commit, parse_tag, HashAlgo, ObjectId, ObjectKind}
 use crate::cache::{EventPublisher, InvalidationEvent, InvalidationEventKind};
 use crate::error::{Error, Result};
 use crate::ids::{RepositoryId, TenantId};
+use crate::policy::{AuditSink, PolicyActor};
 use crate::protocol::receive_pack::{
     PushPlan, PushPolicy, ReceivePackReport, ReceivePackRequest, ReceivePackService,
 };
@@ -698,12 +699,42 @@ where
     ///
     /// Returns protocol, object closure, fast-forward, ref conflict, policy, backend, or object
     /// parsing errors.
-    pub async fn prepare_push<P>(&self, request: ReceivePackRequest, policy: &P) -> Result<PushPlan>
+    pub async fn prepare_push<P>(
+        &self,
+        request: ReceivePackRequest,
+        actor: &PolicyActor,
+        policy: &P,
+    ) -> Result<PushPlan>
     where
         P: PushPolicy,
     {
         ReceivePackService::new(self.clone())
-            .prepare_push(request, policy)
+            .prepare_push(request, actor, policy)
+            .await
+    }
+
+    /// Prepare, apply, audit, and run all receive-pack policy hooks for one push.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, authorization, policy, backend, audit, or invalidation publishing
+    /// errors.
+    pub async fn receive_push<P, E, A>(
+        &self,
+        request: ReceivePackRequest,
+        actor: PolicyActor,
+        timestamp: time::OffsetDateTime,
+        policy: &P,
+        publisher: &E,
+        audit: &A,
+    ) -> Result<ReceivePackReport>
+    where
+        P: PushPolicy,
+        E: EventPublisher,
+        A: AuditSink,
+    {
+        ReceivePackService::new(self.clone())
+            .receive_push(request, actor, timestamp, policy, publisher, audit)
             .await
     }
 

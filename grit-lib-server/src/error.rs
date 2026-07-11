@@ -53,6 +53,20 @@ pub enum Error {
         /// Policy-provided reason.
         reason: String,
     },
+    /// A repository authorization provider denied access.
+    #[error("authorization denied for {actor} on {tenant}/{repository} {permission}: {reason}")]
+    AuthorizationDenied {
+        /// Tenant whose repository was accessed.
+        tenant: String,
+        /// Repository that was accessed.
+        repository: String,
+        /// Actor that requested access.
+        actor: String,
+        /// Permission that was denied.
+        permission: &'static str,
+        /// Provider-supplied reason.
+        reason: String,
+    },
     /// A requested object was not found.
     #[error("object not found: {0}")]
     ObjectNotFound(String),
