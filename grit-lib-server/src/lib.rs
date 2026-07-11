@@ -36,6 +36,11 @@ pub mod prelude {
     pub use crate::layered::LayeredCache;
     #[cfg(feature = "nats")]
     pub use crate::nats_invalidation::{NatsInvalidationPublisher, NatsInvalidationSubscriber};
+    pub use crate::protocol::receive_pack::{
+        AllowAllPushPolicy, ProtectedRefPolicy, PushCommandKind, PushCommandStatus, PushPlan,
+        PushPolicy, PushPolicyContext, QuarantinedObject, ReceivePackCapability,
+        ReceivePackCommand, ReceivePackReport, ReceivePackRequest, ReceivePackService,
+    };
     pub use crate::protocol::upload_pack::{
         AdvertisedRef, FetchPackPlan, FetchPackResponse, GitProtocolVersion, RefAdvertisement,
         UploadPackCapability, UploadPackRequest, UploadPackService,
