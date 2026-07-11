@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use grit_lib::objects::{ObjectId, ObjectKind};
+use serde::{Deserialize, Serialize};
 
-use crate::cache::{Cache, CacheKey, CacheValue};
+use crate::cache::{Cache, CacheKey, CacheValue, CacheValueKind};
 use crate::error::{Error, Result};
 use crate::ids::{RepositoryId, TenantId};
 use crate::storage::{
@@ -53,7 +54,7 @@ where
     ) -> Result<Option<StoredObject>> {
         let key = CacheKey::Object(oid.to_hex());
         if let Some(value) = self.cache.get(tenant, repository, &key).await? {
-            return decode_object(&value.bytes).map(Some);
+            return decode_object(&value).map(Some);
         }
         let object = self.storage.read_object(tenant, repository, oid).await?;
         if let Some(object) = object.as_ref() {
@@ -62,7 +63,7 @@ where
                     tenant,
                     repository,
                     &key,
-                    CacheValue::new(encode_object(object)),
+                    CacheValue::typed(CacheValueKind::Object, encode_object(object)?),
                 )
                 .await?;
         }
@@ -84,7 +85,7 @@ where
                 tenant,
                 repository,
                 &CacheKey::Object(oid.to_hex()),
-                CacheValue::new(encode_object(object)),
+                CacheValue::typed(CacheValueKind::Object, encode_object(object)?),
             )
             .await
     }
@@ -134,12 +135,17 @@ where
     ) -> Result<Option<StoredRef>> {
         let key = CacheKey::Ref(refname.to_owned());
         if let Some(value) = self.cache.get(tenant, repository, &key).await? {
-            return decode_ref(&value.bytes).map(Some);
+            return decode_ref(&value).map(Some);
         }
         let value = self.storage.read_ref(tenant, repository, refname).await?;
         if let Some(value) = value.as_ref() {
             self.cache
-                .put(tenant, repository, &key, CacheValue::new(encode_ref(value)))
+                .put(
+                    tenant,
+                    repository,
+                    &key,
+                    CacheValue::typed(CacheValueKind::Ref, encode_ref(value)?),
+                )
                 .await?;
         }
         Ok(value)
@@ -161,16 +167,10 @@ where
                 tenant,
                 repository,
                 &CacheKey::Ref(refname.to_owned()),
-                CacheValue::new(encode_ref(value)),
+                CacheValue::typed(CacheValueKind::Ref, encode_ref(value)?),
             )
             .await?;
-        self.cache
-            .invalidate(
-                tenant,
-                repository,
-                &CacheKey::RefList(ref_parent_prefix(refname)),
-            )
-            .await
+        invalidate_ref_lists(self.cache.as_ref(), tenant, repository, refname).await
     }
 
     async fn delete_ref(
@@ -186,13 +186,7 @@ where
         self.cache
             .invalidate(tenant, repository, &CacheKey::Ref(refname.to_owned()))
             .await?;
-        self.cache
-            .invalidate(
-                tenant,
-                repository,
-                &CacheKey::RefList(ref_parent_prefix(refname)),
-            )
-            .await
+        invalidate_ref_lists(self.cache.as_ref(), tenant, repository, refname).await
     }
 
     async fn list_refs(
@@ -201,7 +195,20 @@ where
         repository: &RepositoryId,
         prefix: &str,
     ) -> Result<Vec<(String, StoredRef)>> {
-        self.storage.list_refs(tenant, repository, prefix).await
+        let key = CacheKey::RefList(prefix.to_owned());
+        if let Some(value) = self.cache.get(tenant, repository, &key).await? {
+            return decode_ref_list(&value);
+        }
+        let refs = self.storage.list_refs(tenant, repository, prefix).await?;
+        self.cache
+            .put(
+                tenant,
+                repository,
+                &key,
+                CacheValue::typed(CacheValueKind::RefList, encode_ref_list(&refs)?),
+            )
+            .await?;
+        Ok(refs)
     }
 }
 
@@ -242,7 +249,22 @@ where
         repository: &RepositoryId,
         key: &str,
     ) -> Result<Option<String>> {
-        self.storage.get_config(tenant, repository, key).await
+        let cache_key = CacheKey::Config(key.to_owned());
+        if let Some(value) = self.cache.get(tenant, repository, &cache_key).await? {
+            return decode_config(&value).map(Some);
+        }
+        let value = self.storage.get_config(tenant, repository, key).await?;
+        if let Some(value) = value.as_ref() {
+            self.cache
+                .put(
+                    tenant,
+                    repository,
+                    &cache_key,
+                    CacheValue::typed(CacheValueKind::Config, encode_config(value)?),
+                )
+                .await?;
+        }
+        Ok(value)
     }
 
     async fn set_config(
@@ -254,6 +276,14 @@ where
     ) -> Result<()> {
         self.storage
             .set_config(tenant, repository, key, value)
+            .await?;
+        self.cache
+            .put(
+                tenant,
+                repository,
+                &CacheKey::Config(key.to_owned()),
+                CacheValue::typed(CacheValueKind::Config, encode_config(value)?),
+            )
             .await
     }
 
@@ -281,7 +311,8 @@ where
     ) -> Result<()> {
         self.storage
             .upsert_tree_entries(tenant, repository, entries)
-            .await
+            .await?;
+        self.cache.invalidate_repository(tenant, repository).await
     }
 
     async fn list_tree_entries(
@@ -291,9 +322,26 @@ where
         tree_oid: &ObjectId,
         prefix: &str,
     ) -> Result<Vec<IndexedTreeEntry>> {
-        self.storage
+        let key = CacheKey::TreeList {
+            tree: tree_oid.to_hex(),
+            prefix: prefix.to_owned(),
+        };
+        if let Some(value) = self.cache.get(tenant, repository, &key).await? {
+            return decode_tree_list(&value);
+        }
+        let entries = self
+            .storage
             .list_tree_entries(tenant, repository, tree_oid, prefix)
-            .await
+            .await?;
+        self.cache
+            .put(
+                tenant,
+                repository,
+                &key,
+                CacheValue::typed(CacheValueKind::TreeList, encode_tree_list(&entries)?),
+            )
+            .await?;
+        Ok(entries)
     }
 
     async fn read_blob_at_path(
@@ -323,7 +371,17 @@ where
     ) -> Result<()> {
         self.storage
             .upsert_commits(tenant, repository, commits)
-            .await
+            .await?;
+        for commit in commits {
+            self.cache
+                .invalidate(
+                    tenant,
+                    repository,
+                    &CacheKey::CommitSummary(commit.oid.to_hex()),
+                )
+                .await?;
+        }
+        Ok(())
     }
 
     async fn replace_commit_graph(
@@ -334,7 +392,8 @@ where
     ) -> Result<()> {
         self.storage
             .replace_commit_graph(tenant, repository, commits)
-            .await
+            .await?;
+        self.cache.invalidate_repository(tenant, repository).await
     }
 
     async fn read_indexed_commit(
@@ -343,9 +402,28 @@ where
         repository: &RepositoryId,
         oid: &ObjectId,
     ) -> Result<Option<IndexedCommit>> {
-        self.storage
+        let key = CacheKey::CommitSummary(oid.to_hex());
+        if let Some(value) = self.cache.get(tenant, repository, &key).await? {
+            return decode_indexed_commit(&value).map(Some);
+        }
+        let commit = self
+            .storage
             .read_indexed_commit(tenant, repository, oid)
-            .await
+            .await?;
+        if let Some(commit) = commit.as_ref() {
+            self.cache
+                .put(
+                    tenant,
+                    repository,
+                    &key,
+                    CacheValue::typed(
+                        CacheValueKind::CommitSummary,
+                        encode_indexed_commit(commit)?,
+                    ),
+                )
+                .await?;
+        }
+        Ok(commit)
     }
 
     async fn commit_parents(
@@ -375,81 +453,278 @@ where
     }
 }
 
-fn encode_object(object: &StoredObject) -> Vec<u8> {
-    let mut out = Vec::with_capacity(object.data.len() + 1);
-    out.push(kind_code(object.kind));
-    out.extend_from_slice(&object.data);
-    out
+fn encode_object(object: &StoredObject) -> Result<Vec<u8>> {
+    serde_json::to_vec(&StoredObjectWire::from(object))
+        .map_err(|err| Error::Cache(format!("serialize cached object: {err}")))
 }
 
-fn decode_object(bytes: &[u8]) -> Result<StoredObject> {
-    let Some((&kind, data)) = bytes.split_first() else {
-        return Err(Error::Cache("cached object payload is empty".to_owned()));
-    };
-    Ok(StoredObject {
-        kind: code_kind(kind)?,
-        data: data.to_vec(),
-    })
+fn decode_object(value: &CacheValue) -> Result<StoredObject> {
+    require_kind(value, CacheValueKind::Object)?;
+    let wire: StoredObjectWire = serde_json::from_slice(&value.bytes)
+        .map_err(|err| Error::Cache(format!("decode cached object: {err}")))?;
+    wire.try_into()
 }
 
-fn encode_ref(value: &StoredRef) -> Vec<u8> {
-    match value {
-        StoredRef::Direct(oid) => {
-            let mut out = Vec::with_capacity(1 + oid.algo().hex_len());
-            out.push(b'D');
-            out.extend_from_slice(oid.to_hex().as_bytes());
-            out
-        }
-        StoredRef::Symbolic(target) => {
-            let mut out = Vec::with_capacity(1 + target.len());
-            out.push(b'S');
-            out.extend_from_slice(target.as_bytes());
-            out
-        }
+fn encode_ref(value: &StoredRef) -> Result<Vec<u8>> {
+    serde_json::to_vec(&StoredRefWire::from(value))
+        .map_err(|err| Error::Cache(format!("serialize cached ref: {err}")))
+}
+
+fn decode_ref(value: &CacheValue) -> Result<StoredRef> {
+    require_kind(value, CacheValueKind::Ref)?;
+    let wire: StoredRefWire = serde_json::from_slice(&value.bytes)
+        .map_err(|err| Error::Cache(format!("decode cached ref: {err}")))?;
+    wire.try_into()
+}
+
+fn encode_ref_list(refs: &[(String, StoredRef)]) -> Result<Vec<u8>> {
+    let wire = refs
+        .iter()
+        .map(|(name, value)| (name.clone(), StoredRefWire::from(value)))
+        .collect::<Vec<_>>();
+    serde_json::to_vec(&wire)
+        .map_err(|err| Error::Cache(format!("serialize cached ref list: {err}")))
+}
+
+fn decode_ref_list(value: &CacheValue) -> Result<Vec<(String, StoredRef)>> {
+    require_kind(value, CacheValueKind::RefList)?;
+    let wire: Vec<(String, StoredRefWire)> = serde_json::from_slice(&value.bytes)
+        .map_err(|err| Error::Cache(format!("decode cached ref list: {err}")))?;
+    wire.into_iter()
+        .map(|(name, value)| Ok((name, value.try_into()?)))
+        .collect()
+}
+
+fn encode_config(value: &str) -> Result<Vec<u8>> {
+    serde_json::to_vec(value).map_err(|err| Error::Cache(format!("serialize cached config: {err}")))
+}
+
+fn decode_config(value: &CacheValue) -> Result<String> {
+    require_kind(value, CacheValueKind::Config)?;
+    serde_json::from_slice(&value.bytes)
+        .map_err(|err| Error::Cache(format!("decode cached config: {err}")))
+}
+
+fn encode_tree_list(entries: &[IndexedTreeEntry]) -> Result<Vec<u8>> {
+    let wire = entries
+        .iter()
+        .map(IndexedTreeEntryWire::from)
+        .collect::<Vec<_>>();
+    serde_json::to_vec(&wire)
+        .map_err(|err| Error::Cache(format!("serialize cached tree list: {err}")))
+}
+
+fn decode_tree_list(value: &CacheValue) -> Result<Vec<IndexedTreeEntry>> {
+    require_kind(value, CacheValueKind::TreeList)?;
+    let wire: Vec<IndexedTreeEntryWire> = serde_json::from_slice(&value.bytes)
+        .map_err(|err| Error::Cache(format!("decode cached tree list: {err}")))?;
+    wire.into_iter().map(TryInto::try_into).collect()
+}
+
+fn encode_indexed_commit(commit: &IndexedCommit) -> Result<Vec<u8>> {
+    serde_json::to_vec(&IndexedCommitWire::from(commit))
+        .map_err(|err| Error::Cache(format!("serialize cached commit summary: {err}")))
+}
+
+fn decode_indexed_commit(value: &CacheValue) -> Result<IndexedCommit> {
+    require_kind(value, CacheValueKind::CommitSummary)?;
+    let wire: IndexedCommitWire = serde_json::from_slice(&value.bytes)
+        .map_err(|err| Error::Cache(format!("decode cached commit summary: {err}")))?;
+    wire.try_into()
+}
+
+fn require_kind(value: &CacheValue, expected: CacheValueKind) -> Result<()> {
+    if value.version != crate::cache::CACHE_VALUE_VERSION {
+        return Err(Error::Cache(format!(
+            "unsupported cache value version {}",
+            value.version
+        )));
     }
+    if value.kind != expected {
+        return Err(Error::Cache(format!(
+            "cached value kind {:?} does not match expected {:?}",
+            value.kind, expected
+        )));
+    }
+    Ok(())
 }
 
-fn decode_ref(bytes: &[u8]) -> Result<StoredRef> {
-    let Some((&kind, data)) = bytes.split_first() else {
-        return Err(Error::Cache("cached ref payload is empty".to_owned()));
-    };
+fn kind_code(kind: ObjectKind) -> &'static str {
     match kind {
-        b'D' => {
-            let hex = std::str::from_utf8(data)
-                .map_err(|_| Error::Cache("cached direct ref is not UTF-8".to_owned()))?;
-            Ok(StoredRef::Direct(ObjectId::from_hex(hex)?))
-        }
-        b'S' => {
-            let target = std::str::from_utf8(data)
-                .map_err(|_| Error::Cache("cached symbolic ref is not UTF-8".to_owned()))?;
-            Ok(StoredRef::Symbolic(target.to_owned()))
-        }
-        other => Err(Error::Cache(format!("unknown cached ref kind {other}"))),
+        ObjectKind::Blob => "blob",
+        ObjectKind::Tree => "tree",
+        ObjectKind::Commit => "commit",
+        ObjectKind::Tag => "tag",
     }
 }
 
-fn kind_code(kind: ObjectKind) -> u8 {
-    match kind {
-        ObjectKind::Blob => b'B',
-        ObjectKind::Tree => b'T',
-        ObjectKind::Commit => b'C',
-        ObjectKind::Tag => b'G',
-    }
-}
-
-fn code_kind(code: u8) -> Result<ObjectKind> {
+fn code_kind(code: &str) -> Result<ObjectKind> {
     match code {
-        b'B' => Ok(ObjectKind::Blob),
-        b'T' => Ok(ObjectKind::Tree),
-        b'C' => Ok(ObjectKind::Commit),
-        b'G' => Ok(ObjectKind::Tag),
+        "blob" => Ok(ObjectKind::Blob),
+        "tree" => Ok(ObjectKind::Tree),
+        "commit" => Ok(ObjectKind::Commit),
+        "tag" => Ok(ObjectKind::Tag),
         other => Err(Error::Cache(format!("unknown cached object kind {other}"))),
     }
 }
 
-fn ref_parent_prefix(refname: &str) -> String {
-    match refname.rsplit_once('/') {
-        Some((parent, _)) => format!("{parent}/"),
-        None => String::new(),
+async fn invalidate_ref_lists<C>(
+    cache: &C,
+    tenant: &TenantId,
+    repository: &RepositoryId,
+    refname: &str,
+) -> Result<()>
+where
+    C: Cache,
+{
+    for prefix in ref_list_prefixes(refname) {
+        cache
+            .invalidate(tenant, repository, &CacheKey::RefList(prefix))
+            .await?;
+    }
+    Ok(())
+}
+
+fn ref_list_prefixes(refname: &str) -> Vec<String> {
+    let mut prefixes = vec![String::new()];
+    let mut prefix = String::new();
+    for component in refname
+        .split('/')
+        .take_while(|component| !component.is_empty())
+    {
+        prefix.push_str(component);
+        prefix.push('/');
+        prefixes.push(prefix.clone());
+    }
+    prefixes
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredObjectWire {
+    kind: String,
+    data: Vec<u8>,
+}
+
+impl From<&StoredObject> for StoredObjectWire {
+    fn from(object: &StoredObject) -> Self {
+        Self {
+            kind: kind_code(object.kind).to_owned(),
+            data: object.data.clone(),
+        }
+    }
+}
+
+impl TryFrom<StoredObjectWire> for StoredObject {
+    type Error = Error;
+
+    fn try_from(value: StoredObjectWire) -> Result<Self> {
+        Ok(Self {
+            kind: code_kind(&value.kind)?,
+            data: value.data,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+enum StoredRefWire {
+    Direct(String),
+    Symbolic(String),
+}
+
+impl From<&StoredRef> for StoredRefWire {
+    fn from(value: &StoredRef) -> Self {
+        match value {
+            StoredRef::Direct(oid) => Self::Direct(oid.to_hex()),
+            StoredRef::Symbolic(target) => Self::Symbolic(target.clone()),
+        }
+    }
+}
+
+impl TryFrom<StoredRefWire> for StoredRef {
+    type Error = Error;
+
+    fn try_from(value: StoredRefWire) -> Result<Self> {
+        match value {
+            StoredRefWire::Direct(oid) => Ok(Self::Direct(ObjectId::from_hex(&oid)?)),
+            StoredRefWire::Symbolic(target) => Ok(Self::Symbolic(target)),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct IndexedTreeEntryWire {
+    tree_oid: String,
+    path: String,
+    mode: u32,
+    oid: String,
+    kind: String,
+    size: Option<u64>,
+}
+
+impl From<&IndexedTreeEntry> for IndexedTreeEntryWire {
+    fn from(entry: &IndexedTreeEntry) -> Self {
+        Self {
+            tree_oid: entry.tree_oid.to_hex(),
+            path: entry.path.clone(),
+            mode: entry.mode,
+            oid: entry.oid.to_hex(),
+            kind: kind_code(entry.kind).to_owned(),
+            size: entry.size,
+        }
+    }
+}
+
+impl TryFrom<IndexedTreeEntryWire> for IndexedTreeEntry {
+    type Error = Error;
+
+    fn try_from(value: IndexedTreeEntryWire) -> Result<Self> {
+        Ok(Self {
+            tree_oid: ObjectId::from_hex(&value.tree_oid)?,
+            path: value.path,
+            mode: value.mode,
+            oid: ObjectId::from_hex(&value.oid)?,
+            kind: code_kind(&value.kind)?,
+            size: value.size,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct IndexedCommitWire {
+    oid: String,
+    tree: String,
+    parents: Vec<String>,
+    commit_time: i64,
+    generation: u32,
+}
+
+impl From<&IndexedCommit> for IndexedCommitWire {
+    fn from(commit: &IndexedCommit) -> Self {
+        Self {
+            oid: commit.oid.to_hex(),
+            tree: commit.tree.to_hex(),
+            parents: commit.parents.iter().map(ObjectId::to_hex).collect(),
+            commit_time: commit.commit_time,
+            generation: commit.generation,
+        }
+    }
+}
+
+impl TryFrom<IndexedCommitWire> for IndexedCommit {
+    type Error = Error;
+
+    fn try_from(value: IndexedCommitWire) -> Result<Self> {
+        Ok(Self {
+            oid: ObjectId::from_hex(&value.oid)?,
+            tree: ObjectId::from_hex(&value.tree)?,
+            parents: value
+                .parents
+                .iter()
+                .map(|oid| ObjectId::from_hex(oid).map_err(Error::from))
+                .collect::<Result<Vec<_>>>()?,
+            commit_time: value.commit_time,
+            generation: value.generation,
+        })
     }
 }

@@ -10,7 +10,12 @@ pub mod cached;
 pub mod error;
 pub mod ids;
 pub mod import;
+pub mod layered;
 pub mod memory;
+#[cfg(feature = "nats")]
+pub mod nats_invalidation;
+#[cfg(feature = "redis")]
+pub mod redis_cache;
 pub mod repository;
 #[cfg(feature = "sqlx-postgres")]
 pub mod sqlx_postgres;
@@ -19,11 +24,19 @@ pub mod views;
 
 /// Commonly used server-layer types.
 pub mod prelude {
-    pub use crate::cache::{Cache, CacheKey, CacheValue, EventPublisher, InvalidationEvent};
+    pub use crate::cache::{
+        apply_invalidation, Cache, CacheKey, CacheValue, CacheValueKind, EventPublisher,
+        InvalidationEvent, InvalidationEventKind,
+    };
     pub use crate::cached::CachedStorage;
     pub use crate::error::{Error, Result};
     pub use crate::ids::{RepositoryId, TenantId};
     pub use crate::import::{import_repository, ImportReport};
+    pub use crate::layered::LayeredCache;
+    #[cfg(feature = "nats")]
+    pub use crate::nats_invalidation::{NatsInvalidationPublisher, NatsInvalidationSubscriber};
+    #[cfg(feature = "redis")]
+    pub use crate::redis_cache::RedisCache;
     pub use crate::repository::ServerRepository;
     pub use crate::storage::{
         BrowseIndex, CommitGraphStore, ConfigStore, IndexedCommit, ObjectStore, RefStore,

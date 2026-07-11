@@ -12,15 +12,22 @@ workspace = true
 [features]
 default = []
 sqlx-postgres = ["dep:sqlx"]
+redis = ["dep:redis"]
+nats = ["dep:async-nats", "dep:futures-util"]
 
 [dependencies]
 async-trait.workspace = true
 grit-lib = { path = "../grit-lib", version = "0.5" }
+serde.workspace = true
+serde_json.workspace = true
 sha1.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 time.workspace = true
 sqlx = { workspace = true, optional = true }
+redis = { version = "0.32.7", default-features = false, features = ["aio", "tokio-comp", "connection-manager"], optional = true }
+async-nats = { version = "0.42", optional = true }
+futures-util = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
