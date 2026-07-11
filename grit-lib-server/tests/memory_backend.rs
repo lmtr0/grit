@@ -1028,6 +1028,38 @@ async fn incremental_reimport_picks_up_new_commit_and_reports_progress(
 }
 
 #[tokio::test]
+async fn import_indexes_repeated_commit_tree_once() -> grit_lib_server::error::Result<()> {
+    let temp = tempfile::tempdir().map_err(grit_lib::error::Error::from)?;
+    let source = init_repository(temp.path(), false, "main", None, "files")?;
+    refs::write_symbolic_ref(&source.git_dir, "HEAD", "refs/heads/main")?;
+
+    let blob = source.odb.write(ObjectKind::Blob, b"same\n")?;
+    let tree = source.odb.write(
+        ObjectKind::Tree,
+        &serialize_tree(&[TreeEntry {
+            mode: 0o100644,
+            name: b"README.md".to_vec(),
+            oid: blob,
+        }]),
+    )?;
+    let first = write_fixture_commit(&source, tree, Vec::new(), 1_700_000_000, "first")?;
+    let second = write_fixture_commit(&source, tree, vec![first], 1_700_000_100, "second")?;
+    let third = write_fixture_commit(&source, tree, vec![second], 1_700_000_200, "third")?;
+    refs::write_ref(&source.git_dir, "refs/heads/main", &third)?;
+
+    let (tenant, repository) = ids()?;
+    let backend = Arc::new(MemoryBackend::new());
+    let repo = ServerRepository::new(tenant, repository, HashAlgo::Sha1, backend);
+    let report = import_repository(&repo, &source).await?;
+
+    assert_eq!(report.objects, 5);
+    assert_eq!(report.tree_entries, 1);
+    assert_eq!(repo.blob_at("main", "README.md").await?.data, b"same\n");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn incremental_reimport_prunes_deleted_branch() -> grit_lib_server::error::Result<()> {
     let temp = tempfile::tempdir().map_err(grit_lib::error::Error::from)?;
     let source = init_repository(temp.path(), false, "main", None, "files")?;

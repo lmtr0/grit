@@ -218,6 +218,7 @@ where
     }
 
     let mut seen = HashSet::new();
+    let mut indexed_trees = HashSet::new();
     let mut stack = roots;
     while let Some(work) = stack.pop() {
         let (oid, tree_context) = match work {
@@ -260,6 +261,9 @@ where
             }
             ObjectKind::Tree => {
                 let (root, prefix) = tree_context.unwrap_or((oid, String::new()));
+                if !indexed_trees.insert((root, oid, prefix.clone())) {
+                    continue;
+                }
                 let indexed =
                     index_tree(destination, source, root, &prefix, &object.data, &mut stack)
                         .await?;
