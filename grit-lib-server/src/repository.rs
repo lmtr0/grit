@@ -1,5 +1,6 @@
 //! Repository handle for server-backed storage.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use grit_lib::objects::{parse_commit, parse_tag, HashAlgo, ObjectId, ObjectKind};
@@ -7,10 +8,13 @@ use grit_lib::objects::{parse_commit, parse_tag, HashAlgo, ObjectId, ObjectKind}
 use crate::cache::{CacheKey, EventPublisher, InvalidationEvent};
 use crate::error::{Error, Result};
 use crate::ids::{RepositoryId, TenantId};
-use crate::storage::{IndexedTreeEntry, ServerStorage, StoredObject, StoredRef};
+use crate::storage::{
+    commit_time_from_identity, IndexedCommit, IndexedTreeEntry, ServerStorage, StoredObject,
+    StoredRef,
+};
 use crate::views::{
-    BlobView, BranchView, CommitSummary, CompareInputs, DiscoveredFile, RepositorySummary, TagView,
-    TreeEntryView, TreeView,
+    BlobView, BranchView, CommitComparison, CommitHistoryOptions, CommitHistoryPage, CommitSummary,
+    CompareInputs, DiscoveredFile, RepositorySummary, TagView, TreeEntryView, TreeView,
 };
 
 /// Server-backed repository handle.
@@ -372,6 +376,196 @@ where
         })
     }
 
+    /// Return a paginated commit history from a ref, commit id, or tag.
+    ///
+    /// `options.offset` skips matching commits, `options.limit` caps the returned page, and
+    /// `options.path` limits results to commits that change the repository-relative path when the
+    /// commit tree has been indexed for browsing.
+    ///
+    /// # Errors
+    ///
+    /// Returns revision resolution, backend, graph index, path index, or object parsing errors.
+    pub async fn commit_history(
+        &self,
+        start: &str,
+        options: CommitHistoryOptions,
+    ) -> Result<CommitHistoryPage> {
+        let start = self.commit(start).await?;
+        let path = options.path.as_deref().map(normalize_tree_path);
+        let walked = self.walk_commit_oids(&[start.oid]).await?;
+        let mut commits = Vec::new();
+        for oid in walked {
+            let summary = self
+                .commit_summary(&oid)
+                .await?
+                .ok_or_else(|| Error::ObjectNotFound(oid.to_hex()))?;
+            if self.history_path_matches(&summary, path.as_deref()).await? {
+                commits.push(summary);
+            }
+        }
+
+        let total_estimate = commits.len();
+        let end = options.limit.map_or(total_estimate, |limit| {
+            options.offset.saturating_add(limit).min(total_estimate)
+        });
+        let page = commits
+            .into_iter()
+            .skip(options.offset)
+            .take(end.saturating_sub(options.offset))
+            .collect::<Vec<_>>();
+        let next_offset = (end < total_estimate).then_some(end);
+        Ok(CommitHistoryPage {
+            commits: page,
+            next_offset,
+            total_estimate,
+        })
+    }
+
+    /// Return parent commits for a ref, commit id, or tag.
+    ///
+    /// # Errors
+    ///
+    /// Returns revision resolution, backend, graph index, or object parsing errors.
+    pub async fn commit_parents(&self, commit: &str) -> Result<Vec<CommitSummary>> {
+        let commit = self.commit(commit).await?;
+        let parents = self.parent_ids(&commit.oid).await?;
+        self.commit_summaries(parents).await
+    }
+
+    /// Return child commits for a ref, commit id, or tag.
+    ///
+    /// # Errors
+    ///
+    /// Returns revision resolution, backend, graph index, or object parsing errors.
+    pub async fn commit_children(&self, commit: &str) -> Result<Vec<CommitSummary>> {
+        let commit = self.commit(commit).await?;
+        let children = self
+            .storage
+            .commit_children(&self.tenant, &self.repository, &commit.oid)
+            .await?;
+        self.commit_summaries(children).await
+    }
+
+    /// Return whether `ancestor` is reachable from `descendant` by following parents.
+    ///
+    /// # Errors
+    ///
+    /// Returns revision resolution, backend, graph index, or object parsing errors.
+    pub async fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
+        let ancestor = self.commit(ancestor).await?;
+        let descendant = self.commit(descendant).await?;
+        self.is_ancestor_oid(ancestor.oid, descendant.oid).await
+    }
+
+    /// Return a best merge base for two refs, commit ids, or tags.
+    ///
+    /// # Errors
+    ///
+    /// Returns revision resolution, backend, graph index, or object parsing errors.
+    pub async fn merge_base(&self, left: &str, right: &str) -> Result<Option<CommitSummary>> {
+        let left = self.commit(left).await?;
+        let right = self.commit(right).await?;
+        match self.merge_base_oid(left.oid, right.oid).await? {
+            Some(oid) => self.commit_summary(&oid).await,
+            None => Ok(None),
+        }
+    }
+
+    /// Return commits reachable from the supplied refs, commit ids, or tags.
+    ///
+    /// # Errors
+    ///
+    /// Returns revision resolution, backend, graph index, or object parsing errors.
+    pub async fn reachable_from(&self, refs: &[impl AsRef<str>]) -> Result<Vec<CommitSummary>> {
+        let mut starts = Vec::with_capacity(refs.len());
+        for refname in refs {
+            starts.push(self.commit(refname.as_ref()).await?.oid);
+        }
+        self.commit_summaries(self.walk_commit_oids(&starts).await?)
+            .await
+    }
+
+    /// Estimate the number of commits reachable from `start`.
+    ///
+    /// # Errors
+    ///
+    /// Returns revision resolution, backend, graph index, or object parsing errors.
+    pub async fn commit_count_estimate(&self, start: &str) -> Result<usize> {
+        let start = self.commit(start).await?;
+        Ok(self.walk_commit_oids(&[start.oid]).await?.len())
+    }
+
+    /// Compare two refs, commit ids, or tags using graph reachability.
+    ///
+    /// # Errors
+    ///
+    /// Returns revision resolution, backend, graph index, or object parsing errors.
+    pub async fn compare_commits(&self, base: &str, head: &str) -> Result<CommitComparison> {
+        let base = self.commit(base).await?;
+        let head = self.commit(head).await?;
+        let base_reachable = self.reachable_set(&[base.oid]).await?;
+        let head_reachable = self.reachable_set(&[head.oid]).await?;
+        let merge_base = match self.merge_base_oid(base.oid, head.oid).await? {
+            Some(oid) => self.commit_summary(&oid).await?,
+            None => None,
+        };
+        Ok(CommitComparison {
+            ahead_by: head_reachable.difference(&base_reachable).count(),
+            behind_by: base_reachable.difference(&head_reachable).count(),
+            base,
+            head,
+            merge_base,
+        })
+    }
+
+    /// Rebuild the commit graph index from stored commit objects.
+    ///
+    /// # Errors
+    ///
+    /// Returns backend or object parsing errors.
+    pub async fn repair_commit_graph(&self) -> Result<usize> {
+        let commit_ids = self
+            .storage
+            .list_object_ids(&self.tenant, &self.repository, Some(ObjectKind::Commit))
+            .await?;
+        let mut commits = HashMap::new();
+        for (oid, _) in commit_ids {
+            let Some(object) = self.read_object(&oid).await? else {
+                continue;
+            };
+            if object.kind != ObjectKind::Commit {
+                continue;
+            }
+            let commit = parse_commit(&object.data)?;
+            commits.insert(
+                oid,
+                IndexedCommit {
+                    oid,
+                    tree: commit.tree,
+                    parents: commit.parents,
+                    commit_time: commit_time_from_identity(&commit.committer),
+                    generation: 1,
+                },
+            );
+        }
+
+        let mut memo = HashMap::new();
+        let keys = commits.keys().copied().collect::<Vec<_>>();
+        for oid in keys {
+            let generation = compute_generation(oid, &commits, &mut memo, &mut HashSet::new());
+            if let Some(commit) = commits.get_mut(&oid) {
+                commit.generation = generation;
+            }
+        }
+        let mut repaired = commits.into_values().collect::<Vec<_>>();
+        repaired.sort_by(|left, right| left.oid.cmp(&right.oid));
+        let count = repaired.len();
+        self.storage
+            .replace_commit_graph(&self.tenant, &self.repository, &repaired)
+            .await?;
+        Ok(count)
+    }
+
     /// Read a commit and return hosting-oriented metadata.
     ///
     /// # Errors
@@ -577,6 +771,190 @@ where
             .find(|entry| entry.path == path))
     }
 
+    async fn commit_summaries(&self, oids: Vec<ObjectId>) -> Result<Vec<CommitSummary>> {
+        let mut commits = Vec::with_capacity(oids.len());
+        for oid in oids {
+            commits.push(
+                self.commit_summary(&oid)
+                    .await?
+                    .ok_or_else(|| Error::ObjectNotFound(oid.to_hex()))?,
+            );
+        }
+        Ok(commits)
+    }
+
+    async fn indexed_commits_by_oid(&self) -> Result<HashMap<ObjectId, IndexedCommit>> {
+        Ok(self
+            .storage
+            .list_indexed_commits(&self.tenant, &self.repository)
+            .await?
+            .into_iter()
+            .map(|commit| (commit.oid, commit))
+            .collect())
+    }
+
+    async fn ensure_indexed_commit(
+        &self,
+        indexed: &mut HashMap<ObjectId, IndexedCommit>,
+        oid: ObjectId,
+    ) -> Result<IndexedCommit> {
+        if let Some(commit) = indexed.get(&oid) {
+            return Ok(commit.clone());
+        }
+        if let Some(commit) = self
+            .storage
+            .read_indexed_commit(&self.tenant, &self.repository, &oid)
+            .await?
+        {
+            indexed.insert(oid, commit.clone());
+            return Ok(commit);
+        }
+        let summary = self
+            .commit_summary(&oid)
+            .await?
+            .ok_or_else(|| Error::ObjectNotFound(oid.to_hex()))?;
+        let generation = summary
+            .parents
+            .iter()
+            .filter_map(|parent| indexed.get(parent))
+            .map(|parent| parent.generation.saturating_add(1))
+            .max()
+            .unwrap_or(1);
+        let commit = IndexedCommit {
+            oid,
+            tree: summary.tree,
+            parents: summary.parents,
+            commit_time: commit_time_from_identity(&summary.committer),
+            generation,
+        };
+        self.storage
+            .upsert_commits(&self.tenant, &self.repository, &[commit.clone()])
+            .await?;
+        indexed.insert(oid, commit.clone());
+        Ok(commit)
+    }
+
+    async fn parent_ids(&self, oid: &ObjectId) -> Result<Vec<ObjectId>> {
+        if let Some(commit) = self
+            .storage
+            .read_indexed_commit(&self.tenant, &self.repository, oid)
+            .await?
+        {
+            return Ok(commit.parents);
+        }
+        let summary = self
+            .commit_summary(oid)
+            .await?
+            .ok_or_else(|| Error::ObjectNotFound(oid.to_hex()))?;
+        Ok(summary.parents)
+    }
+
+    async fn walk_commit_oids(&self, starts: &[ObjectId]) -> Result<Vec<ObjectId>> {
+        let mut indexed = self.indexed_commits_by_oid().await?;
+        for start in starts {
+            self.ensure_indexed_commit(&mut indexed, *start).await?;
+        }
+
+        let mut seen = HashSet::new();
+        let mut frontier = starts.to_vec();
+        let mut walked = Vec::new();
+        while !frontier.is_empty() {
+            let next = best_frontier_index(&frontier, &indexed);
+            let oid = frontier.swap_remove(next);
+            if !seen.insert(oid) {
+                continue;
+            }
+            let commit = self.ensure_indexed_commit(&mut indexed, oid).await?;
+            walked.push(oid);
+            for parent in commit.parents {
+                if !seen.contains(&parent) {
+                    self.ensure_indexed_commit(&mut indexed, parent).await?;
+                    frontier.push(parent);
+                }
+            }
+        }
+        Ok(walked)
+    }
+
+    async fn reachable_set(&self, starts: &[ObjectId]) -> Result<HashSet<ObjectId>> {
+        Ok(self.walk_commit_oids(starts).await?.into_iter().collect())
+    }
+
+    async fn is_ancestor_oid(&self, ancestor: ObjectId, descendant: ObjectId) -> Result<bool> {
+        if ancestor == descendant {
+            return Ok(true);
+        }
+        Ok(self.reachable_set(&[descendant]).await?.contains(&ancestor))
+    }
+
+    async fn merge_base_oid(&self, left: ObjectId, right: ObjectId) -> Result<Option<ObjectId>> {
+        let left_reachable = self.reachable_set(&[left]).await?;
+        let right_reachable = self.reachable_set(&[right]).await?;
+        let common = left_reachable
+            .intersection(&right_reachable)
+            .copied()
+            .collect::<Vec<_>>();
+        if common.is_empty() {
+            return Ok(None);
+        }
+
+        let mut best = Vec::new();
+        for candidate in &common {
+            let mut dominated = false;
+            for other in &common {
+                if candidate != other && self.is_ancestor_oid(*candidate, *other).await? {
+                    dominated = true;
+                    break;
+                }
+            }
+            if !dominated {
+                best.push(*candidate);
+            }
+        }
+
+        let indexed = self.indexed_commits_by_oid().await?;
+        best.sort_by(|left, right| commit_order(*left, *right, &indexed));
+        Ok(best.into_iter().next())
+    }
+
+    async fn history_path_matches(
+        &self,
+        commit: &CommitSummary,
+        path: Option<&str>,
+    ) -> Result<bool> {
+        let Some(path) = path else {
+            return Ok(true);
+        };
+        if path.is_empty() {
+            return Ok(true);
+        }
+
+        let current = self.tree_entry_signature(&commit.tree, path).await?;
+        if commit.parents.is_empty() {
+            return Ok(current.is_some());
+        }
+        for parent in &commit.parents {
+            let Some(parent) = self.commit_summary(parent).await? else {
+                continue;
+            };
+            if self.tree_entry_signature(&parent.tree, path).await? != current {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn tree_entry_signature(
+        &self,
+        root: &ObjectId,
+        path: &str,
+    ) -> Result<Option<(ObjectId, u32, ObjectKind)>> {
+        Ok(self
+            .tree_entry(root, path)
+            .await?
+            .map(|entry| (entry.oid, entry.mode, entry.kind)))
+    }
+
     /// Write a ref and publish invalidations through `publisher`.
     ///
     /// # Errors
@@ -651,6 +1029,74 @@ fn is_direct_child(candidate: &str, parent: &str) -> bool {
         return false;
     };
     !rest.is_empty() && !rest.contains('/')
+}
+
+fn best_frontier_index(frontier: &[ObjectId], indexed: &HashMap<ObjectId, IndexedCommit>) -> usize {
+    let mut best = 0;
+    for index in 1..frontier.len() {
+        if commit_order(frontier[index], frontier[best], indexed).is_lt() {
+            best = index;
+        }
+    }
+    best
+}
+
+fn commit_order(
+    left: ObjectId,
+    right: ObjectId,
+    indexed: &HashMap<ObjectId, IndexedCommit>,
+) -> std::cmp::Ordering {
+    let left_commit = indexed.get(&left);
+    let right_commit = indexed.get(&right);
+    right_commit
+        .map(|commit| commit.commit_time)
+        .unwrap_or_default()
+        .cmp(
+            &left_commit
+                .map(|commit| commit.commit_time)
+                .unwrap_or_default(),
+        )
+        .then_with(|| {
+            right_commit
+                .map(|commit| commit.generation)
+                .unwrap_or_default()
+                .cmp(
+                    &left_commit
+                        .map(|commit| commit.generation)
+                        .unwrap_or_default(),
+                )
+        })
+        .then_with(|| left.cmp(&right))
+}
+
+fn compute_generation(
+    oid: ObjectId,
+    commits: &HashMap<ObjectId, IndexedCommit>,
+    memo: &mut HashMap<ObjectId, u32>,
+    visiting: &mut HashSet<ObjectId>,
+) -> u32 {
+    if let Some(generation) = memo.get(&oid) {
+        return *generation;
+    }
+    if !visiting.insert(oid) {
+        return 1;
+    }
+    let generation = commits
+        .get(&oid)
+        .map(|commit| {
+            commit
+                .parents
+                .iter()
+                .filter(|parent| commits.contains_key(parent))
+                .map(|parent| compute_generation(*parent, commits, memo, visiting))
+                .max()
+                .unwrap_or_default()
+                .saturating_add(1)
+        })
+        .unwrap_or(1);
+    visiting.remove(&oid);
+    memo.insert(oid, generation);
+    generation
 }
 
 impl From<IndexedTreeEntry> for TreeEntryView {

@@ -30,6 +30,8 @@ pub struct ImportReport {
     pub objects: usize,
     /// Number of tree entries indexed.
     pub tree_entries: usize,
+    /// Number of commit graph rows rebuilt from imported commits.
+    pub commit_graph_entries: usize,
 }
 
 /// Import reachable repository data from a filesystem-backed [`Repository`].
@@ -143,6 +145,7 @@ where
         }
     }
 
+    report.commit_graph_entries = destination.repair_commit_graph().await?;
     Ok(report)
 }
 

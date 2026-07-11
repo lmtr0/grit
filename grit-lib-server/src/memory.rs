@@ -4,14 +4,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
 
 use async_trait::async_trait;
-use grit_lib::objects::{ObjectId, ObjectKind};
+use grit_lib::objects::{parse_commit, ObjectId, ObjectKind};
 
 use crate::cache::{Cache, CacheKey, CacheValue, EventPublisher, InvalidationEvent};
 use crate::error::{Error, Result};
 use crate::ids::{RepositoryId, TenantId};
 use crate::storage::{
-    BrowseIndex, ConfigStore, IndexedTreeEntry, ObjectStore, RefStore, ReflogEntry, ReflogStore,
-    StoredObject, StoredRef,
+    commit_time_from_identity, BrowseIndex, CommitGraphStore, ConfigStore, IndexedCommit,
+    IndexedTreeEntry, ObjectStore, RefStore, ReflogEntry, ReflogStore, StoredObject, StoredRef,
 };
 
 type RepoKey = (TenantId, RepositoryId);
@@ -19,6 +19,7 @@ type ObjectKey = (RepoKey, ObjectId);
 type RefKey = (RepoKey, String);
 type ConfigKey = (RepoKey, String);
 type TreeKey = (RepoKey, ObjectId, String);
+type CommitKey = (RepoKey, ObjectId);
 type CacheEntryKey = (RepoKey, CacheKey);
 
 /// In-memory repository backend.
@@ -29,6 +30,7 @@ pub struct MemoryBackend {
     reflogs: RwLock<BTreeMap<RefKey, Vec<ReflogEntry>>>,
     config: RwLock<BTreeMap<ConfigKey, String>>,
     trees: RwLock<BTreeMap<TreeKey, IndexedTreeEntry>>,
+    commits: RwLock<BTreeMap<CommitKey, IndexedCommit>>,
     cache: RwLock<HashMap<CacheEntryKey, CacheValue>>,
     events: RwLock<Vec<InvalidationEvent>>,
 }
@@ -55,6 +57,36 @@ impl MemoryBackend {
             .map(|guard| guard.clone())
             .map_err(|_| Error::Backend("memory event log lock poisoned".to_owned()))
     }
+
+    fn indexed_commit(
+        &self,
+        repo: RepoKey,
+        oid: ObjectId,
+        object: &StoredObject,
+    ) -> Result<Option<IndexedCommit>> {
+        if object.kind != ObjectKind::Commit {
+            return Ok(None);
+        }
+        let commit = parse_commit(&object.data)?;
+        let generation = self
+            .commits
+            .read()
+            .map_err(|_| Error::Backend("memory commit graph lock poisoned".to_owned()))?
+            .iter()
+            .filter(|((candidate_repo, candidate_oid), _)| {
+                candidate_repo == &repo && commit.parents.contains(candidate_oid)
+            })
+            .map(|(_, parent)| parent.generation.saturating_add(1))
+            .max()
+            .unwrap_or(1);
+        Ok(Some(IndexedCommit {
+            oid,
+            tree: commit.tree,
+            parents: commit.parents,
+            commit_time: commit_time_from_identity(&commit.committer),
+            generation,
+        }))
+    }
 }
 
 #[async_trait]
@@ -78,14 +110,25 @@ impl ObjectStore for MemoryBackend {
         oid: &ObjectId,
         object: &StoredObject,
     ) -> Result<()> {
+        let repo = repo_key(tenant, repository);
         self.objects
             .write()
             .map(|mut objects| {
                 objects
-                    .entry((repo_key(tenant, repository), *oid))
+                    .entry((repo.clone(), *oid))
                     .or_insert_with(|| object.clone());
             })
-            .map_err(|_| Error::Backend("memory object lock poisoned".to_owned()))
+            .map_err(|_| Error::Backend("memory object lock poisoned".to_owned()))?;
+
+        if let Some(commit) = self.indexed_commit(repo.clone(), *oid, object)? {
+            self.commits
+                .write()
+                .map(|mut commits| {
+                    commits.insert((repo, *oid), commit);
+                })
+                .map_err(|_| Error::Backend("memory commit graph lock poisoned".to_owned()))?;
+        }
+        Ok(())
     }
 
     async fn object_exists(
@@ -379,6 +422,117 @@ impl BrowseIndex for MemoryBackend {
             Some(oid) => self.read_object(tenant, repository, &oid).await,
             None => Ok(None),
         }
+    }
+}
+
+#[async_trait]
+impl CommitGraphStore for MemoryBackend {
+    async fn upsert_commits(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        commits: &[IndexedCommit],
+    ) -> Result<()> {
+        let repo = repo_key(tenant, repository);
+        self.commits
+            .write()
+            .map(|mut stored| {
+                for commit in commits {
+                    stored.insert((repo.clone(), commit.oid), commit.clone());
+                }
+            })
+            .map_err(|_| Error::Backend("memory commit graph lock poisoned".to_owned()))
+    }
+
+    async fn replace_commit_graph(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        commits: &[IndexedCommit],
+    ) -> Result<()> {
+        let repo = repo_key(tenant, repository);
+        self.commits
+            .write()
+            .map(|mut stored| {
+                stored.retain(|(candidate_repo, _), _| candidate_repo != &repo);
+                for commit in commits {
+                    stored.insert((repo.clone(), commit.oid), commit.clone());
+                }
+            })
+            .map_err(|_| Error::Backend("memory commit graph lock poisoned".to_owned()))
+    }
+
+    async fn read_indexed_commit(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        oid: &ObjectId,
+    ) -> Result<Option<IndexedCommit>> {
+        self.commits
+            .read()
+            .map(|commits| commits.get(&(repo_key(tenant, repository), *oid)).cloned())
+            .map_err(|_| Error::Backend("memory commit graph lock poisoned".to_owned()))
+    }
+
+    async fn commit_parents(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        oid: &ObjectId,
+    ) -> Result<Vec<ObjectId>> {
+        Ok(self
+            .read_indexed_commit(tenant, repository, oid)
+            .await?
+            .map(|commit| commit.parents)
+            .unwrap_or_default())
+    }
+
+    async fn commit_children(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        oid: &ObjectId,
+    ) -> Result<Vec<ObjectId>> {
+        let repo = repo_key(tenant, repository);
+        self.commits
+            .read()
+            .map(|commits| {
+                let mut children = commits
+                    .iter()
+                    .filter(|((candidate_repo, _), commit)| {
+                        candidate_repo == &repo && commit.parents.contains(oid)
+                    })
+                    .map(|((_, child), _)| *child)
+                    .collect::<Vec<_>>();
+                children.sort();
+                children
+            })
+            .map_err(|_| Error::Backend("memory commit graph lock poisoned".to_owned()))
+    }
+
+    async fn list_indexed_commits(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+    ) -> Result<Vec<IndexedCommit>> {
+        let repo = repo_key(tenant, repository);
+        self.commits
+            .read()
+            .map(|commits| {
+                let mut commits = commits
+                    .iter()
+                    .filter(|((candidate_repo, _), _)| candidate_repo == &repo)
+                    .map(|(_, commit)| commit.clone())
+                    .collect::<Vec<_>>();
+                commits.sort_by(|left, right| {
+                    right
+                        .commit_time
+                        .cmp(&left.commit_time)
+                        .then_with(|| left.oid.cmp(&right.oid))
+                });
+                commits
+            })
+            .map_err(|_| Error::Backend("memory commit graph lock poisoned".to_owned()))
     }
 }
 

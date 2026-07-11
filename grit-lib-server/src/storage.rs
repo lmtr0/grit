@@ -238,6 +238,21 @@ pub struct IndexedTreeEntry {
     pub size: Option<u64>,
 }
 
+/// Commit metadata indexed for graph traversal and history queries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexedCommit {
+    /// Commit object id.
+    pub oid: ObjectId,
+    /// Root tree object id named by the commit.
+    pub tree: ObjectId,
+    /// Parent commit ids in commit object order.
+    pub parents: Vec<ObjectId>,
+    /// Committer timestamp as seconds since the Unix epoch.
+    pub commit_time: i64,
+    /// Topological generation, with root commits starting at one.
+    pub generation: u32,
+}
+
 /// Query index operations for repository-browsing UI.
 #[async_trait]
 pub trait BrowseIndex: Send + Sync {
@@ -268,13 +283,82 @@ pub trait BrowseIndex: Send + Sync {
     ) -> Result<Option<StoredObject>>;
 }
 
+/// Commit graph index operations for history and reachability queries.
+#[async_trait]
+pub trait CommitGraphStore: Send + Sync {
+    /// Upsert commit graph rows.
+    async fn upsert_commits(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        commits: &[IndexedCommit],
+    ) -> Result<()>;
+
+    /// Replace the commit graph for a repository with `commits`.
+    async fn replace_commit_graph(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        commits: &[IndexedCommit],
+    ) -> Result<()> {
+        self.upsert_commits(tenant, repository, commits).await
+    }
+
+    /// Read one indexed commit.
+    async fn read_indexed_commit(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        oid: &ObjectId,
+    ) -> Result<Option<IndexedCommit>>;
+
+    /// Return parent commit ids for `oid` in commit object order.
+    async fn commit_parents(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        oid: &ObjectId,
+    ) -> Result<Vec<ObjectId>>;
+
+    /// Return commit ids that name `oid` as a parent.
+    async fn commit_children(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        oid: &ObjectId,
+    ) -> Result<Vec<ObjectId>>;
+
+    /// List all indexed commits for a repository.
+    async fn list_indexed_commits(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+    ) -> Result<Vec<IndexedCommit>>;
+}
+
 /// Combined storage contract for a full server repository backend.
 pub trait ServerStorage:
-    ObjectStore + RefStore + ReflogStore + ConfigStore + BrowseIndex + Send + Sync
+    ObjectStore + RefStore + ReflogStore + ConfigStore + BrowseIndex + CommitGraphStore + Send + Sync
 {
 }
 
 impl<T> ServerStorage for T where
-    T: ObjectStore + RefStore + ReflogStore + ConfigStore + BrowseIndex + Send + Sync
+    T: ObjectStore
+        + RefStore
+        + ReflogStore
+        + ConfigStore
+        + BrowseIndex
+        + CommitGraphStore
+        + Send
+        + Sync
 {
+}
+
+pub(crate) fn commit_time_from_identity(identity: &str) -> i64 {
+    identity
+        .split_whitespace()
+        .rev()
+        .nth(1)
+        .and_then(|timestamp| timestamp.parse().ok())
+        .unwrap_or_default()
 }

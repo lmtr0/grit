@@ -130,3 +130,40 @@ pub struct CompareInputs {
     /// Root tree for the head commit.
     pub head_tree: ObjectId,
 }
+
+/// Options for paginated commit history queries.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CommitHistoryOptions {
+    /// Number of matching commits to skip before returning results.
+    pub offset: usize,
+    /// Maximum number of commits to return. `None` returns every matching commit after `offset`.
+    pub limit: Option<usize>,
+    /// Optional repository-relative path filter.
+    pub path: Option<String>,
+}
+
+/// One page of commit history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitHistoryPage {
+    /// Commits in deterministic reverse chronological traversal order.
+    pub commits: Vec<CommitSummary>,
+    /// Offset to request for the next page, or `None` when this is the last page.
+    pub next_offset: Option<usize>,
+    /// Number of commits matching the query.
+    pub total_estimate: usize,
+}
+
+/// Ahead/behind result for two commits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitComparison {
+    /// Base commit used for the comparison.
+    pub base: CommitSummary,
+    /// Head commit used for the comparison.
+    pub head: CommitSummary,
+    /// Best common ancestor found for `base` and `head`.
+    pub merge_base: Option<CommitSummary>,
+    /// Number of commits reachable from `head` that are not reachable from `base`.
+    pub ahead_by: usize,
+    /// Number of commits reachable from `base` that are not reachable from `head`.
+    pub behind_by: usize,
+}

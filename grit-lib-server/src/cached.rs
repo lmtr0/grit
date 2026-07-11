@@ -9,8 +9,8 @@ use crate::cache::{Cache, CacheKey, CacheValue};
 use crate::error::{Error, Result};
 use crate::ids::{RepositoryId, TenantId};
 use crate::storage::{
-    BrowseIndex, ConfigStore, IndexedTreeEntry, ObjectStore, RefStore, ReflogEntry, ReflogStore,
-    StoredObject, StoredRef,
+    BrowseIndex, CommitGraphStore, ConfigStore, IndexedCommit, IndexedTreeEntry, ObjectStore,
+    RefStore, ReflogEntry, ReflogStore, StoredObject, StoredRef,
 };
 
 /// Storage wrapper that caches hot object and ref reads.
@@ -306,6 +306,72 @@ where
         self.storage
             .read_blob_at_path(tenant, repository, tree_oid, path)
             .await
+    }
+}
+
+#[async_trait]
+impl<S, C> CommitGraphStore for CachedStorage<S, C>
+where
+    S: CommitGraphStore,
+    C: Cache,
+{
+    async fn upsert_commits(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        commits: &[IndexedCommit],
+    ) -> Result<()> {
+        self.storage
+            .upsert_commits(tenant, repository, commits)
+            .await
+    }
+
+    async fn replace_commit_graph(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        commits: &[IndexedCommit],
+    ) -> Result<()> {
+        self.storage
+            .replace_commit_graph(tenant, repository, commits)
+            .await
+    }
+
+    async fn read_indexed_commit(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        oid: &ObjectId,
+    ) -> Result<Option<IndexedCommit>> {
+        self.storage
+            .read_indexed_commit(tenant, repository, oid)
+            .await
+    }
+
+    async fn commit_parents(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        oid: &ObjectId,
+    ) -> Result<Vec<ObjectId>> {
+        self.storage.commit_parents(tenant, repository, oid).await
+    }
+
+    async fn commit_children(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        oid: &ObjectId,
+    ) -> Result<Vec<ObjectId>> {
+        self.storage.commit_children(tenant, repository, oid).await
+    }
+
+    async fn list_indexed_commits(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+    ) -> Result<Vec<IndexedCommit>> {
+        self.storage.list_indexed_commits(tenant, repository).await
     }
 }
 
