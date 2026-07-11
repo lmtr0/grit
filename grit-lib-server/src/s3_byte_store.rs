@@ -47,15 +47,20 @@ impl S3ByteStore {
 #[async_trait]
 impl ExternalByteStore for S3ByteStore {
     async fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<()> {
-        self.client
+        match self
+            .client
             .put_object()
             .bucket(&self.bucket)
             .key(key)
+            .if_none_match("*")
             .body(ByteStream::from(bytes.to_vec()))
             .send()
             .await
-            .map_err(|err| Error::Backend(format!("put s3 object {key}: {err}")))?;
-        Ok(())
+        {
+            Ok(_) => Ok(()),
+            Err(err) if is_precondition_failed_error(&err) => Ok(()),
+            Err(err) => Err(Error::Backend(format!("put s3 object {key}: {err}"))),
+        }
     }
 
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
@@ -98,6 +103,7 @@ impl ExternalByteStore for S3ByteStore {
         {
             Ok(response) => response,
             Err(err) if is_missing_object_error(&err) => return Ok(None),
+            Err(err) if is_invalid_range_error(&err) => return Ok(Some(Vec::new())),
             Err(err) => return Err(Error::Backend(format!("get s3 object range {key}: {err}"))),
         };
         let bytes = response
@@ -155,10 +161,30 @@ impl ContentUrlSigner for S3ByteStore {
 
 fn is_missing_object_error<E>(err: &E) -> bool
 where
-    E: std::fmt::Display,
+    E: std::fmt::Debug + std::fmt::Display,
 {
-    let text = err.to_string();
-    text.contains("NoSuchKey") || text.contains("NotFound")
+    let text = format!("{err} {err:?}");
+    text.contains("NoSuchKey") || text.contains("NotFound") || text.contains("status code: 404")
+}
+
+fn is_precondition_failed_error<E>(err: &E) -> bool
+where
+    E: std::fmt::Debug + std::fmt::Display,
+{
+    let text = format!("{err} {err:?}");
+    text.contains("PreconditionFailed")
+        || text.contains("Precondition Failed")
+        || text.contains("status code: 412")
+}
+
+fn is_invalid_range_error<E>(err: &E) -> bool
+where
+    E: std::fmt::Debug + std::fmt::Display,
+{
+    let text = format!("{err} {err:?}");
+    text.contains("InvalidRange")
+        || text.contains("Requested Range Not Satisfiable")
+        || text.contains("status code: 416")
 }
 
 fn system_time_from_offset(value: OffsetDateTime) -> Result<SystemTime> {

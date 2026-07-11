@@ -71,7 +71,7 @@ pub mod prelude {
         UploadPackCapability, UploadPackRequest, UploadPackService,
     };
     #[cfg(feature = "redis")]
-    pub use crate::redis_cache::RedisCache;
+    pub use crate::redis_cache::{RedisCache, RedisCacheOptions};
     pub use crate::repository::ServerRepository;
     #[cfg(feature = "s3")]
     pub use crate::s3_byte_store::S3ByteStore;

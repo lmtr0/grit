@@ -1,5 +1,7 @@
 //! Redis cache backend for hosted repository data.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use redis::aio::ConnectionManager;
 
@@ -12,6 +14,30 @@ use crate::ids::{RepositoryId, TenantId};
 pub struct RedisCache {
     manager: ConnectionManager,
     namespace: String,
+}
+
+/// Connection options for [`RedisCache`].
+#[derive(Clone, Debug)]
+pub struct RedisCacheOptions {
+    /// Key namespace prefix shared by one deployment.
+    pub namespace: String,
+    /// Timeout for each Redis connection attempt.
+    pub connection_timeout: Duration,
+    /// Timeout for Redis command responses.
+    pub response_timeout: Duration,
+    /// Number of connection retries performed by the connection manager.
+    pub connection_retries: usize,
+}
+
+impl Default for RedisCacheOptions {
+    fn default() -> Self {
+        Self {
+            namespace: "grit-cache".to_owned(),
+            connection_timeout: Duration::from_secs(5),
+            response_timeout: Duration::from_secs(5),
+            connection_retries: 1,
+        }
+    }
 }
 
 impl RedisCache {
@@ -32,7 +58,7 @@ impl RedisCache {
     ///
     /// Returns [`Error::Cache`] when the URL is invalid or Redis cannot be reached.
     pub async fn connect(url: &str) -> Result<Self> {
-        Self::connect_with_namespace(url, "grit-cache").await
+        Self::connect_with_options(url, RedisCacheOptions::default()).await
     }
 
     /// Connect to Redis and create a cache with a custom namespace.
@@ -41,13 +67,33 @@ impl RedisCache {
     ///
     /// Returns [`Error::Cache`] when the URL is invalid or Redis cannot be reached.
     pub async fn connect_with_namespace(url: &str, namespace: impl Into<String>) -> Result<Self> {
+        Self::connect_with_options(
+            url,
+            RedisCacheOptions {
+                namespace: namespace.into(),
+                ..RedisCacheOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Connect to Redis with explicit cache connection options.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Cache`] when the URL is invalid or Redis cannot be reached.
+    pub async fn connect_with_options(url: &str, options: RedisCacheOptions) -> Result<Self> {
         let client = redis::Client::open(url)
             .map_err(|err| Error::Cache(format!("create redis client: {err}")))?;
+        let config = redis::aio::ConnectionManagerConfig::new()
+            .set_connection_timeout(options.connection_timeout)
+            .set_response_timeout(options.response_timeout)
+            .set_number_of_retries(options.connection_retries);
         let manager = client
-            .get_connection_manager()
+            .get_connection_manager_with_config(config)
             .await
             .map_err(|err| Error::Cache(format!("connect redis cache: {err}")))?;
-        Ok(Self::new(manager, namespace))
+        Ok(Self::new(manager, options.namespace))
     }
 
     fn key(&self, tenant: &TenantId, repository: &RepositoryId, key: &CacheKey) -> String {
