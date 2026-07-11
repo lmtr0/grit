@@ -47,6 +47,12 @@ pub enum Error {
     /// A cache backend rejected the operation.
     #[error("cache error: {0}")]
     Cache(String),
+    /// A protocol request was malformed or cannot be served.
+    #[error("protocol error: {0}")]
+    Protocol(String),
+    /// An I/O operation failed while framing protocol data.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
     /// An error from `grit-lib`.
     #[error(transparent)]
     Grit(#[from] grit_lib::error::Error),

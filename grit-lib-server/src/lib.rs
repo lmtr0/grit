@@ -14,6 +14,7 @@ pub mod layered;
 pub mod memory;
 #[cfg(feature = "nats")]
 pub mod nats_invalidation;
+pub mod protocol;
 #[cfg(feature = "redis")]
 pub mod redis_cache;
 pub mod repository;
@@ -35,6 +36,10 @@ pub mod prelude {
     pub use crate::layered::LayeredCache;
     #[cfg(feature = "nats")]
     pub use crate::nats_invalidation::{NatsInvalidationPublisher, NatsInvalidationSubscriber};
+    pub use crate::protocol::upload_pack::{
+        AdvertisedRef, FetchPackPlan, FetchPackResponse, GitProtocolVersion, RefAdvertisement,
+        UploadPackCapability, UploadPackRequest, UploadPackService,
+    };
     #[cfg(feature = "redis")]
     pub use crate::redis_cache::RedisCache;
     pub use crate::repository::ServerRepository;
