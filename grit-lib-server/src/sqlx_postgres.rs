@@ -1279,6 +1279,26 @@ impl BrowseIndex for PgServerStorage {
         Ok(())
     }
 
+    async fn replace_tree_entries(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        entries: &[IndexedTreeEntry],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "delete from grit_tree_entries
+             where tenant_id = $1 and repository_id = $2",
+        )
+        .bind(tenant.as_str())
+        .bind(repository.as_str())
+        .execute(&mut *tx)
+        .await?;
+        upsert_tree_entries_in_transaction(&mut tx, tenant, repository, entries).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn list_tree_entries(
         &self,
         tenant: &TenantId,

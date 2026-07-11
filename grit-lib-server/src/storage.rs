@@ -264,6 +264,20 @@ pub trait BrowseIndex: Send + Sync {
         entries: &[IndexedTreeEntry],
     ) -> Result<()>;
 
+    /// Replace all browse-index entries for a repository with `entries`.
+    ///
+    /// Backends that cannot perform a repository-wide replacement atomically may fall back to an
+    /// idempotent upsert, but repair-capable backends should remove stale rows before inserting
+    /// the supplied snapshot.
+    async fn replace_tree_entries(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        entries: &[IndexedTreeEntry],
+    ) -> Result<()> {
+        self.upsert_tree_entries(tenant, repository, entries).await
+    }
+
     /// List direct entries below `tree_oid` and `prefix`.
     async fn list_tree_entries(
         &self,

@@ -4,11 +4,15 @@ use grit_lib::objects::{
     serialize_commit, serialize_tag, serialize_tree, CommitData, HashAlgo, ObjectId, ObjectKind,
     TagData, TreeEntry,
 };
+use grit_lib::odb::Odb;
 use grit_lib::refs;
 use grit_lib::repo::init_repository;
 use grit_lib_server::cached::CachedStorage;
 use grit_lib_server::ids::{RepositoryId, TenantId};
-use grit_lib_server::import::import_repository;
+use grit_lib_server::import::{
+    import_repository, import_repository_with_options, ImportOptions, ImportProgressEvent,
+};
+use grit_lib_server::maintenance::{ConsistencyIssue, ExportOptions};
 use grit_lib_server::memory::MemoryBackend;
 use grit_lib_server::repository::ServerRepository;
 use grit_lib_server::storage::{
@@ -820,6 +824,175 @@ async fn default_branch_handles_detached_head() -> grit_lib_server::error::Resul
         Some(commit)
     );
     assert_eq!(repo.blob_at("HEAD", "README.md").await?.data, b"detached\n");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn incremental_reimport_picks_up_new_commit_and_reports_progress(
+) -> grit_lib_server::error::Result<()> {
+    let temp = tempfile::tempdir().map_err(grit_lib::error::Error::from)?;
+    let source = init_repository(temp.path(), false, "main", None, "files")?;
+    refs::write_symbolic_ref(&source.git_dir, "HEAD", "refs/heads/main")?;
+
+    let first_blob = source.odb.write(ObjectKind::Blob, b"first\n")?;
+    let first_tree = source.odb.write(
+        ObjectKind::Tree,
+        &serialize_tree(&[TreeEntry {
+            mode: 0o100644,
+            name: b"README.md".to_vec(),
+            oid: first_blob,
+        }]),
+    )?;
+    let first = write_fixture_commit(&source, first_tree, Vec::new(), 1_700_000_000, "first")?;
+    refs::write_ref(&source.git_dir, "refs/heads/main", &first)?;
+
+    let (tenant, repository) = ids()?;
+    let backend = Arc::new(MemoryBackend::new());
+    let repo = ServerRepository::new(tenant, repository, HashAlgo::Sha1, backend);
+    import_repository(&repo, &source).await?;
+    assert_eq!(repo.commit("main").await?.oid, first);
+
+    let second_blob = source.odb.write(ObjectKind::Blob, b"second\n")?;
+    let second_tree = source.odb.write(
+        ObjectKind::Tree,
+        &serialize_tree(&[TreeEntry {
+            mode: 0o100644,
+            name: b"README.md".to_vec(),
+            oid: second_blob,
+        }]),
+    )?;
+    let second = write_fixture_commit(&source, second_tree, vec![first], 1_700_000_100, "second")?;
+    refs::write_ref(&source.git_dir, "refs/heads/main", &second)?;
+
+    let mut events = Vec::new();
+    let report = import_repository_with_options(
+        &repo,
+        &source,
+        ImportOptions {
+            checkpoint_interval: 1,
+            ..ImportOptions::default()
+        },
+        |event| {
+            events.push(event);
+            Ok(())
+        },
+    )
+    .await?;
+
+    assert_eq!(repo.commit("main").await?.oid, second);
+    assert_eq!(repo.blob_at("main", "README.md").await?.data, b"second\n");
+    assert!(!report.checkpoints.is_empty());
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, ImportProgressEvent::Checkpoint(_))));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, ImportProgressEvent::Completed(_))));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn incremental_reimport_prunes_deleted_branch() -> grit_lib_server::error::Result<()> {
+    let temp = tempfile::tempdir().map_err(grit_lib::error::Error::from)?;
+    let source = init_repository(temp.path(), false, "main", None, "files")?;
+    refs::write_symbolic_ref(&source.git_dir, "HEAD", "refs/heads/main")?;
+    let tree = source.odb.write(ObjectKind::Tree, &serialize_tree(&[]))?;
+    let main = write_fixture_commit(&source, tree, Vec::new(), 1_700_000_000, "main")?;
+    let topic = write_fixture_commit(&source, tree, vec![main], 1_700_000_100, "topic")?;
+    refs::write_ref(&source.git_dir, "refs/heads/main", &main)?;
+    refs::write_ref(&source.git_dir, "refs/heads/topic", &topic)?;
+
+    let (tenant, repository) = ids()?;
+    let backend = Arc::new(MemoryBackend::new());
+    let repo = ServerRepository::new(tenant, repository, HashAlgo::Sha1, backend);
+    import_repository(&repo, &source).await?;
+    assert_eq!(repo.resolve_ref("refs/heads/topic").await?, Some(topic));
+
+    refs::delete_ref(&source.git_dir, "refs/heads/topic")?;
+    let report = import_repository(&repo, &source).await?;
+
+    assert_eq!(report.pruned_refs, 1);
+    assert!(repo.read_ref("refs/heads/topic").await?.is_none());
+    assert_eq!(repo.resolve_ref("refs/heads/main").await?, Some(main));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn consistency_check_detects_missing_object_referenced_by_ref(
+) -> grit_lib_server::error::Result<()> {
+    let (tenant, repository) = ids()?;
+    let backend = Arc::new(MemoryBackend::new());
+    let repo = ServerRepository::new(tenant, repository, HashAlgo::Sha1, backend.clone());
+    let missing = ObjectId::from_hex("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")?;
+
+    backend
+        .write_ref(
+            repo.tenant(),
+            repo.repository(),
+            "refs/heads/main",
+            &StoredRef::Direct(missing),
+            None,
+        )
+        .await?;
+
+    let report = repo.check_repository_consistency().await?;
+    assert!(!report.is_clean());
+    assert!(report.issues.iter().any(|issue| {
+        matches!(
+            issue,
+            ConsistencyIssue::MissingRefTarget { refname, target }
+                if refname == "refs/heads/main" && target == &missing
+        )
+    }));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn browse_index_can_be_rebuilt_from_object_storage() -> grit_lib_server::error::Result<()> {
+    let fixture = import_hosting_fixture().await?;
+    let repo = &fixture.repo;
+
+    repo.storage()
+        .replace_tree_entries(repo.tenant(), repo.repository(), &[])
+        .await?;
+    assert!(repo.tree_at("main", "").await?.entries.is_empty());
+
+    let repaired = repo.repair_browse_index().await?;
+    assert!(repaired > 0);
+    let root = repo.tree_at("main", "").await?;
+    assert!(root.entries.iter().any(|entry| entry.path == "README.md"));
+    assert_eq!(
+        repo.blob_at("main", "bin/run.sh").await?.data,
+        b"#!/bin/sh\necho hi\n"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn server_repository_exports_loose_filesystem_repository(
+) -> grit_lib_server::error::Result<()> {
+    let fixture = import_hosting_fixture().await?;
+    let export = tempfile::tempdir().map_err(grit_lib::error::Error::from)?;
+
+    let report = fixture
+        .repo
+        .export_repository(export.path(), ExportOptions::default())
+        .await?;
+
+    assert_eq!(report.objects, fixture.report.objects);
+    assert_eq!(
+        refs::resolve_ref(export.path(), "refs/heads/main")?,
+        fixture.head_commit
+    );
+    let exported_odb = Odb::new(&export.path().join("objects"));
+    let readme = exported_odb.read(&fixture.readme)?;
+    assert_eq!(readme.kind, ObjectKind::Blob);
+    assert_eq!(readme.data, b"# Demo\n\nUpdated\n");
 
     Ok(())
 }

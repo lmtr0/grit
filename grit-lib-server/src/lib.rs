@@ -11,6 +11,7 @@ pub mod error;
 pub mod ids;
 pub mod import;
 pub mod layered;
+pub mod maintenance;
 pub mod memory;
 #[cfg(feature = "nats")]
 pub mod nats_invalidation;
@@ -33,8 +34,15 @@ pub mod prelude {
     pub use crate::cached::CachedStorage;
     pub use crate::error::{Error, Result};
     pub use crate::ids::{RepositoryId, TenantId};
-    pub use crate::import::{import_repository, ImportReport};
+    pub use crate::import::{
+        import_repository, import_repository_with_options, ImportCheckpoint, ImportOptions,
+        ImportProgressEvent, ImportReport,
+    };
     pub use crate::layered::LayeredCache;
+    pub use crate::maintenance::{
+        check_repository_consistency, export_repository, repair_browse_index, ConsistencyIssue,
+        ConsistencyReport, ExportOptions, ExportReport,
+    };
     #[cfg(feature = "nats")]
     pub use crate::nats_invalidation::{NatsInvalidationPublisher, NatsInvalidationSubscriber};
     pub use crate::policy::{

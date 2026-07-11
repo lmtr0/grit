@@ -8,6 +8,7 @@ use grit_lib::objects::{parse_commit, parse_tag, HashAlgo, ObjectId, ObjectKind}
 use crate::cache::{EventPublisher, InvalidationEvent, InvalidationEventKind};
 use crate::error::{Error, Result};
 use crate::ids::{RepositoryId, TenantId};
+use crate::maintenance::{ConsistencyReport, ExportOptions, ExportReport};
 use crate::policy::{AuditSink, PolicyActor};
 use crate::protocol::receive_pack::{
     PushPlan, PushPolicy, ReceivePackReport, ReceivePackRequest, ReceivePackService,
@@ -581,6 +582,38 @@ where
             .replace_commit_graph(&self.tenant, &self.repository, &repaired)
             .await?;
         Ok(count)
+    }
+
+    /// Rebuild the browse index from stored commit and tree objects.
+    ///
+    /// # Errors
+    ///
+    /// Returns backend or object parsing errors.
+    pub async fn repair_browse_index(&self) -> Result<usize> {
+        crate::maintenance::repair_browse_index(self).await
+    }
+
+    /// Check refs, stored objects, and repairable indexes for missing objects.
+    ///
+    /// # Errors
+    ///
+    /// Returns backend or object parsing errors.
+    pub async fn check_repository_consistency(&self) -> Result<ConsistencyReport> {
+        crate::maintenance::check_repository_consistency(self).await
+    }
+
+    /// Export this repository to a filesystem Git directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns backend errors, filesystem I/O errors, compression errors, or an error if the target
+    /// already contains repository files and overwriting is disabled.
+    pub async fn export_repository(
+        &self,
+        git_dir: impl AsRef<std::path::Path>,
+        options: ExportOptions,
+    ) -> Result<ExportReport> {
+        crate::maintenance::export_repository(self, git_dir, options).await
     }
 
     /// Read a commit and return hosting-oriented metadata.
