@@ -71,6 +71,7 @@ The Windows version also comes with `grit manager` which works as an interface t
 | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
 | [`grit-cli`](https://crates.io/crates/grit-cli)       | The `grit` binary — a smaller workflow-oriented CLI backed by `grit-lib` (shipped by the install script) |
 | [`grit-lib`](https://crates.io/crates/grit-lib)       | Core library: object model, diff engine, index, refs, revision walking, merge, config, and more |
+| `grit-lib-server`                                    | Server-side repository storage, import, hosting views, and protocol helpers for building Git hosting APIs |
 | [`grit-git`](https://crates.io/crates/grit-git) | The `grit-git` binary — a drop-in CLI reimplementation of `git` with 140+ commands (`cargo install grit-git`) |
 | `grit-examples`                                       | Runnable examples of simple lib usage (add, cat-file, write-tree, hash-object, etc)             |
 | `grit-test-support`                                   | Workspace-only helpers for integration tests                                                    |
