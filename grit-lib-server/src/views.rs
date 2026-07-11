@@ -1,6 +1,9 @@
 //! Hosting-oriented read models.
 
+use std::time::Duration;
+
 use grit_lib::objects::{ObjectId, ObjectKind};
+use time::OffsetDateTime;
 
 /// Repository-level metadata for landing pages and API summaries.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -107,6 +110,96 @@ pub struct BlobView {
     pub mode: u32,
     /// Blob data.
     pub data: Vec<u8>,
+}
+
+/// Blob metadata returned without transferring blob contents.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlobMetadataView {
+    /// Blob object id.
+    pub oid: ObjectId,
+    /// Blob path relative to the tree root.
+    pub path: String,
+    /// Blob mode from the tree entry.
+    pub mode: u32,
+    /// Blob size when known from the browse index.
+    pub size: Option<u64>,
+}
+
+/// Preferred delivery mode for blob contents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlobContentDelivery {
+    /// Return the blob contents through the server API.
+    Inline,
+    /// Materialize the raw blob bytes and return a signed direct-download URL.
+    SignedUrl,
+    /// Return small blobs inline and large blobs through a signed direct-download URL.
+    Auto,
+}
+
+/// Options for server-mediated blob content delivery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlobDownloadOptions {
+    /// Delivery mode.
+    pub delivery: BlobContentDelivery,
+    /// Maximum blob size returned inline when `delivery` is [`BlobContentDelivery::Auto`].
+    pub inline_threshold: usize,
+    /// Signed URL validity duration.
+    pub expires_in: Duration,
+    /// Explicit signing start time supplied by the embedding server.
+    pub issued_at: OffsetDateTime,
+    /// Optional prefix prepended to materialized raw blob keys.
+    pub key_prefix: String,
+}
+
+impl BlobDownloadOptions {
+    /// Create default automatic blob download options with an explicit issue timestamp.
+    #[must_use]
+    pub fn new(issued_at: OffsetDateTime) -> Self {
+        Self {
+            delivery: BlobContentDelivery::Auto,
+            inline_threshold: 64 * 1024,
+            expires_in: Duration::from_secs(5 * 60),
+            issued_at,
+            key_prefix: String::new(),
+        }
+    }
+}
+
+/// Signed direct-download URL for materialized raw blob contents.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignedContentUrl {
+    /// HTTP method to use with `url`.
+    pub method: String,
+    /// Signed URL.
+    pub url: String,
+    /// Additional HTTP headers the client must send with the signed request.
+    pub headers: Vec<(String, String)>,
+    /// Timestamp after which the URL should no longer be used.
+    pub expires_at: OffsetDateTime,
+}
+
+/// Direct-download blob response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlobDownloadView {
+    /// Blob object id.
+    pub oid: ObjectId,
+    /// Blob path relative to the tree root.
+    pub path: String,
+    /// Blob mode from the tree entry.
+    pub mode: u32,
+    /// Blob size in bytes.
+    pub size: u64,
+    /// Signed direct-download URL.
+    pub signed_url: SignedContentUrl,
+}
+
+/// Blob content response that either carries bytes inline or delegates transfer to object storage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlobContentView {
+    /// Inline blob contents returned by the server.
+    Inline(BlobView),
+    /// Signed direct-download URL for raw blob contents.
+    Redirect(BlobDownloadView),
 }
 
 /// Conventional file discovered in a repository tree.

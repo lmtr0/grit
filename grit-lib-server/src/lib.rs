@@ -39,7 +39,9 @@ pub mod prelude {
     };
     pub use crate::cached::CachedStorage;
     pub use crate::error::{Error, Result};
-    pub use crate::external::{ExternalByteStore, MemoryByteStore};
+    pub use crate::external::{
+        ContentUrlSigner, ExternalByteStore, MemoryByteStore, StaticContentUrlSigner,
+    };
     #[cfg(feature = "externalized-postgres")]
     pub use crate::externalized::{ExternalStorageOptions, PgExternalizedStorage};
     pub use crate::ids::{RepositoryId, TenantId};
@@ -79,8 +81,9 @@ pub mod prelude {
         StoredObject, StoredPack, StoredRef,
     };
     pub use crate::views::{
-        BlobView, BranchView, CommitComparison, CommitHistoryOptions, CommitHistoryPage,
-        CommitSummary, CompareInputs, DiscoveredFile, RepositorySummary, TagView, TreeEntryView,
-        TreeView,
+        BlobContentDelivery, BlobContentView, BlobDownloadOptions, BlobDownloadView,
+        BlobMetadataView, BlobView, BranchView, CommitComparison, CommitHistoryOptions,
+        CommitHistoryPage, CommitSummary, CompareInputs, DiscoveredFile, RepositorySummary,
+        SignedContentUrl, TagView, TreeEntryView, TreeView,
     };
 }
