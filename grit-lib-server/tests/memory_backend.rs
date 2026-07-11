@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use flate2::write::ZlibEncoder;
 use grit_lib::objects::{
     serialize_commit, serialize_tag, serialize_tree, CommitData, HashAlgo, ObjectId, ObjectKind,
     TagData, TreeEntry,
@@ -19,9 +20,56 @@ use grit_lib_server::storage::{
     BrowseIndex, CommitGraphStore, IndexedTreeEntry, ObjectStore, RefStore, StoredObject, StoredRef,
 };
 use grit_lib_server::views::CommitHistoryOptions;
+use sha1::{Digest as _, Sha1};
 
 fn ids() -> grit_lib_server::error::Result<(TenantId, RepositoryId)> {
     Ok((TenantId::new("tenant-a")?, RepositoryId::new("repo-a")?))
+}
+
+fn pack(objects: &[StoredObject]) -> grit_lib_server::error::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"PACK");
+    out.extend_from_slice(&2u32.to_be_bytes());
+    let count = u32::try_from(objects.len())
+        .map_err(|_| grit_lib_server::error::Error::Protocol("too many test objects".to_owned()))?;
+    out.extend_from_slice(&count.to_be_bytes());
+
+    for object in objects {
+        encode_pack_object_header(&mut out, pack_type_code(object.kind), object.data.len());
+        let mut encoder = ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &object.data)?;
+        out.extend_from_slice(&encoder.finish()?);
+    }
+
+    let mut hasher = Sha1::new();
+    hasher.update(&out);
+    out.extend_from_slice(&hasher.finalize());
+    Ok(out)
+}
+
+fn pack_type_code(kind: ObjectKind) -> u8 {
+    match kind {
+        ObjectKind::Commit => 1,
+        ObjectKind::Tree => 2,
+        ObjectKind::Blob => 3,
+        ObjectKind::Tag => 4,
+    }
+}
+
+fn encode_pack_object_header(buf: &mut Vec<u8>, type_code: u8, payload_len: usize) {
+    let mut size = payload_len;
+    let first = ((type_code & 0x7) << 4) | (size & 0x0f) as u8;
+    size >>= 4;
+    if size > 0 {
+        buf.push(first | 0x80);
+        while size > 0 {
+            let byte = (size & 0x7f) as u8;
+            size >>= 7;
+            buf.push(if size > 0 { byte | 0x80 } else { byte });
+        }
+    } else {
+        buf.push(first);
+    }
 }
 
 struct ImportedFixture {
@@ -1142,6 +1190,162 @@ async fn cached_storage_reads_refs_from_cache_and_updates_on_write(
             .read_ref(&tenant, &repository, "refs/heads/main")
             .await?,
         Some(second)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn stores_and_retrieves_packed_objects() -> grit_lib_server::error::Result<()> {
+    let (tenant, repository) = ids()?;
+    let backend = Arc::new(MemoryBackend::new());
+    let repo = ServerRepository::new(tenant, repository, HashAlgo::Sha1, backend);
+    let blob = StoredObject::new(ObjectKind::Blob, b"packed\n");
+    let blob_oid = blob.object_id(HashAlgo::Sha1);
+    let pack = pack(std::slice::from_ref(&blob))?;
+
+    let metadata = repo.write_pack(&pack).await?;
+    assert_eq!(metadata.object_count, 1);
+    assert_eq!(repo.read_object(&blob_oid).await?, Some(blob.clone()));
+
+    let packed = repo
+        .read_packed_object(&blob_oid)
+        .await?
+        .ok_or_else(|| grit_lib_server::error::Error::ObjectNotFound(blob_oid.to_hex()))?;
+    assert_eq!(packed.pack.pack_checksum, metadata.pack_checksum);
+    assert_eq!(packed.index.oid, blob_oid);
+    assert_eq!(packed.object, blob);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn packed_object_lookup_prefers_newest_duplicate_pack() -> grit_lib_server::error::Result<()>
+{
+    let (tenant, repository) = ids()?;
+    let backend = Arc::new(MemoryBackend::new());
+    let repo = ServerRepository::new(tenant, repository, HashAlgo::Sha1, backend);
+    let duplicate = StoredObject::new(ObjectKind::Blob, b"same\n");
+    let oid = duplicate.object_id(HashAlgo::Sha1);
+    let first_extra = StoredObject::new(ObjectKind::Blob, b"first\n");
+    let second_extra = StoredObject::new(ObjectKind::Blob, b"second\n");
+
+    let first = repo
+        .write_pack(&pack(&[duplicate.clone(), first_extra])?)
+        .await?;
+    let second = repo
+        .write_pack(&pack(&[second_extra, duplicate.clone()])?)
+        .await?;
+    assert_ne!(first.pack_checksum, second.pack_checksum);
+
+    let packed = repo
+        .read_packed_object(&oid)
+        .await?
+        .ok_or_else(|| grit_lib_server::error::Error::ObjectNotFound(oid.to_hex()))?;
+    assert_eq!(packed.pack.pack_checksum, second.pack_checksum);
+    assert_eq!(packed.object, duplicate);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn pack_index_lookup_reads_object_by_offset() -> grit_lib_server::error::Result<()> {
+    let (tenant, repository) = ids()?;
+    let backend = Arc::new(MemoryBackend::new());
+    let repo = ServerRepository::new(tenant, repository, HashAlgo::Sha1, backend);
+    let blob = StoredObject::new(ObjectKind::Blob, b"offset\n");
+    let other = StoredObject::new(ObjectKind::Blob, b"other\n");
+    let metadata = repo.write_pack(&pack(&[other, blob.clone()])?).await?;
+    let packed = repo
+        .read_packed_object(&blob.object_id(HashAlgo::Sha1))
+        .await?
+        .ok_or_else(|| grit_lib_server::error::Error::ObjectNotFound("blob".to_owned()))?;
+
+    let by_offset = repo
+        .read_packed_object_at_offset(&metadata.pack_checksum, packed.index.offset)
+        .await?;
+    assert_eq!(by_offset.index, packed.index);
+    assert_eq!(by_offset.object, blob);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn repack_plan_preserves_reachable_packed_objects() -> grit_lib_server::error::Result<()> {
+    let (tenant, repository) = ids()?;
+    let backend = Arc::new(MemoryBackend::new());
+    let repo = ServerRepository::new(tenant, repository, HashAlgo::Sha1, backend.clone());
+    let blob = StoredObject::new(ObjectKind::Blob, b"reachable\n");
+    let blob_oid = blob.object_id(HashAlgo::Sha1);
+    let tree = StoredObject::new(
+        ObjectKind::Tree,
+        serialize_tree(&[TreeEntry {
+            mode: 0o100644,
+            name: b"README.md".to_vec(),
+            oid: blob_oid,
+        }]),
+    );
+    let tree_oid = tree.object_id(HashAlgo::Sha1);
+    let ident = "A U Thor <a@example.com> 1700000000 +0000".to_owned();
+    let commit = StoredObject::new(
+        ObjectKind::Commit,
+        serialize_commit(&CommitData {
+            tree: tree_oid,
+            parents: Vec::new(),
+            author: ident.clone(),
+            committer: ident,
+            author_raw: Vec::new(),
+            committer_raw: Vec::new(),
+            encoding: None,
+            message: "reachable\n".to_owned(),
+            raw_message: None,
+        }),
+    );
+    let commit_oid = commit.object_id(HashAlgo::Sha1);
+    let reachable_pack = repo
+        .write_pack(&pack(&[blob.clone(), tree.clone(), commit.clone()])?)
+        .await?;
+    let unreachable = StoredObject::new(ObjectKind::Blob, b"unreachable\n");
+    let unreachable_oid = unreachable.object_id(HashAlgo::Sha1);
+    let unreachable_pack = repo.write_pack(&pack(&[unreachable])?).await?;
+
+    backend
+        .write_ref(
+            repo.tenant(),
+            repo.repository(),
+            "HEAD",
+            &StoredRef::Symbolic("refs/heads/main".to_owned()),
+            None,
+        )
+        .await?;
+    backend
+        .write_ref(
+            repo.tenant(),
+            repo.repository(),
+            "refs/heads/main",
+            &StoredRef::Direct(commit_oid),
+            None,
+        )
+        .await?;
+
+    let plan = repo.plan_repack().await?;
+    assert!(plan.reachable_objects.contains(&commit_oid));
+    assert!(plan.reachable_objects.contains(&tree_oid));
+    assert!(plan.reachable_objects.contains(&blob_oid));
+    assert!(plan.unreachable_objects.contains(&unreachable_oid));
+    assert_eq!(
+        plan.packs_to_rewrite
+            .iter()
+            .map(|pack| pack.pack_checksum.clone())
+            .collect::<Vec<_>>(),
+        vec![reachable_pack.pack_checksum]
+    );
+    assert_eq!(
+        plan.packs_to_delete
+            .iter()
+            .map(|pack| pack.pack_checksum.clone())
+            .collect::<Vec<_>>(),
+        vec![unreachable_pack.pack_checksum]
     );
 
     Ok(())

@@ -15,6 +15,7 @@ pub mod maintenance;
 pub mod memory;
 #[cfg(feature = "nats")]
 pub mod nats_invalidation;
+mod packfile;
 pub mod policy;
 pub mod protocol;
 #[cfg(feature = "redis")]
@@ -63,8 +64,9 @@ pub mod prelude {
     pub use crate::redis_cache::RedisCache;
     pub use crate::repository::ServerRepository;
     pub use crate::storage::{
-        BrowseIndex, CommitGraphStore, ConfigStore, IndexedCommit, ObjectStore, RefStore,
-        ReflogEntry, ReflogStore, StoredObject, StoredRef,
+        BrowseIndex, CommitGraphStore, ConfigStore, IndexedCommit, ObjectStore, PackMetadata,
+        PackObjectIndex, PackStore, PackedObject, RefStore, ReflogEntry, ReflogStore, RepackPlan,
+        StoredObject, StoredPack, StoredRef,
     };
     pub use crate::views::{
         BlobView, BranchView, CommitComparison, CommitHistoryOptions, CommitHistoryPage,

@@ -11,7 +11,8 @@ use crate::error::{Error, Result};
 use crate::ids::{RepositoryId, TenantId};
 use crate::storage::{
     BrowseIndex, CommitGraphStore, ConfigStore, IndexedCommit, IndexedTreeEntry, ObjectStore,
-    RefStore, ReflogEntry, ReflogStore, StoredObject, StoredRef,
+    PackMetadata, PackObjectIndex, PackStore, RefStore, ReflogEntry, ReflogStore, StoredObject,
+    StoredPack, StoredRef,
 };
 
 /// Storage wrapper that caches hot object and ref reads.
@@ -462,6 +463,88 @@ where
         repository: &RepositoryId,
     ) -> Result<Vec<IndexedCommit>> {
         self.storage.list_indexed_commits(tenant, repository).await
+    }
+}
+
+#[async_trait]
+impl<S, C> PackStore for CachedStorage<S, C>
+where
+    S: PackStore,
+    C: Cache,
+{
+    async fn write_pack(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        pack: &StoredPack,
+    ) -> Result<PackMetadata> {
+        let metadata = self.storage.write_pack(tenant, repository, pack).await?;
+        self.cache.invalidate_repository(tenant, repository).await?;
+        Ok(metadata)
+    }
+
+    async fn read_pack_metadata(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        pack_checksum: &[u8],
+    ) -> Result<Option<PackMetadata>> {
+        self.storage
+            .read_pack_metadata(tenant, repository, pack_checksum)
+            .await
+    }
+
+    async fn read_pack_data(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        pack_checksum: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        self.storage
+            .read_pack_data(tenant, repository, pack_checksum)
+            .await
+    }
+
+    async fn find_packed_object(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        oid: &ObjectId,
+    ) -> Result<Option<(PackMetadata, PackObjectIndex)>> {
+        self.storage
+            .find_packed_object(tenant, repository, oid)
+            .await
+    }
+
+    async fn read_pack_index_at_offset(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        pack_checksum: &[u8],
+        offset: u64,
+    ) -> Result<Option<PackObjectIndex>> {
+        self.storage
+            .read_pack_index_at_offset(tenant, repository, pack_checksum, offset)
+            .await
+    }
+
+    async fn list_packs(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+    ) -> Result<Vec<PackMetadata>> {
+        self.storage.list_packs(tenant, repository).await
+    }
+
+    async fn list_pack_objects(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        pack_checksum: Option<&[u8]>,
+    ) -> Result<Vec<(PackMetadata, PackObjectIndex)>> {
+        self.storage
+            .list_pack_objects(tenant, repository, pack_checksum)
+            .await
     }
 }
 

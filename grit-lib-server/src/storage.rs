@@ -27,6 +27,73 @@ pub struct StoredObject {
     pub data: Vec<u8>,
 }
 
+/// Metadata for one stored packfile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackMetadata {
+    /// Pack trailing checksum bytes.
+    pub pack_checksum: Vec<u8>,
+    /// Checksum of the object index rows associated with this pack.
+    pub index_checksum: Vec<u8>,
+    /// Number of objects recorded in the pack header.
+    pub object_count: u32,
+    /// Number of bytes in the complete pack, including the trailing checksum.
+    pub size_bytes: u64,
+    /// Monotonic storage order assigned by the backend.
+    pub storage_order: u64,
+}
+
+/// One object-to-pack index row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackObjectIndex {
+    /// Object id for this packed representation.
+    pub oid: ObjectId,
+    /// Git object kind.
+    pub kind: ObjectKind,
+    /// Offset of the object header inside the pack.
+    pub offset: u64,
+    /// Uncompressed object payload size.
+    pub size: u64,
+    /// Compressed object stream size.
+    pub compressed_size: u64,
+}
+
+/// Pack bytes with metadata and object index rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredPack {
+    /// Pack metadata.
+    pub metadata: PackMetadata,
+    /// Complete raw PACK bytes.
+    pub data: Vec<u8>,
+    /// Object index rows in pack order.
+    pub index: Vec<PackObjectIndex>,
+}
+
+/// Packed object resolved through a pack index row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackedObject {
+    /// Pack metadata that owns this object representation.
+    pub pack: PackMetadata,
+    /// Index row that located the object.
+    pub index: PackObjectIndex,
+    /// Decoded object payload.
+    pub object: StoredObject,
+}
+
+/// Planned repository repack and garbage-collection inputs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepackPlan {
+    /// Object ids reachable from refs and retained by a repack.
+    pub reachable_objects: Vec<ObjectId>,
+    /// Stored object ids not reachable from refs and eligible for pruning.
+    pub unreachable_objects: Vec<ObjectId>,
+    /// Loose object ids that should be included in the next pack.
+    pub loose_objects: Vec<ObjectId>,
+    /// Existing packs that contain reachable objects and should be rewritten.
+    pub packs_to_rewrite: Vec<PackMetadata>,
+    /// Existing packs whose indexed objects are all unreachable.
+    pub packs_to_delete: Vec<PackMetadata>,
+}
+
 impl StoredObject {
     /// Create a stored object from its kind and raw data.
     #[must_use]
@@ -350,9 +417,77 @@ pub trait CommitGraphStore: Send + Sync {
     ) -> Result<Vec<IndexedCommit>>;
 }
 
+/// Packfile storage operations for one hosted repository.
+#[async_trait]
+pub trait PackStore: Send + Sync {
+    /// Store a packfile and its object index rows.
+    async fn write_pack(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        pack: &StoredPack,
+    ) -> Result<PackMetadata>;
+
+    /// Read pack metadata by trailing checksum.
+    async fn read_pack_metadata(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        pack_checksum: &[u8],
+    ) -> Result<Option<PackMetadata>>;
+
+    /// Read complete raw pack bytes by trailing checksum.
+    async fn read_pack_data(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        pack_checksum: &[u8],
+    ) -> Result<Option<Vec<u8>>>;
+
+    /// Return the newest packed representation for an object id.
+    async fn find_packed_object(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        oid: &ObjectId,
+    ) -> Result<Option<(PackMetadata, PackObjectIndex)>>;
+
+    /// Read an object index row by pack checksum and pack offset.
+    async fn read_pack_index_at_offset(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        pack_checksum: &[u8],
+        offset: u64,
+    ) -> Result<Option<PackObjectIndex>>;
+
+    /// List pack metadata rows for a repository.
+    async fn list_packs(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+    ) -> Result<Vec<PackMetadata>>;
+
+    /// List packed object index rows, optionally restricted to one pack.
+    async fn list_pack_objects(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        pack_checksum: Option<&[u8]>,
+    ) -> Result<Vec<(PackMetadata, PackObjectIndex)>>;
+}
+
 /// Combined storage contract for a full server repository backend.
 pub trait ServerStorage:
-    ObjectStore + RefStore + ReflogStore + ConfigStore + BrowseIndex + CommitGraphStore + Send + Sync
+    ObjectStore
+    + RefStore
+    + ReflogStore
+    + ConfigStore
+    + BrowseIndex
+    + CommitGraphStore
+    + PackStore
+    + Send
+    + Sync
 {
 }
 
@@ -363,6 +498,7 @@ impl<T> ServerStorage for T where
         + ConfigStore
         + BrowseIndex
         + CommitGraphStore
+        + PackStore
         + Send
         + Sync
 {

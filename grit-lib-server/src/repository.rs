@@ -1,9 +1,9 @@
 //! Repository handle for server-backed storage.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use grit_lib::objects::{parse_commit, parse_tag, HashAlgo, ObjectId, ObjectKind};
+use grit_lib::objects::{parse_commit, parse_tag, parse_tree, HashAlgo, ObjectId, ObjectKind};
 
 use crate::cache::{EventPublisher, InvalidationEvent, InvalidationEventKind};
 use crate::error::{Error, Result};
@@ -17,8 +17,8 @@ use crate::protocol::upload_pack::{
     FetchPackPlan, FetchPackResponse, RefAdvertisement, UploadPackRequest, UploadPackService,
 };
 use crate::storage::{
-    commit_time_from_identity, IndexedCommit, IndexedTreeEntry, ServerStorage, StoredObject,
-    StoredRef,
+    commit_time_from_identity, IndexedCommit, IndexedTreeEntry, PackMetadata, PackedObject,
+    RepackPlan, ServerStorage, StoredObject, StoredRef,
 };
 use crate::views::{
     BlobView, BranchView, CommitComparison, CommitHistoryOptions, CommitHistoryPage, CommitSummary,
@@ -110,6 +110,125 @@ where
         self.storage
             .read_object(&self.tenant, &self.repository, oid)
             .await
+    }
+
+    /// Store a raw packfile and its object-to-pack index rows.
+    ///
+    /// The pack is validated before it is stored. Delta objects are rejected until the server
+    /// object model can resolve and index deltas without relying on filesystem Git storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns protocol errors for malformed pack bytes, backend errors from the configured pack
+    /// store, or object parsing errors while updating commit graph indexes.
+    pub async fn write_pack(&self, pack: &[u8]) -> Result<PackMetadata> {
+        let decoded = crate::packfile::decode_pack(pack, self.hash_algo)?;
+        let metadata = self
+            .storage
+            .write_pack(&self.tenant, &self.repository, &decoded.pack)
+            .await?;
+        let commits = decoded
+            .objects
+            .iter()
+            .filter(|decoded| decoded.object.kind == ObjectKind::Commit)
+            .map(|decoded| {
+                let commit = parse_commit(&decoded.object.data)?;
+                Ok(IndexedCommit {
+                    oid: decoded.index.oid,
+                    tree: commit.tree,
+                    parents: commit.parents,
+                    commit_time: commit_time_from_identity(&commit.committer),
+                    generation: 1,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if !commits.is_empty() {
+            self.storage
+                .upsert_commits(&self.tenant, &self.repository, &commits)
+                .await?;
+        }
+        Ok(metadata)
+    }
+
+    /// Read the newest packed representation of `oid`.
+    ///
+    /// # Errors
+    ///
+    /// Returns backend errors, missing-pack consistency errors, or protocol errors if stored pack
+    /// bytes no longer decode at the indexed offset.
+    pub async fn read_packed_object(&self, oid: &ObjectId) -> Result<Option<PackedObject>> {
+        let Some((pack, index)) = self
+            .storage
+            .find_packed_object(&self.tenant, &self.repository, oid)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let data = self
+            .storage
+            .read_pack_data(&self.tenant, &self.repository, &pack.pack_checksum)
+            .await?
+            .ok_or_else(|| Error::Backend("pack index points at missing pack data".to_owned()))?;
+        let object = crate::packfile::read_object_at_offset(&data, index.offset, self.hash_algo)?;
+        Ok(Some(PackedObject {
+            pack,
+            index,
+            object,
+        }))
+    }
+
+    /// Read a packed object by pack checksum and object offset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ObjectNotFound`] when the pack or offset is unknown, plus backend or
+    /// protocol errors if stored pack bytes cannot be decoded.
+    pub async fn read_packed_object_at_offset(
+        &self,
+        pack_checksum: &[u8],
+        offset: u64,
+    ) -> Result<PackedObject> {
+        let pack = self
+            .storage
+            .read_pack_metadata(&self.tenant, &self.repository, pack_checksum)
+            .await?
+            .ok_or_else(|| Error::ObjectNotFound("pack".to_owned()))?;
+        let index = self
+            .storage
+            .read_pack_index_at_offset(&self.tenant, &self.repository, pack_checksum, offset)
+            .await?
+            .ok_or_else(|| Error::ObjectNotFound(format!("pack offset {offset}")))?;
+        let data = self
+            .storage
+            .read_pack_data(&self.tenant, &self.repository, pack_checksum)
+            .await?
+            .ok_or_else(|| {
+                Error::Backend("pack metadata points at missing pack data".to_owned())
+            })?;
+        let object = crate::packfile::read_object_at_offset(&data, offset, self.hash_algo)?;
+        Ok(PackedObject {
+            pack,
+            index,
+            object,
+        })
+    }
+
+    /// Serialize the supplied objects as a raw PACK v2 stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ObjectNotFound`] for missing object ids, or compression/protocol errors
+    /// while building the pack.
+    pub async fn build_pack(&self, objects: &[ObjectId]) -> Result<Vec<u8>> {
+        let mut packed = Vec::with_capacity(objects.len());
+        for oid in objects {
+            let object = self
+                .read_object(oid)
+                .await?
+                .ok_or_else(|| Error::ObjectNotFound(oid.to_hex()))?;
+            packed.push((*oid, object));
+        }
+        crate::packfile::serialize_pack(&packed, self.hash_algo)
     }
 
     /// Read a ref by name.
@@ -602,6 +721,83 @@ where
         crate::maintenance::check_repository_consistency(self).await
     }
 
+    /// Plan a repository repack and garbage-collection pass.
+    ///
+    /// The plan is advisory: it classifies reachable objects from refs, unreachable stored
+    /// objects, packs that contain reachable objects and should be rewritten, and packs that only
+    /// contain unreachable objects.
+    ///
+    /// # Errors
+    ///
+    /// Returns backend errors or object parsing errors while traversing object reachability.
+    pub async fn plan_repack(&self) -> Result<RepackPlan> {
+        let mut roots = Vec::new();
+        for (refname, value) in self.list_refs("").await? {
+            if let Some(oid) = self.resolve_stored_ref(&refname, value).await? {
+                roots.push(oid);
+            }
+        }
+        let reachable_objects = self.walk_object_oids(&roots, false).await?;
+        let reachable = reachable_objects.iter().copied().collect::<HashSet<_>>();
+
+        let stored_objects = self
+            .storage
+            .list_object_ids(&self.tenant, &self.repository, None)
+            .await?
+            .into_iter()
+            .map(|(oid, _)| oid)
+            .collect::<HashSet<_>>();
+
+        let mut unreachable_objects = stored_objects
+            .difference(&reachable)
+            .copied()
+            .collect::<Vec<_>>();
+        unreachable_objects.sort();
+
+        let packed_rows = self
+            .storage
+            .list_pack_objects(&self.tenant, &self.repository, None)
+            .await?;
+        let packed_objects = packed_rows
+            .iter()
+            .map(|(_, index)| index.oid)
+            .collect::<HashSet<_>>();
+        let mut loose_objects = stored_objects
+            .difference(&packed_objects)
+            .copied()
+            .collect::<Vec<_>>();
+        loose_objects.sort();
+
+        let mut pack_reachability = HashMap::<Vec<u8>, (PackMetadata, bool)>::new();
+        for (pack, index) in packed_rows {
+            let entry = pack_reachability
+                .entry(pack.pack_checksum.clone())
+                .or_insert_with(|| (pack, false));
+            if reachable.contains(&index.oid) {
+                entry.1 = true;
+            }
+        }
+        let mut packs_to_rewrite = Vec::new();
+        let mut packs_to_delete = Vec::new();
+        for (_, (pack, has_reachable)) in pack_reachability {
+            if has_reachable {
+                packs_to_rewrite.push(pack);
+            } else {
+                packs_to_delete.push(pack);
+            }
+        }
+        packs_to_rewrite.sort_by_key(|pack| pack.storage_order);
+        packs_to_delete.sort_by_key(|pack| pack.storage_order);
+
+        Ok(RepackPlan {
+            reachable_objects,
+            unreachable_objects,
+            loose_objects,
+            packs_to_rewrite,
+            packs_to_delete,
+        })
+    }
+
     /// Export this repository to a filesystem Git directory.
     ///
     /// # Errors
@@ -929,6 +1125,50 @@ where
         Ok(commits)
     }
 
+    async fn walk_object_oids(
+        &self,
+        roots: &[ObjectId],
+        skip_missing: bool,
+    ) -> Result<Vec<ObjectId>> {
+        let mut visited = HashSet::new();
+        let mut ordered = Vec::new();
+        let mut queue = VecDeque::new();
+        for root in roots {
+            enqueue_object(*root, &mut visited, &mut ordered, &mut queue);
+        }
+
+        while let Some(oid) = queue.pop_front() {
+            let Some(object) = self.read_object(&oid).await? else {
+                if skip_missing {
+                    continue;
+                }
+                return Err(Error::ObjectNotFound(oid.to_hex()));
+            };
+            match object.kind {
+                ObjectKind::Commit => {
+                    let commit = parse_commit(&object.data)?;
+                    for parent in commit.parents {
+                        enqueue_object(parent, &mut visited, &mut ordered, &mut queue);
+                    }
+                    enqueue_object(commit.tree, &mut visited, &mut ordered, &mut queue);
+                }
+                ObjectKind::Tree => {
+                    for entry in parse_tree(&object.data)? {
+                        if entry.mode != 0o160000 {
+                            enqueue_object(entry.oid, &mut visited, &mut ordered, &mut queue);
+                        }
+                    }
+                }
+                ObjectKind::Tag => {
+                    let tag = parse_tag(&object.data)?;
+                    enqueue_object(tag.object, &mut visited, &mut ordered, &mut queue);
+                }
+                ObjectKind::Blob => {}
+            }
+        }
+        Ok(ordered)
+    }
+
     async fn indexed_commits_by_oid(&self) -> Result<HashMap<ObjectId, IndexedCommit>> {
         Ok(self
             .storage
@@ -1250,6 +1490,18 @@ impl From<IndexedTreeEntry> for TreeEntryView {
             kind: entry.kind,
             size: entry.size,
         }
+    }
+}
+
+fn enqueue_object(
+    oid: ObjectId,
+    visited: &mut HashSet<ObjectId>,
+    ordered: &mut Vec<ObjectId>,
+    queue: &mut VecDeque<ObjectId>,
+) {
+    if visited.insert(oid) {
+        ordered.push(oid);
+        queue.push_back(oid);
     }
 }
 

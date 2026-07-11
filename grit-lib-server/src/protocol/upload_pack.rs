@@ -1,14 +1,9 @@
 //! Read-only upload-pack protocol support.
 
 use std::collections::{HashSet, VecDeque};
-use std::io::Write;
 
-use flate2::write::ZlibEncoder;
-use flate2::Compression;
 use grit_lib::objects::{parse_commit, parse_tag, parse_tree, HashAlgo, ObjectId, ObjectKind};
 use grit_lib::pkt_line;
-use sha1::{Digest as _, Sha1};
-use sha2::Sha256;
 
 use crate::error::{Error, Result};
 use crate::repository::ServerRepository;
@@ -456,24 +451,7 @@ where
     }
 
     async fn serialize_pack(&self, objects: &[ObjectId]) -> Result<Vec<u8>> {
-        let mut out = Vec::new();
-        out.extend_from_slice(b"PACK");
-        out.extend_from_slice(&2u32.to_be_bytes());
-        let count = u32::try_from(objects.len())
-            .map_err(|_| Error::Protocol("pack object count exceeds u32".to_owned()))?;
-        out.extend_from_slice(&count.to_be_bytes());
-
-        for oid in objects {
-            let object = self
-                .repo
-                .read_object(oid)
-                .await?
-                .ok_or_else(|| Error::ObjectNotFound(oid.to_hex()))?;
-            encode_pack_object_header(&mut out, pack_type_code(object.kind), object.data.len());
-            write_zlib(&mut out, &object.data)?;
-        }
-        append_pack_trailer(&mut out, self.repo.hash_algo());
-        Ok(out)
+        self.repo.build_pack(objects).await
     }
 }
 
@@ -543,52 +521,5 @@ fn enqueue(
     if visited.insert(oid) {
         ordered.push(oid);
         queue.push_back(oid);
-    }
-}
-
-fn pack_type_code(kind: ObjectKind) -> u8 {
-    match kind {
-        ObjectKind::Commit => 1,
-        ObjectKind::Tree => 2,
-        ObjectKind::Blob => 3,
-        ObjectKind::Tag => 4,
-    }
-}
-
-fn encode_pack_object_header(buf: &mut Vec<u8>, type_code: u8, payload_len: usize) {
-    let mut size = payload_len;
-    let first = ((type_code & 0x7) << 4) | (size & 0x0f) as u8;
-    size >>= 4;
-    if size > 0 {
-        buf.push(first | 0x80);
-        while size > 0 {
-            let b = (size & 0x7f) as u8;
-            size >>= 7;
-            buf.push(if size > 0 { b | 0x80 } else { b });
-        }
-    } else {
-        buf.push(first);
-    }
-}
-
-fn write_zlib(buf: &mut Vec<u8>, data: &[u8]) -> Result<()> {
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(data)?;
-    buf.extend_from_slice(&encoder.finish()?);
-    Ok(())
-}
-
-fn append_pack_trailer(buf: &mut Vec<u8>, algo: HashAlgo) {
-    match algo {
-        HashAlgo::Sha1 => {
-            let mut hasher = Sha1::new();
-            hasher.update(&*buf);
-            buf.extend_from_slice(&hasher.finalize());
-        }
-        HashAlgo::Sha256 => {
-            let mut hasher = Sha256::new();
-            hasher.update(&*buf);
-            buf.extend_from_slice(&hasher.finalize());
-        }
     }
 }
