@@ -164,6 +164,13 @@ where
         else {
             return Ok(None);
         };
+        if let Some(object) = self.try_read_packed_object_range(&pack, &index).await? {
+            return Ok(Some(PackedObject {
+                pack,
+                index,
+                object,
+            }));
+        }
         let data = self
             .storage
             .read_pack_data(&self.tenant, &self.repository, &pack.pack_checksum)
@@ -198,6 +205,13 @@ where
             .read_pack_index_at_offset(&self.tenant, &self.repository, pack_checksum, offset)
             .await?
             .ok_or_else(|| Error::ObjectNotFound(format!("pack offset {offset}")))?;
+        if let Some(object) = self.try_read_packed_object_range(&pack, &index).await? {
+            return Ok(PackedObject {
+                pack,
+                index,
+                object,
+            });
+        }
         let data = self
             .storage
             .read_pack_data(&self.tenant, &self.repository, pack_checksum)
@@ -1268,6 +1282,40 @@ where
 
     async fn reachable_set(&self, starts: &[ObjectId]) -> Result<HashSet<ObjectId>> {
         Ok(self.walk_commit_oids(starts).await?.into_iter().collect())
+    }
+
+    async fn try_read_packed_object_range(
+        &self,
+        pack: &PackMetadata,
+        index: &crate::storage::PackObjectIndex,
+    ) -> Result<Option<StoredObject>> {
+        let range_len = index
+            .compressed_size
+            .checked_add(32)
+            .ok_or_else(|| Error::Backend("pack object range length overflow".to_owned()))?;
+        let Some(range) = self
+            .storage
+            .read_pack_range(
+                &self.tenant,
+                &self.repository,
+                &pack.pack_checksum,
+                index.offset,
+                range_len,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        match crate::packfile::read_object_from_pack_range(
+            &range,
+            &index.oid,
+            index.offset,
+            self.hash_algo,
+        ) {
+            Ok(object) => Ok(Some(object)),
+            Err(Error::Protocol(_)) => Ok(None),
+            Err(err) => Err(err),
+        }
     }
 
     async fn is_ancestor_oid(&self, ancestor: ObjectId, descendant: ObjectId) -> Result<bool> {

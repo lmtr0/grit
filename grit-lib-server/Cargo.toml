@@ -12,11 +12,14 @@ workspace = true
 [features]
 default = []
 sqlx-postgres = ["dep:sqlx"]
+externalized-postgres = ["sqlx-postgres"]
 redis = ["dep:redis"]
 nats = ["dep:async-nats", "dep:futures-util"]
+s3 = ["externalized-postgres", "dep:aws-config", "dep:aws-sdk-s3"]
 live-sqlx-postgres-tests = ["sqlx-postgres"]
 live-redis-tests = ["redis"]
 live-nats-tests = ["nats"]
+live-s3-tests = ["s3"]
 
 [dependencies]
 async-trait.workspace = true
@@ -29,6 +32,8 @@ sha2.workspace = true
 thiserror.workspace = true
 time.workspace = true
 sqlx = { workspace = true, optional = true }
+aws-config = { version = "1", optional = true }
+aws-sdk-s3 = { version = "1", optional = true }
 redis = { version = "0.32.7", default-features = false, features = ["aio", "tokio-comp", "connection-manager"], optional = true }
 async-nats = { version = "0.42", optional = true }
 futures-util = { version = "0.3", optional = true }

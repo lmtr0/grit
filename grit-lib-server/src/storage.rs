@@ -444,6 +444,39 @@ pub trait PackStore: Send + Sync {
         pack_checksum: &[u8],
     ) -> Result<Option<Vec<u8>>>;
 
+    /// Read a byte range from a raw packfile.
+    ///
+    /// Backends with native ranged reads should override this method. The default implementation
+    /// reads the complete pack and slices the requested range locally.
+    async fn read_pack_range(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        pack_checksum: &[u8],
+        start: u64,
+        len: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(data) = self
+            .read_pack_data(tenant, repository, pack_checksum)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let start = usize::try_from(start).map_err(|_| {
+            crate::error::Error::Backend("pack range start exceeds usize".to_owned())
+        })?;
+        let len = usize::try_from(len).map_err(|_| {
+            crate::error::Error::Backend("pack range length exceeds usize".to_owned())
+        })?;
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| crate::error::Error::Backend("pack range overflow".to_owned()))?;
+        if start >= data.len() {
+            return Ok(Some(Vec::new()));
+        }
+        Ok(Some(data[start..end.min(data.len())].to_vec()))
+    }
+
     /// Return the newest packed representation for an object id.
     async fn find_packed_object(
         &self,
