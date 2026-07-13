@@ -543,7 +543,11 @@ fn index_tree(
                 .or_default()
                 .push(entry_index);
         }
-        stack.push(ImportWork::Object(entry.oid));
+        // Gitlinks name commits from another repository. Their object IDs are not
+        // required (or generally available) in the superproject object database.
+        if entry.mode != 0o160000 {
+            stack.push(ImportWork::Object(entry.oid));
+        }
     }
     Ok(indexed.len() - initial_len)
 }
@@ -551,6 +555,7 @@ fn index_tree(
 fn kind_for_mode(mode: u32) -> ObjectKind {
     match mode {
         0o040000 => ObjectKind::Tree,
+        0o160000 => ObjectKind::Commit,
         _ => ObjectKind::Blob,
     }
 }

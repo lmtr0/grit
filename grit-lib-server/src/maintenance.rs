@@ -302,6 +302,11 @@ where
             }
             ObjectKind::Tree => {
                 for entry in parse_tree(&object.data)? {
+                    // Gitlinks refer to commits in a separate repository, so
+                    // their target objects do not belong in this object store.
+                    if entry.mode == 0o160000 {
+                        continue;
+                    }
                     if !repo
                         .storage()
                         .object_exists(repo.tenant(), repo.repository(), &entry.oid)
@@ -381,6 +386,9 @@ where
             .await?
         {
             report.checked_browse_entries += 1;
+            if entry.mode == 0o160000 {
+                continue;
+            }
             if !repo
                 .storage()
                 .object_exists(repo.tenant(), repo.repository(), &entry.oid)
@@ -578,6 +586,7 @@ fn write_exported_config(
 fn kind_for_mode(mode: u32) -> ObjectKind {
     match mode {
         0o040000 => ObjectKind::Tree,
+        0o160000 => ObjectKind::Commit,
         _ => ObjectKind::Blob,
     }
 }
