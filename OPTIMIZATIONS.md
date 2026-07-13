@@ -322,6 +322,60 @@ Per-object progress events and async-trait future allocation can then be
 replaced with optional batch events. This is a lower-order optimization unless
 the callback performs expensive work.
 
+Implemented: ref/config/pack discovery, source ODB reads/decompression,
+commit/tree/tag parsing, direct-tree entry preparation, and native-pack
+readability validation now run on runtime-neutral blocking workers instead of
+the caller's async executor. The caller only merges prepared records into
+stateful traversal/index structures and computes commit generations.
+Independent packed-object reads and independent pack validations use one
+reusable pool per import. `ImportExecutionOptions`
+separately caps worker count (a fixed four by default) and conservative decode
+plus prepared-record working-set bytes in flight (128 MiB by default);
+pathological requests are
+clamped to 32 workers and 1 GiB before allocation. Packed delta estimates
+include inflated instruction streams retained across recursive base decoding,
+the active base payload, and the result. Whole-pack validation is charged the
+largest such estimate in that pack, not merely its largest final object. The
+process-wide 96 MiB delta-base cache and 32 MiB destination batch are separate
+bounds.
+
+Traversal weights additionally cover the retained raw payload and prepared
+output held until the whole wave merges. Tree weights use the shortest
+structurally parseable SHA-1 entry to overestimate entry count, geometric parsed
+and prepared vector capacities (including Rust's minimum nonzero capacity),
+their entry structs, and copied name bytes (including the
+discarded SHA-1 attempt for SHA-256 trees). Commit/tag weights include parent
+vector capacity, parsed identity/type/tag fields, expanded messages/raw forms,
+and allocation slack. Overflow makes the weight unknown and therefore
+exclusive.
+
+One object with an unknown estimate, or a conservative estimate larger than
+the configured byte limit, may exceed that limit but always runs alone. Thus no
+two unknown or oversized blobs/delta chains multiply transient memory.
+Completed worker results are normalized to their scheduling order within each
+wave; semantic state and progress counts are independent of worker completion
+timing. Changing configured worker/byte limits may change traversal,
+progress-event, and destination-batch order, so the implementation does not
+claim byte-for-byte event ordering across execution configurations. Workers
+never publish refs or mutate destination storage. Errors drain the current
+bounded wave and then abort normal installation/publication; pool shutdown
+joins every worker on normal completion. Cancellation marks queued jobs so they
+skip blocking work and transfers active-worker joins to a reaper created before
+the pool workers; an already-active filesystem operation may finish, but
+dropping the async import does not synchronously wait for it. The reaper joins
+the workers and then self-terminates; cancellation intentionally does not join
+the reaper thread synchronously.
+
+The blocking-read and portable decode pipeline is above the `ServerStorage`
+boundary, so memory, PostgreSQL, externalized PostgreSQL, and future backends
+all receive it. Compatible pack metadata is used for exact scheduling even
+when the destination cannot retain native packs. Direct native-pack retention,
+shared pack bytes, direct packed lookup, and parallel whole-pack validation
+still require a backend that advertises native-pack import support; currently
+that is the memory backend. Persistent backends therefore gain responsive,
+bounded source reads and portable batch writes, but not the memory backend's
+zero-expansion pack installation.
+
 ## Suggested implementation order
 
 1. Add phase timings and counters described below.

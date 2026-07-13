@@ -1711,6 +1711,27 @@ pub struct PackedObjectMetadata {
     pub size: u64,
 }
 
+/// Object metadata plus a conservative peak working-set estimate for one packed decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackedObjectDecodeEstimate {
+    /// Resolved Git object kind. Delta objects inherit their base object's kind.
+    pub kind: ObjectKind,
+    /// Uncompressed size of the resolved object payload.
+    pub size: u64,
+    /// Conservative transient bytes required to resolve this object without a warm delta cache.
+    ///
+    /// This includes recursively retained delta instruction streams, the active base payload, and
+    /// the result payload. The process-wide bounded delta-base cache is additional shared state.
+    pub working_set_size: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ResolvedPackedObjectMetadata {
+    kind: ObjectKind,
+    size: u64,
+    working_set_size: u64,
+}
+
 /// Read object metadata from immutable pack bytes without materializing the object payload.
 ///
 /// Direct objects use the kind and size in their pack entry header. For a delta, this follows its
@@ -1736,7 +1757,11 @@ pub fn read_object_metadata_from_pack_bytes(
         .ok_or_else(|| Error::ObjectNotFound(oid_bytes_to_hex(oid)))?;
     let mut memo = HashMap::new();
     let mut visiting = HashSet::new();
-    read_object_metadata_at(pack_bytes, idx, offset, &mut memo, &mut visiting, 0)
+    let metadata = read_object_metadata_at(pack_bytes, idx, offset, &mut memo, &mut visiting, 0)?;
+    Ok(PackedObjectMetadata {
+        kind: metadata.kind,
+        size: metadata.size,
+    })
 }
 
 /// Read metadata for every indexed object from immutable pack bytes without materializing object
@@ -1758,9 +1783,48 @@ pub fn read_all_object_metadata_from_pack_bytes(
     let mut visiting = HashSet::new();
     let mut metadata = Vec::with_capacity(idx.entries.len());
     for entry in &idx.entries {
-        let object_metadata =
+        let resolved =
             read_object_metadata_at(pack_bytes, idx, entry.offset, &mut memo, &mut visiting, 0)?;
-        metadata.push((entry.oid.clone(), object_metadata));
+        metadata.push((
+            entry.oid.clone(),
+            PackedObjectMetadata {
+                kind: resolved.kind,
+                size: resolved.size,
+            },
+        ));
+    }
+    Ok(metadata)
+}
+
+/// Read metadata and conservative decode working-set estimates for every indexed object.
+///
+/// Delta base metadata is memoized across entries. Each estimate assumes no warm delta cache and
+/// includes recursively retained inflated delta instructions, the active base payload, and the
+/// result payload. The process-wide bounded delta-base cache is additional shared state.
+///
+/// # Errors
+///
+/// Returns [`Error::CorruptObject`] when pack metadata is invalid or the conservative working-set
+/// calculation overflows `u64`.
+pub fn read_all_object_decode_estimates_from_pack_bytes(
+    pack_bytes: &[u8],
+    idx: &PackIndex,
+) -> Result<Vec<(Vec<u8>, PackedObjectDecodeEstimate)>> {
+    validate_pack_index_object_count(pack_bytes, idx)?;
+    let mut memo = HashMap::with_capacity(idx.entries.len());
+    let mut visiting = HashSet::new();
+    let mut metadata = Vec::with_capacity(idx.entries.len());
+    for entry in &idx.entries {
+        let resolved =
+            read_object_metadata_at(pack_bytes, idx, entry.offset, &mut memo, &mut visiting, 0)?;
+        metadata.push((
+            entry.oid.clone(),
+            PackedObjectDecodeEstimate {
+                kind: resolved.kind,
+                size: resolved.size,
+                working_set_size: resolved.working_set_size,
+            },
+        ));
     }
     Ok(metadata)
 }
@@ -1769,10 +1833,10 @@ fn read_object_metadata_at(
     pack_bytes: &[u8],
     idx: &PackIndex,
     offset: u64,
-    memo: &mut HashMap<u64, PackedObjectMetadata>,
+    memo: &mut HashMap<u64, ResolvedPackedObjectMetadata>,
     visiting: &mut HashSet<u64>,
     depth: usize,
-) -> Result<PackedObjectMetadata> {
+) -> Result<ResolvedPackedObjectMetadata> {
     if let Some(metadata) = memo.get(&offset) {
         return Ok(*metadata);
     }
@@ -1788,9 +1852,10 @@ fn read_object_metadata_at(
         let (packed_type, delta_data_size) = parse_pack_object_header(pack_bytes, &mut pos)?;
         match packed_type {
             PackedType::Commit | PackedType::Tree | PackedType::Blob | PackedType::Tag => {
-                Ok(PackedObjectMetadata {
+                Ok(ResolvedPackedObjectMetadata {
                     kind: packed_type_to_kind(packed_type)?,
                     size: delta_data_size,
+                    working_set_size: delta_data_size,
                 })
             }
             PackedType::OfsDelta | PackedType::RefDelta => {
@@ -1846,9 +1911,22 @@ fn read_object_metadata_at(
                         "delta size header exceeds declared delta stream size".to_owned(),
                     ));
                 }
-                Ok(PackedObjectMetadata {
+                let recursive_peak = delta_data_size
+                    .checked_add(base.working_set_size)
+                    .ok_or_else(|| {
+                        Error::CorruptObject("delta decode working-set overflow".to_owned())
+                    })?;
+                let apply_peak = base
+                    .size
+                    .checked_add(delta_data_size)
+                    .and_then(|value| value.checked_add(result_size))
+                    .ok_or_else(|| {
+                        Error::CorruptObject("delta decode working-set overflow".to_owned())
+                    })?;
+                Ok(ResolvedPackedObjectMetadata {
                     kind: base.kind,
                     size: result_size,
+                    working_set_size: recursive_peak.max(apply_peak),
                 })
             }
         }

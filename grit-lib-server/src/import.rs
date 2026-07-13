@@ -2,13 +2,20 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
+use std::thread::JoinHandle;
 use std::time::SystemTime;
 
 use grit_lib::config::ConfigSet;
 use grit_lib::objects::{
     parse_commit, parse_tag, parse_tree, HashAlgo, Object, ObjectId, ObjectKind,
 };
+use grit_lib::odb::Odb;
 use grit_lib::pack::{self, PackIndex};
 use grit_lib::refs;
 use grit_lib::repo::Repository;
@@ -23,12 +30,60 @@ use crate::storage::{
 
 const IMPORT_OBJECT_BATCH_MAX_COUNT: usize = 2_000;
 const IMPORT_OBJECT_BATCH_MAX_BYTES: usize = 32 * 1024 * 1024;
+const DEFAULT_IMPORT_DECODE_WORKERS: usize = 4;
+const DEFAULT_IMPORT_DECODE_BYTES: usize = 128 * 1024 * 1024;
+const MAX_IMPORT_DECODE_WORKERS: usize = 32;
+const MAX_IMPORT_DECODE_BYTES: usize = 1024 * 1024 * 1024;
 
-type NativeObjectMetadata = HashMap<ObjectId, (ObjectKind, u64)>;
+type NativeObjectMetadata = HashMap<ObjectId, NativeObjectMetadataEntry>;
 
+#[derive(Clone, Copy)]
+struct NativeObjectMetadataEntry {
+    kind: ObjectKind,
+    size: u64,
+    decode_working_set: u64,
+    import_working_set: u64,
+}
+
+#[derive(Clone, Copy)]
 struct ImportWork {
     oid: ObjectId,
     expected_kind: Option<ObjectKind>,
+}
+
+struct DecodeJob {
+    work: ImportWork,
+    native_metadata: Option<NativeObjectMetadataEntry>,
+    skip_payload: bool,
+}
+
+struct DecodedImportObject {
+    work: ImportWork,
+    stored: Option<StoredObject>,
+    object_kind: ObjectKind,
+    object_size: u64,
+    parsed: ParsedImportObject,
+}
+
+enum ParsedImportObject {
+    Commit {
+        tree: ObjectId,
+        parents: Vec<ObjectId>,
+        commit_time: i64,
+    },
+    Tree(Vec<ParsedTreeEntry>),
+    Tag {
+        target: ObjectId,
+        target_kind: ObjectKind,
+    },
+    Blob,
+}
+
+struct ParsedTreeEntry {
+    name: String,
+    mode: u32,
+    oid: ObjectId,
+    kind: ObjectKind,
 }
 
 impl ImportWork {
@@ -58,9 +113,10 @@ struct NativeSourcePack {
 
 #[derive(Default)]
 struct NativeSourcePacks {
-    packs: Vec<NativeSourcePack>,
+    packs: Vec<Arc<NativeSourcePack>>,
     loose_oids: Vec<ObjectId>,
     full_mirror_compatible: bool,
+    retention_enabled: bool,
 }
 
 struct NativeInstallInputs<'a> {
@@ -70,8 +126,14 @@ struct NativeInstallInputs<'a> {
     newly_trusted: &'a [(ObjectId, ObjectKind)],
 }
 
+struct SourceImportInputs {
+    roots: Vec<ImportWork>,
+    desired_refs: Vec<(String, StoredRef)>,
+    config_entries: Vec<(String, String)>,
+}
+
 impl NativeSourcePacks {
-    fn object_metadata(&self, oid: &ObjectId) -> Option<(ObjectKind, u64)> {
+    fn object_metadata(&self, oid: &ObjectId) -> Option<NativeObjectMetadataEntry> {
         self.packs
             .iter()
             .rev()
@@ -157,6 +219,272 @@ impl Default for ImportOptions {
     }
 }
 
+/// Resource limits for blocking repository-import execution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportExecutionOptions {
+    /// Requested number of reusable source decode and validation workers.
+    ///
+    /// Import clamps this value to the inclusive range `1..=32` before allocating the worker
+    /// pool. The host-independent default is four.
+    pub decode_workers: usize,
+    /// Requested conservative source decode-and-preparation working-set bytes allowed in one wave.
+    ///
+    /// Import clamps this value to the inclusive range `1..=1 GiB`. A job whose conservative
+    /// estimate exceeds the effective limit runs alone, as does a job without a conservative
+    /// estimate. The host-independent default is 128 MiB.
+    pub decode_in_flight_bytes: usize,
+}
+
+impl Default for ImportExecutionOptions {
+    fn default() -> Self {
+        Self {
+            decode_workers: DEFAULT_IMPORT_DECODE_WORKERS,
+            decode_in_flight_bytes: DEFAULT_IMPORT_DECODE_BYTES,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ValidatedImportExecutionOptions {
+    decode_workers: usize,
+    decode_in_flight_bytes: usize,
+}
+
+impl From<&ImportExecutionOptions> for ValidatedImportExecutionOptions {
+    fn from(options: &ImportExecutionOptions) -> Self {
+        Self {
+            decode_workers: options.decode_workers.clamp(1, MAX_IMPORT_DECODE_WORKERS),
+            decode_in_flight_bytes: options
+                .decode_in_flight_bytes
+                .clamp(1, MAX_IMPORT_DECODE_BYTES),
+        }
+    }
+}
+
+struct BlockingState<T> {
+    result: Option<Result<T>>,
+    waker: Option<Waker>,
+}
+
+struct BlockingTask<T> {
+    state: Arc<Mutex<BlockingState<T>>>,
+}
+
+impl<T> Future for BlockingTask<T> {
+    type Output = Result<T>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(result) = state.result.take() {
+            Poll::Ready(result)
+        } else {
+            state.waker = Some(context.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
+type PoolJob = Box<dyn FnOnce() + Send + 'static>;
+
+enum PoolMessage {
+    Run(PoolJob),
+    Shutdown,
+}
+
+struct BlockingPool {
+    sender: mpsc::Sender<PoolMessage>,
+    workers: Vec<JoinHandle<()>>,
+    cancelled: Arc<AtomicBool>,
+    reaper_sender: Option<mpsc::Sender<Vec<JoinHandle<()>>>>,
+    reaper: Option<JoinHandle<()>>,
+}
+
+impl BlockingPool {
+    fn new(worker_count: usize) -> Result<Self> {
+        let (reaper_sender, reaper_receiver) = mpsc::channel::<Vec<JoinHandle<()>>>();
+        let reaper = std::thread::Builder::new()
+            .name("grit-import-worker-reaper".to_owned())
+            .spawn(move || {
+                while let Ok(workers) = reaper_receiver.recv() {
+                    for worker in workers {
+                        let _ = worker.join();
+                    }
+                }
+            })?;
+        let (sender, receiver) = mpsc::channel();
+        let receiver = Arc::new(Mutex::new(receiver));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut workers = Vec::with_capacity(worker_count);
+        for worker_index in 0..worker_count {
+            let receiver = Arc::clone(&receiver);
+            let worker = std::thread::Builder::new()
+                .name(format!("grit-import-worker-{worker_index}"))
+                .spawn(move || loop {
+                    let message = receiver
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .recv();
+                    match message {
+                        Ok(PoolMessage::Run(job)) => job(),
+                        Ok(PoolMessage::Shutdown) | Err(_) => break,
+                    }
+                });
+            match worker {
+                Ok(worker) => workers.push(worker),
+                Err(error) => {
+                    cancelled.store(true, Ordering::Release);
+                    for _ in &workers {
+                        let _ = sender.send(PoolMessage::Shutdown);
+                    }
+                    let _ = reaper_sender.send(workers);
+                    drop(reaper_sender);
+                    drop(reaper);
+                    return Err(error.into());
+                }
+            }
+        }
+        Ok(Self {
+            sender,
+            workers,
+            cancelled,
+            reaper_sender: Some(reaper_sender),
+            reaper: Some(reaper),
+        })
+    }
+
+    fn submit<T>(
+        &self,
+        work: impl FnOnce() -> Result<T> + Send + 'static,
+    ) -> Result<BlockingTask<T>>
+    where
+        T: Send + 'static,
+    {
+        let state = Arc::new(Mutex::new(BlockingState {
+            result: None,
+            waker: None,
+        }));
+        let worker_state = Arc::clone(&state);
+        let cancelled = Arc::clone(&self.cancelled);
+        self.sender
+            .send(PoolMessage::Run(Box::new(move || {
+                let result = if cancelled.load(Ordering::Acquire) {
+                    Err(Error::Protocol(
+                        "repository import was cancelled".to_owned(),
+                    ))
+                } else {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+                        .map_err(|_| Error::Protocol("blocking import worker panicked".to_owned()))
+                        .and_then(std::convert::identity)
+                };
+                let waker = {
+                    let mut state = worker_state
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    state.result = Some(result);
+                    state.waker.take()
+                };
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            })))
+            .map_err(|_| Error::Protocol("blocking import worker pool stopped".to_owned()))?;
+        Ok(BlockingTask { state })
+    }
+
+    async fn run_jobs<J, T, F>(&self, jobs: Vec<J>, work: F) -> Result<Vec<T>>
+    where
+        J: Send + 'static,
+        T: Send + 'static,
+        F: Fn(J) -> Result<T> + Send + Sync + 'static,
+    {
+        let work = Arc::new(work);
+        let mut tasks = Vec::with_capacity(jobs.len());
+        let mut first_error = None;
+        for job in jobs {
+            let work = Arc::clone(&work);
+            match self.submit(move || work(job)) {
+                Ok(task) => tasks.push(task),
+                Err(error) => {
+                    first_error = Some(error);
+                    break;
+                }
+            }
+        }
+        let mut results = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            match task.await {
+                Ok(result) => results.push(Some(result)),
+                Err(error) => {
+                    results.push(None);
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        results
+            .into_iter()
+            .map(|result| {
+                result.ok_or_else(|| {
+                    Error::Protocol("blocking import job lost its result".to_owned())
+                })
+            })
+            .collect()
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        let mut first_error = None;
+        for _ in &self.workers {
+            if self.sender.send(PoolMessage::Shutdown).is_err() && first_error.is_none() {
+                first_error = Some(Error::Protocol(
+                    "blocking import worker pool stopped".to_owned(),
+                ));
+            }
+        }
+        for worker in self.workers.drain(..) {
+            if worker.join().is_err() && first_error.is_none() {
+                first_error = Some(Error::Protocol(
+                    "blocking import worker panicked".to_owned(),
+                ));
+            }
+        }
+        drop(self.reaper_sender.take());
+        if self
+            .reaper
+            .take()
+            .is_some_and(|reaper| reaper.join().is_err())
+            && first_error.is_none()
+        {
+            first_error = Some(Error::Protocol(
+                "blocking import worker reaper panicked".to_owned(),
+            ));
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for BlockingPool {
+    fn drop(&mut self) {
+        if self.workers.is_empty() {
+            return;
+        }
+        self.cancelled.store(true, Ordering::Release);
+        for _ in &self.workers {
+            let _ = self.sender.send(PoolMessage::Shutdown);
+        }
+        let workers = self.workers.drain(..).collect::<Vec<_>>();
+        if let Some(reaper_sender) = self.reaper_sender.take() {
+            let _ = reaper_sender.send(workers);
+        }
+        // Disconnecting the channel lets the already-running reaper self-terminate after joining
+        // the active workers. Dropping its handle intentionally detaches that non-blocking cleanup.
+        drop(self.reaper.take());
+    }
+}
+
 /// Import progress checkpoint for large repository imports.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImportCheckpoint {
@@ -210,7 +538,8 @@ pub enum ImportProgressEvent {
 ///
 /// # Errors
 ///
-/// Returns errors from the source repository, destination storage, or object parsing.
+/// Returns errors from the source repository, destination storage, object parsing, or worker-pool
+/// construction, submission, execution, and orderly shutdown.
 pub async fn import_repository<S>(
     destination: &crate::repository::ServerRepository<S>,
     source: &Repository,
@@ -221,7 +550,36 @@ where
     import_repository_with_options(destination, source, ImportOptions::default(), |_| Ok(())).await
 }
 
-/// Import reachable repository data with explicit options and progress reporting.
+/// Import reachable repository data with explicit semantic options and progress reporting.
+///
+/// This source-compatible entry point uses [`ImportExecutionOptions::default`] for blocking work
+/// limits. Use [`import_repository_with_execution_options`] to tune those resource limits.
+///
+/// # Errors
+///
+/// Returns errors from the source repository, destination storage, progress callback, object
+/// parsing, or worker-pool construction, submission, execution, and orderly shutdown.
+pub async fn import_repository_with_options<S, P>(
+    destination: &crate::repository::ServerRepository<S>,
+    source: &Repository,
+    options: ImportOptions,
+    progress: P,
+) -> Result<ImportReport>
+where
+    S: ServerStorage,
+    P: FnMut(ImportProgressEvent) -> Result<()>,
+{
+    import_repository_with_execution_options(
+        destination,
+        source,
+        options,
+        ImportExecutionOptions::default(),
+        progress,
+    )
+    .await
+}
+
+/// Import reachable repository data with semantic and execution options plus progress reporting.
 ///
 /// Direct entries discovered during import are upserted by immutable tree object id. Existing
 /// entries for stored objects outside the current reachable closure are preserved. Use
@@ -243,41 +601,58 @@ where
 /// of being retained as a loose copy. Promisor, thin, corrupt, hash-incompatible, alternate, or
 /// backend-unsupported packs safely use the reachable loose-object fallback. Refs remain
 /// unpublished until every retained pack, fallback object, and query index has been installed.
+/// Blocking ref/config/pack discovery, reads, decompression, commit/tree/tag parsing, tree-entry
+/// preparation, and native-pack validation run outside the async executor. The caller task only
+/// merges prepared records into traversal/index state and computes commit generations. Decode
+/// worker count and conservative decode-plus-prepared-record working-set bytes are bounded
+/// independently by [`ImportExecutionOptions`]. Delta estimates include inflated instruction
+/// streams, recursive base resolution, the active base, and result payload. Preparation estimates
+/// also cover the retained raw payload, parsed commit/tag strings and parent vectors, and worst-case
+/// tree entry/name allocations while the completed wave waits to merge. One object whose estimate
+/// is unknown or exceeds the byte limit may exceed that limit, but it always runs alone.
+/// The process-wide 96 MiB delta-base cache and the separately bounded destination write batch are
+/// additional memory. The portable pipeline applies to every storage backend; direct pack
+/// retention remains conditional on [`crate::storage::PackStore::supports_native_pack_import`].
+/// Worker completion order is normalized to scheduling order within each wave. Imported semantic
+/// state and progress counts do not depend on worker timing, but changing execution limits may
+/// change traversal, progress-event, and destination-batch order.
 ///
 /// The `progress` callback receives events after durable writes complete. Returning an error from
 /// the callback aborts the import and returns that error.
 ///
 /// # Errors
 ///
-/// Returns errors from the source repository, destination storage, progress callback, or object
-/// parsing.
-pub async fn import_repository_with_options<S, P>(
+/// Returns errors from the source repository, destination storage, progress callback, object
+/// parsing, or worker-pool construction, submission, execution, and orderly shutdown. Worker
+/// panics are converted to errors. Cancellation skips queued jobs and hands active-worker joining
+/// to an off-executor reaper.
+pub async fn import_repository_with_execution_options<S, P>(
     destination: &crate::repository::ServerRepository<S>,
     source: &Repository,
     options: ImportOptions,
+    execution_options: ImportExecutionOptions,
     mut progress: P,
 ) -> Result<ImportReport>
 where
     S: ServerStorage,
     P: FnMut(ImportProgressEvent) -> Result<()>,
 {
-    let mut roots = Vec::new();
-    let mut desired_refs = Vec::new();
-
-    if let Ok(Some(target)) = refs::read_symbolic_ref(&source.git_dir, "HEAD") {
-        desired_refs.push(("HEAD".to_owned(), StoredRef::Symbolic(target)));
-    } else if let Ok(oid) = refs::resolve_ref(&source.git_dir, "HEAD") {
-        desired_refs.push(("HEAD".to_owned(), StoredRef::Direct(oid)));
-        roots.push(ImportWork::object(oid));
-    }
-
-    for (name, oid) in refs::list_refs(&source.git_dir, "refs/")? {
-        desired_refs.push((name, StoredRef::Direct(oid)));
-        roots.push(ImportWork::object(oid));
-    }
-    let config_entries = read_config(source)?;
-    let native_source_packs = discover_native_source_packs(destination, source, &options).await?;
-    let native_import_enabled = native_source_packs.is_some();
+    let execution = ValidatedImportExecutionOptions::from(&execution_options);
+    let mut pool = BlockingPool::new(execution.decode_workers)?;
+    let git_dir = source.git_dir.clone();
+    let SourceImportInputs {
+        roots,
+        desired_refs,
+        config_entries,
+    } = pool
+        .submit(move || discover_source_inputs(&git_dir))?
+        .await?;
+    let native_source_packs = discover_native_source_packs(destination, source, &options, &pool)
+        .await?
+        .map(Arc::new);
+    let native_import_enabled = native_source_packs
+        .as_ref()
+        .is_some_and(|native| native.retention_enabled);
 
     let session = destination
         .storage()
@@ -300,182 +675,175 @@ where
     let mut pending_objects = Vec::with_capacity(IMPORT_OBJECT_BATCH_MAX_COUNT);
     let mut pending_object_bytes = 0usize;
     let mut stack = roots;
-    while let Some(work) = stack.pop() {
-        let oid = work.oid;
-        if !seen.insert(oid) {
-            continue;
-        }
-        if trusted_objects.contains(&oid) {
-            continue;
-        }
-        let native_metadata = native_source_packs
-            .as_ref()
-            .and_then(|native| native.object_metadata(&oid));
-        if let (Some(expected), Some((actual, _))) = (work.expected_kind, native_metadata) {
-            if expected != actual {
-                return Err(Error::Protocol(format!(
-                    "source object {oid} has kind {actual}, expected {expected}"
-                )));
-            }
-        }
-        let skip_retained_blob = native_metadata.is_some_and(|(kind, _)| kind == ObjectKind::Blob)
-            && work
-                .expected_kind
-                .is_none_or(|kind| kind == ObjectKind::Blob);
-        let stored = if skip_retained_blob {
-            None
-        } else {
-            let object = if let Some(native) = native_source_packs.as_ref() {
-                native
-                    .read_verified_object(&oid)?
-                    .map_or_else(|| read_source_object_verified(source, &oid), Ok)?
-            } else {
-                read_source_object_verified(source, &oid)?
+    while !stack.is_empty() {
+        let worker_limit = execution.decode_workers.min(stack.len().max(1));
+        let byte_limit = execution.decode_in_flight_bytes;
+        let mut scheduled_bytes = 0usize;
+        let mut jobs = Vec::with_capacity(worker_limit);
+        while jobs.len() < worker_limit {
+            let Some(work) = stack.pop() else {
+                break;
             };
-            if let Some(expected) = work.expected_kind {
-                if object.kind != expected {
+            let oid = work.oid;
+            if seen.contains(&oid) || trusted_objects.contains(&oid) {
+                continue;
+            }
+            let native_metadata = native_source_packs
+                .as_ref()
+                .and_then(|native| native.object_metadata(&oid));
+            if let (Some(expected), Some(metadata)) = (work.expected_kind, native_metadata) {
+                if expected != metadata.kind {
                     return Err(Error::Protocol(format!(
                         "source object {oid} has kind {}, expected {expected}",
-                        object.kind
+                        metadata.kind
                     )));
                 }
             }
-            Some(StoredObject::new(object.kind, object.data))
-        };
-        let (object_kind, object_size) = match (&stored, native_metadata) {
-            (Some(stored), Some((native_kind, native_size))) => {
-                let decoded_size = u64::try_from(stored.data.len())
-                    .map_err(|_| Error::Protocol("source object size exceeds u64".to_owned()))?;
-                if stored.kind != native_kind || decoded_size != native_size {
-                    return Err(Error::Protocol(format!(
-                        "source pack metadata does not match decoded object {oid}"
-                    )));
-                }
-                (stored.kind, decoded_size)
+            let skip_payload = native_import_enabled
+                && native_metadata.is_some_and(|metadata| metadata.kind == ObjectKind::Blob)
+                && work
+                    .expected_kind
+                    .is_none_or(|kind| kind == ObjectKind::Blob);
+            let working_set = native_metadata
+                .and_then(|metadata| usize::try_from(metadata.import_working_set).ok());
+            let exclusive = !skip_payload && working_set.is_none_or(|size| size > byte_limit);
+            let estimated_bytes = if skip_payload {
+                0
+            } else {
+                working_set.unwrap_or(byte_limit).min(byte_limit)
+            };
+            if !jobs.is_empty()
+                && (exclusive || scheduled_bytes.saturating_add(estimated_bytes) > byte_limit)
+            {
+                stack.push(work);
+                break;
             }
-            (Some(stored), None) => (
-                stored.kind,
-                u64::try_from(stored.data.len())
-                    .map_err(|_| Error::Protocol("source object size exceeds u64".to_owned()))?,
-            ),
-            (None, Some(metadata)) => metadata,
-            (None, None) => {
-                return Err(Error::Protocol(format!(
-                    "source object {oid} has neither payload nor retained-pack metadata"
-                )));
-            }
-        };
-        newly_trusted.push((oid, object_kind));
-
-        object_sizes.insert(oid, object_size);
-        if let Some(entries) = pending_size_entries.remove(&oid) {
-            for entry_index in entries {
-                if let Some(entry) = tree_entries.get_mut(entry_index) {
-                    entry.size = Some(object_size);
-                }
+            seen.insert(oid);
+            scheduled_bytes = scheduled_bytes.saturating_add(estimated_bytes);
+            jobs.push(DecodeJob {
+                work,
+                native_metadata,
+                skip_payload,
+            });
+            if exclusive {
+                break;
             }
         }
 
-        match object_kind {
-            ObjectKind::Commit => {
-                let data = stored
-                    .as_ref()
-                    .map(|stored| stored.data.as_slice())
-                    .ok_or_else(|| {
-                        Error::Protocol("commit payload was not decoded during import".to_owned())
-                    })?;
-                let commit = parse_commit(data)?;
-                stack.push(ImportWork::expected(commit.tree, ObjectKind::Tree));
-                stack.extend(
-                    commit
-                        .parents
-                        .iter()
-                        .copied()
-                        .map(|parent| ImportWork::expected(parent, ObjectKind::Commit)),
-                );
-                indexed_commits.insert(
-                    oid,
-                    IndexedCommit {
+        let odb = source.odb.clone();
+        let native = native_source_packs.clone();
+        let decoded = pool
+            .run_jobs(jobs, move |job| {
+                decode_import_job(&odb, native.as_deref(), job)
+            })
+            .await?;
+
+        for decoded in decoded {
+            let work = decoded.work;
+            let oid = work.oid;
+            let stored = decoded.stored;
+            let object_kind = decoded.object_kind;
+            let object_size = decoded.object_size;
+            newly_trusted.push((oid, object_kind));
+
+            object_sizes.insert(oid, object_size);
+            if let Some(entries) = pending_size_entries.remove(&oid) {
+                for entry_index in entries {
+                    if let Some(entry) = tree_entries.get_mut(entry_index) {
+                        entry.size = Some(object_size);
+                    }
+                }
+            }
+
+            match decoded.parsed {
+                ParsedImportObject::Commit {
+                    tree,
+                    parents,
+                    commit_time,
+                } => {
+                    stack.push(ImportWork::expected(tree, ObjectKind::Tree));
+                    stack.extend(
+                        parents
+                            .iter()
+                            .copied()
+                            .map(|parent| ImportWork::expected(parent, ObjectKind::Commit)),
+                    );
+                    indexed_commits.insert(
                         oid,
-                        tree: commit.tree,
-                        parents: commit.parents,
-                        commit_time: commit_time_from_identity(&commit.committer),
-                        generation: 1,
-                    },
-                );
+                        IndexedCommit {
+                            oid,
+                            tree,
+                            parents,
+                            commit_time,
+                            generation: 1,
+                        },
+                    );
+                }
+                ParsedImportObject::Tree(entries) => {
+                    let indexed = merge_parsed_tree(
+                        oid,
+                        entries,
+                        &mut stack,
+                        &mut tree_entries,
+                        &object_sizes,
+                        &mut pending_size_entries,
+                    );
+                    indexed_tree_batches.push((oid, indexed));
+                }
+                ParsedImportObject::Tag {
+                    target,
+                    target_kind,
+                } => {
+                    stack.push(ImportWork::expected(target, target_kind));
+                }
+                ParsedImportObject::Blob => {}
             }
-            ObjectKind::Tree => {
-                let data = stored
-                    .as_ref()
-                    .map(|stored| stored.data.as_slice())
-                    .ok_or_else(|| {
-                        Error::Protocol("tree payload was not decoded during import".to_owned())
-                    })?;
-                let indexed = index_tree(
-                    oid,
-                    data,
-                    &mut stack,
-                    &mut tree_entries,
-                    &object_sizes,
-                    &mut pending_size_entries,
-                )?;
-                indexed_tree_batches.push((oid, indexed));
-            }
-            ObjectKind::Tag => {
-                let data = stored
-                    .as_ref()
-                    .map(|stored| stored.data.as_slice())
-                    .ok_or_else(|| {
-                        Error::Protocol("tag payload was not decoded during import".to_owned())
-                    })?;
-                let tag = parse_tag(data)?;
-                let target_kind = ObjectKind::from_tag_type_field(tag.object_type.as_bytes())
-                    .ok_or_else(|| {
-                        Error::Protocol("tag target has an invalid object kind".to_owned())
-                    })?;
-                stack.push(ImportWork::expected(tag.object, target_kind));
-            }
-            ObjectKind::Blob => {}
-        }
 
-        if !native_import_enabled {
-            let stored = stored.ok_or_else(|| {
-                Error::Protocol("portable import unexpectedly omitted object payload".to_owned())
-            })?;
-            let payload_bytes = stored.data.len();
-            let exceeds_byte_limit =
-                pending_object_bytes.saturating_add(payload_bytes) > IMPORT_OBJECT_BATCH_MAX_BYTES;
-            if !pending_objects.is_empty()
-                && (pending_objects.len() >= IMPORT_OBJECT_BATCH_MAX_COUNT || exceeds_byte_limit)
-            {
-                flush_imported_objects(
-                    destination,
-                    &mut pending_objects,
-                    &mut pending_object_bytes,
-                    &options,
-                    &mut report,
-                    &mut progress,
-                )
-                .await?;
-            }
-            pending_object_bytes = pending_object_bytes.saturating_add(payload_bytes);
-            pending_objects.push((oid, stored));
-            if pending_objects.len() >= IMPORT_OBJECT_BATCH_MAX_COUNT
-                || pending_object_bytes >= IMPORT_OBJECT_BATCH_MAX_BYTES
-            {
-                flush_imported_objects(
-                    destination,
-                    &mut pending_objects,
-                    &mut pending_object_bytes,
-                    &options,
-                    &mut report,
-                    &mut progress,
-                )
-                .await?;
+            if !native_import_enabled {
+                let stored = stored.ok_or_else(|| {
+                    Error::Protocol(
+                        "portable import unexpectedly omitted object payload".to_owned(),
+                    )
+                })?;
+                let payload_bytes = stored.data.len();
+                let exceeds_byte_limit = pending_object_bytes.saturating_add(payload_bytes)
+                    > IMPORT_OBJECT_BATCH_MAX_BYTES;
+                if !pending_objects.is_empty()
+                    && (pending_objects.len() >= IMPORT_OBJECT_BATCH_MAX_COUNT
+                        || exceeds_byte_limit)
+                {
+                    flush_imported_objects(
+                        destination,
+                        &mut pending_objects,
+                        &mut pending_object_bytes,
+                        &options,
+                        &mut report,
+                        &mut progress,
+                    )
+                    .await?;
+                }
+                pending_object_bytes = pending_object_bytes.saturating_add(payload_bytes);
+                pending_objects.push((oid, stored));
+                if pending_objects.len() >= IMPORT_OBJECT_BATCH_MAX_COUNT
+                    || pending_object_bytes >= IMPORT_OBJECT_BATCH_MAX_BYTES
+                {
+                    flush_imported_objects(
+                        destination,
+                        &mut pending_objects,
+                        &mut pending_object_bytes,
+                        &options,
+                        &mut report,
+                        &mut progress,
+                    )
+                    .await?;
+                }
             }
         }
     }
-    if let Some(native_source_packs) = native_source_packs {
+    if native_import_enabled {
+        let native_source_packs = native_source_packs.ok_or_else(|| {
+            Error::Protocol("native import was enabled without source pack metadata".to_owned())
+        })?;
         let mut completed_reachable = trusted_objects.clone();
         completed_reachable.extend(seen.iter().copied());
         install_native_source_packs(
@@ -487,6 +855,8 @@ where
                 reachable: &completed_reachable,
                 newly_trusted: &newly_trusted,
             },
+            execution,
+            &pool,
             &mut report,
             &mut progress,
         )
@@ -502,6 +872,7 @@ where
         )
         .await?;
     }
+    pool.shutdown()?;
     resolve_pending_tree_sizes(destination, &mut tree_entries, pending_size_entries).await?;
 
     if !tree_entries.is_empty() {
@@ -586,25 +957,47 @@ async fn discover_native_source_packs<S>(
     destination: &crate::repository::ServerRepository<S>,
     source: &Repository,
     options: &ImportOptions,
+    pool: &BlockingPool,
 ) -> Result<Option<NativeSourcePacks>>
 where
     S: ServerStorage,
 {
     if options.native_pack_import == NativePackImportMode::Disabled
-        || !destination.storage().supports_native_pack_import()
         || destination.hash_algo() != source.odb.hash_algo()
     {
         return Ok(None);
     }
 
-    let installed = destination
-        .storage()
-        .list_packs(destination.tenant(), destination.repository())
-        .await?
-        .into_iter()
-        .map(|metadata| metadata.pack_checksum)
-        .collect::<HashSet<_>>();
-    let pack_dir = source.odb.objects_dir().join("pack");
+    let retention_enabled = destination.storage().supports_native_pack_import();
+
+    let installed = if retention_enabled {
+        destination
+            .storage()
+            .list_packs(destination.tenant(), destination.repository())
+            .await?
+            .into_iter()
+            .map(|metadata| metadata.pack_checksum)
+            .collect::<HashSet<_>>()
+    } else {
+        HashSet::new()
+    };
+    let odb = source.odb.clone();
+    let hash_algo = destination.hash_algo();
+    let mode = options.native_pack_import;
+    pool.submit(move || {
+        discover_local_source_packs(&odb, hash_algo, mode, retention_enabled, installed)
+    })?
+    .await
+}
+
+fn discover_local_source_packs(
+    odb: &Odb,
+    hash_algo: HashAlgo,
+    mode: NativePackImportMode,
+    retention_enabled: bool,
+    installed: HashSet<Vec<u8>>,
+) -> Result<Option<NativeSourcePacks>> {
+    let pack_dir = odb.objects_dir().join("pack");
     let local_pack_count = fs::read_dir(&pack_dir)
         .ok()
         .into_iter()
@@ -612,21 +1005,23 @@ where
         .filter_map(std::result::Result::ok)
         .filter(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("pack"))
         .count();
-    let indexes = match read_local_pack_index_snapshots(source.odb.objects_dir()) {
+    let indexes = match read_local_pack_index_snapshots(odb.objects_dir()) {
         Ok(indexes) => indexes,
         Err(_) => {
             return Ok(Some(NativeSourcePacks {
                 full_mirror_compatible: false,
+                retention_enabled,
                 ..NativeSourcePacks::default()
             }));
         }
     };
     let mut discovered = NativeSourcePacks {
         full_mirror_compatible: indexes.len() == local_pack_count,
+        retention_enabled,
         ..NativeSourcePacks::default()
     };
     for (index, index_data) in indexes {
-        if index.hash_bytes != destination.hash_algo().len()
+        if index.hash_bytes != hash_algo.len()
             || index.pack_path.with_extension("promisor").is_file()
         {
             discovered.full_mirror_compatible = false;
@@ -637,7 +1032,7 @@ where
             continue;
         };
         let Ok((metadata, object_metadata)) =
-            source_pack_metadata(&index, &index_data, &data, destination.hash_algo())
+            source_pack_metadata(&index, &index_data, &data, hash_algo)
         else {
             discovered.full_mirror_compatible = false;
             continue;
@@ -646,22 +1041,22 @@ where
             .and_then(|metadata| metadata.modified())
             .unwrap_or(SystemTime::UNIX_EPOCH);
         let already_stored = installed.contains(&metadata.pack_checksum);
-        discovered.packs.push(NativeSourcePack {
+        discovered.packs.push(Arc::new(NativeSourcePack {
             index,
             data,
             object_metadata,
             metadata,
             modified,
             already_stored,
-        });
+        }));
     }
     discovered.packs.sort_by(|left, right| {
         left.modified
             .cmp(&right.modified)
             .then_with(|| left.index.pack_path.cmp(&right.index.pack_path))
     });
-    if options.native_pack_import == NativePackImportMode::FullMirror {
-        match list_local_loose_object_ids(source) {
+    if retention_enabled && mode == NativePackImportMode::FullMirror {
+        match list_local_loose_object_ids(odb) {
             Ok(oids) => discovered.loose_oids = oids,
             Err(_) => discovered.full_mirror_compatible = false,
         }
@@ -749,10 +1144,24 @@ fn source_pack_metadata(
     validate_pack_entry_crcs(index, data, trailer_start)?;
 
     let mut object_metadata = HashMap::with_capacity(index.entries.len());
-    for (raw_oid, metadata) in pack::read_all_object_metadata_from_pack_bytes(data, index)? {
+    for (raw_oid, metadata) in pack::read_all_object_decode_estimates_from_pack_bytes(data, index)?
+    {
         let oid = ObjectId::from_bytes(&raw_oid)?;
         if object_metadata
-            .insert(oid, (metadata.kind, metadata.size))
+            .insert(
+                oid,
+                NativeObjectMetadataEntry {
+                    kind: metadata.kind,
+                    size: metadata.size,
+                    decode_working_set: metadata.working_set_size,
+                    import_working_set: import_object_working_set(
+                        metadata.kind,
+                        metadata.size,
+                        metadata.working_set_size,
+                        hash_algo.len(),
+                    )?,
+                },
+            )
             .is_some()
         {
             return Err(Error::Protocol(
@@ -771,6 +1180,94 @@ fn source_pack_metadata(
         },
         object_metadata,
     ))
+}
+
+fn import_object_working_set(
+    kind: ObjectKind,
+    payload_size: u64,
+    decode_working_set: u64,
+    hash_bytes: usize,
+) -> Result<u64> {
+    let overflow = || Error::Protocol("import preparation working-set overflow".to_owned());
+    let prepared_peak = match kind {
+        ObjectKind::Blob => payload_size,
+        ObjectKind::Tree => {
+            // The generic parser tries SHA-1 first and accepts one octal mode byte, a space, an
+            // empty name terminator, and an OID as the shortest structurally parseable entry.
+            // Using that smaller-than-normal Git entry width deliberately overestimates both the
+            // successful parse and a discarded SHA-1 attempt for a SHA-256 tree.
+            let minimum_entry_width = u64::try_from(HashAlgo::Sha1.len())
+                .map_err(|_| overflow())?
+                .checked_add(3)
+                .ok_or_else(overflow)?;
+            let entry_count = payload_size / minimum_entry_width;
+            let parsed_vector_bytes = conservative_vec_allocation_bytes(
+                entry_count,
+                std::mem::size_of::<grit_lib::objects::TreeEntry>(),
+            )
+            .ok_or_else(overflow)?;
+            let prepared_vector_bytes = conservative_vec_allocation_bytes(
+                entry_count,
+                std::mem::size_of::<ParsedTreeEntry>(),
+            )
+            .ok_or_else(overflow)?;
+            let vector_bytes = parsed_vector_bytes
+                .checked_add(prepared_vector_bytes)
+                .ok_or_else(overflow)?;
+            payload_size
+                .checked_mul(2)
+                .and_then(|bytes| bytes.checked_add(vector_bytes))
+                .ok_or_else(overflow)?
+        }
+        ObjectKind::Commit => {
+            // The raw payload remains stored while parsing may retain author/committer strings and
+            // raw forms, encoding, expanded lossy/encoded strings, decoded and raw messages, plus
+            // the parent vector. Charging twenty-four payload copies covers those bounded
+            // slices/duplicates and their allocation slack conservatively.
+            let minimum_parent_header = u64::try_from(hash_bytes)
+                .map_err(|_| overflow())?
+                .checked_mul(2)
+                .and_then(|bytes| bytes.checked_add(8))
+                .ok_or_else(overflow)?;
+            let parent_count = payload_size / minimum_parent_header;
+            let parent_bytes = parent_count
+                .checked_mul(
+                    u64::try_from(std::mem::size_of::<ObjectId>()).map_err(|_| overflow())?,
+                )
+                .and_then(|bytes| bytes.checked_mul(2))
+                .ok_or_else(overflow)?;
+            payload_size
+                .checked_mul(24)
+                .and_then(|bytes| bytes.checked_add(parent_bytes))
+                .ok_or_else(overflow)?
+        }
+        ObjectKind::Tag => {
+            // The raw payload coexists with object type, tag name, tagger, and a geometrically
+            // grown message buffer.
+            payload_size.checked_mul(6).ok_or_else(overflow)?
+        }
+    };
+    Ok(decode_working_set.max(prepared_peak))
+}
+
+fn conservative_vec_allocation_bytes(len: u64, element_size: usize) -> Option<u64> {
+    if len == 0 || element_size == 0 {
+        return Some(0);
+    }
+    // Rust's RawVec starts non-ZST allocations at 8 elements for one-byte items, 4 for items up
+    // to 1 KiB, and 1 for larger items. Power-of-two rounding conservatively covers geometric
+    // capacity growth for both the parser and prepared-entry vectors.
+    let minimum_nonzero_capacity = if element_size == 1 {
+        8u64
+    } else if element_size <= 1024 {
+        4u64
+    } else {
+        1u64
+    };
+    let capacity = len
+        .max(minimum_nonzero_capacity)
+        .checked_next_power_of_two()?;
+    capacity.checked_mul(u64::try_from(element_size).ok()?)
 }
 
 fn validate_pack_entry_crcs(index: &PackIndex, data: &[u8], trailer_start: usize) -> Result<()> {
@@ -919,9 +1416,9 @@ fn digest(data: &[u8], hash_algo: HashAlgo) -> Vec<u8> {
     }
 }
 
-fn read_source_object_verified(source: &Repository, oid: &ObjectId) -> Result<Object> {
-    let object = source.odb.read(oid)?;
-    let actual = pack::hash_object_bytes(object.kind, &object.data, source.odb.hash_algo().len())?;
+fn read_source_object_verified_from_odb(odb: &Odb, oid: &ObjectId) -> Result<Object> {
+    let object = odb.read(oid)?;
+    let actual = pack::hash_object_bytes(object.kind, &object.data, odb.hash_algo().len())?;
     if actual.as_slice() != oid.as_bytes() {
         return Err(Error::Protocol(format!(
             "source object {oid} failed identity verification"
@@ -930,10 +1427,162 @@ fn read_source_object_verified(source: &Repository, oid: &ObjectId) -> Result<Ob
     Ok(object)
 }
 
-fn list_local_loose_object_ids(source: &Repository) -> Result<Vec<ObjectId>> {
-    let expected_hex_len = source.odb.hash_algo().len().saturating_mul(2);
+fn decode_import_job(
+    odb: &Odb,
+    native: Option<&NativeSourcePacks>,
+    job: DecodeJob,
+) -> Result<DecodedImportObject> {
+    let stored = if job.skip_payload {
+        None
+    } else {
+        let object = if let Some(native) = native {
+            native.read_verified_object(&job.work.oid)?.map_or_else(
+                || read_source_object_verified_from_odb(odb, &job.work.oid),
+                Ok,
+            )?
+        } else {
+            read_source_object_verified_from_odb(odb, &job.work.oid)?
+        };
+        if let Some(expected) = job.work.expected_kind {
+            if object.kind != expected {
+                return Err(Error::Protocol(format!(
+                    "source object {} has kind {}, expected {expected}",
+                    job.work.oid, object.kind
+                )));
+            }
+        }
+        Some(StoredObject::new(object.kind, object.data))
+    };
+    let (object_kind, object_size) = match (&stored, job.native_metadata) {
+        (Some(stored), Some(metadata)) => {
+            let decoded_size = u64::try_from(stored.data.len())
+                .map_err(|_| Error::Protocol("source object size exceeds u64".to_owned()))?;
+            if stored.kind != metadata.kind || decoded_size != metadata.size {
+                return Err(Error::Protocol(format!(
+                    "source pack metadata does not match decoded object {}",
+                    job.work.oid
+                )));
+            }
+            (stored.kind, decoded_size)
+        }
+        (Some(stored), None) => (
+            stored.kind,
+            u64::try_from(stored.data.len())
+                .map_err(|_| Error::Protocol("source object size exceeds u64".to_owned()))?,
+        ),
+        (None, Some(metadata)) => (metadata.kind, metadata.size),
+        (None, None) => {
+            return Err(Error::Protocol(format!(
+                "source object {} has neither payload nor retained-pack metadata",
+                job.work.oid
+            )));
+        }
+    };
+    let parsed = match object_kind {
+        ObjectKind::Commit => {
+            let data = stored
+                .as_ref()
+                .map(|stored| stored.data.as_slice())
+                .ok_or_else(|| {
+                    Error::Protocol("commit payload was not decoded during import".to_owned())
+                })?;
+            let commit = parse_commit(data)?;
+            ParsedImportObject::Commit {
+                tree: commit.tree,
+                parents: commit.parents,
+                commit_time: commit_time_from_identity(&commit.committer),
+            }
+        }
+        ObjectKind::Tree => {
+            let data = stored
+                .as_ref()
+                .map(|stored| stored.data.as_slice())
+                .ok_or_else(|| {
+                    Error::Protocol("tree payload was not decoded during import".to_owned())
+                })?;
+            let entries = parse_tree(data)?
+                .into_iter()
+                .map(|entry| {
+                    let name = String::from_utf8(entry.name).map_err(|_| {
+                        Error::PathNotFound("tree entry name is not UTF-8".to_owned())
+                    })?;
+                    Ok(ParsedTreeEntry {
+                        name,
+                        mode: entry.mode,
+                        oid: entry.oid,
+                        kind: kind_for_mode(entry.mode),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            ParsedImportObject::Tree(entries)
+        }
+        ObjectKind::Tag => {
+            let data = stored
+                .as_ref()
+                .map(|stored| stored.data.as_slice())
+                .ok_or_else(|| {
+                    Error::Protocol("tag payload was not decoded during import".to_owned())
+                })?;
+            let tag = parse_tag(data)?;
+            let target_kind = ObjectKind::from_tag_type_field(tag.object_type.as_bytes())
+                .ok_or_else(|| {
+                    Error::Protocol("tag target has an invalid object kind".to_owned())
+                })?;
+            ParsedImportObject::Tag {
+                target: tag.object,
+                target_kind,
+            }
+        }
+        ObjectKind::Blob => ParsedImportObject::Blob,
+    };
+    Ok(DecodedImportObject {
+        work: job.work,
+        stored,
+        object_kind,
+        object_size,
+        parsed,
+    })
+}
+
+async fn read_source_object_wave(
+    odb: Odb,
+    requests: &mut VecDeque<(ObjectId, Option<u64>)>,
+    execution: ValidatedImportExecutionOptions,
+    pool: &BlockingPool,
+) -> Result<Vec<(ObjectId, Result<Object>)>> {
+    let worker_limit = execution.decode_workers.min(requests.len().max(1));
+    let byte_limit = execution.decode_in_flight_bytes;
+    let mut scheduled_bytes = 0usize;
+    let mut jobs = Vec::with_capacity(worker_limit);
+    while jobs.len() < worker_limit {
+        let Some((oid, size)) = requests.pop_front() else {
+            break;
+        };
+        let working_set = size.and_then(|size| usize::try_from(size).ok());
+        let exclusive = working_set.is_none_or(|size| size > byte_limit);
+        let estimated_bytes = working_set.unwrap_or(byte_limit).min(byte_limit);
+        if !jobs.is_empty()
+            && (exclusive || scheduled_bytes.saturating_add(estimated_bytes) > byte_limit)
+        {
+            requests.push_front((oid, size));
+            break;
+        }
+        scheduled_bytes = scheduled_bytes.saturating_add(estimated_bytes);
+        jobs.push(oid);
+        if exclusive {
+            break;
+        }
+    }
+    pool.run_jobs(jobs, move |oid| {
+        Ok((oid, read_source_object_verified_from_odb(&odb, &oid)))
+    })
+    .await
+}
+
+fn list_local_loose_object_ids(odb: &Odb) -> Result<Vec<ObjectId>> {
+    let expected_hex_len = odb.hash_algo().len().saturating_mul(2);
     let mut oids = Vec::new();
-    let entries = match fs::read_dir(source.odb.objects_dir()) {
+    let entries = match fs::read_dir(odb.objects_dir()) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(oids),
         Err(error) => return Err(error.into()),
@@ -968,8 +1617,10 @@ fn list_local_loose_object_ids(source: &Repository) -> Result<Vec<ObjectId>> {
 
 async fn install_native_source_packs<S, P>(
     destination: &crate::repository::ServerRepository<S>,
-    native: NativeSourcePacks,
+    native: Arc<NativeSourcePacks>,
     inputs: NativeInstallInputs<'_>,
+    execution: ValidatedImportExecutionOptions,
+    pool: &BlockingPool,
     report: &mut ImportReport,
     progress: &mut P,
 ) -> Result<()>
@@ -980,7 +1631,8 @@ where
     let mut covered = HashSet::new();
     let mut packs_to_install = Vec::new();
     let mut all_candidates_installed = true;
-    for source_pack in native.packs {
+    let mut candidates = VecDeque::new();
+    for source_pack in &native.packs {
         let pack_oids = source_pack
             .index
             .entries
@@ -996,20 +1648,63 @@ where
             }
             continue;
         }
-        if validate_native_pack_readability(&source_pack).is_err() {
-            all_candidates_installed = false;
-            continue;
-        }
-        if source_pack.already_stored {
-            covered.extend(pack_oids);
-            continue;
-        }
-        match prepare_native_stored_pack(source_pack) {
-            Ok(pack) => {
-                covered.extend(pack.index.iter().map(|entry| entry.oid));
-                packs_to_install.push(pack);
+        candidates.push_back((Arc::clone(source_pack), pack_oids));
+    }
+
+    let worker_limit = execution.decode_workers.min(candidates.len().max(1));
+    let byte_limit = execution.decode_in_flight_bytes;
+    while !candidates.is_empty() {
+        let mut scheduled_bytes = 0usize;
+        let mut jobs = Vec::with_capacity(worker_limit);
+        while jobs.len() < worker_limit {
+            let Some((source_pack, pack_oids)) = candidates.pop_front() else {
+                break;
+            };
+            let working_set =
+                source_pack
+                    .object_metadata
+                    .values()
+                    .try_fold(0usize, |maximum, metadata| {
+                        usize::try_from(metadata.decode_working_set)
+                            .ok()
+                            .map(|size| maximum.max(size))
+                    });
+            let exclusive = working_set.is_none_or(|size| size > byte_limit);
+            let estimated_bytes = working_set.unwrap_or(byte_limit).min(byte_limit);
+            if !jobs.is_empty()
+                && (exclusive || scheduled_bytes.saturating_add(estimated_bytes) > byte_limit)
+            {
+                candidates.push_front((source_pack, pack_oids));
+                break;
             }
-            Err(_) => all_candidates_installed = false,
+            scheduled_bytes = scheduled_bytes.saturating_add(estimated_bytes);
+            jobs.push((source_pack, pack_oids));
+            if exclusive {
+                break;
+            }
+        }
+        let validated = pool
+            .run_jobs(jobs, |(source_pack, pack_oids)| {
+                let valid = validate_native_pack_readability(&source_pack).is_ok();
+                Ok((source_pack, pack_oids, valid))
+            })
+            .await?;
+        for (source_pack, pack_oids, valid) in validated {
+            if !valid {
+                all_candidates_installed = false;
+                continue;
+            }
+            if source_pack.already_stored {
+                covered.extend(pack_oids);
+                continue;
+            }
+            match prepare_native_stored_pack(&source_pack) {
+                Ok(pack) => {
+                    covered.extend(pack.index.iter().map(|entry| entry.oid));
+                    packs_to_install.push(pack);
+                }
+                Err(_) => all_candidates_installed = false,
+            }
         }
     }
 
@@ -1040,30 +1735,60 @@ where
 
     let mut pending = Vec::with_capacity(IMPORT_OBJECT_BATCH_MAX_COUNT);
     let mut pending_bytes = 0usize;
-    for (oid, _) in inputs.newly_trusted {
-        if covered.contains(oid) {
-            continue;
+    let mut fallback_requests = inputs
+        .newly_trusted
+        .iter()
+        .filter(|(oid, _)| !covered.contains(oid))
+        .map(|(oid, _)| {
+            let working_set = native
+                .object_metadata(oid)
+                .map(|metadata| metadata.decode_working_set);
+            (*oid, working_set)
+        })
+        .collect::<VecDeque<_>>();
+    while !fallback_requests.is_empty() {
+        let fallback_objects = read_source_object_wave(
+            inputs.source.odb.clone(),
+            &mut fallback_requests,
+            execution,
+            pool,
+        )
+        .await?;
+        for (oid, object) in fallback_objects {
+            let object = object?;
+            let stored = StoredObject::new(object.kind, object.data);
+            let payload_bytes = stored.data.len();
+            let exceeds_byte_limit =
+                pending_bytes.saturating_add(payload_bytes) > IMPORT_OBJECT_BATCH_MAX_BYTES;
+            if !pending.is_empty()
+                && (pending.len() >= IMPORT_OBJECT_BATCH_MAX_COUNT || exceeds_byte_limit)
+            {
+                flush_imported_objects(
+                    destination,
+                    &mut pending,
+                    &mut pending_bytes,
+                    inputs.options,
+                    report,
+                    progress,
+                )
+                .await?;
+            }
+            pending_bytes = pending_bytes.saturating_add(payload_bytes);
+            pending.push((oid, stored));
+            if pending.len() >= IMPORT_OBJECT_BATCH_MAX_COUNT
+                || pending_bytes >= IMPORT_OBJECT_BATCH_MAX_BYTES
+            {
+                flush_imported_objects(
+                    destination,
+                    &mut pending,
+                    &mut pending_bytes,
+                    inputs.options,
+                    report,
+                    progress,
+                )
+                .await?;
+            }
         }
-        let object = read_source_object_verified(inputs.source, oid)?;
-        let stored = StoredObject::new(object.kind, object.data);
-        let payload_bytes = stored.data.len();
-        let exceeds_byte_limit =
-            pending_bytes.saturating_add(payload_bytes) > IMPORT_OBJECT_BATCH_MAX_BYTES;
-        if !pending.is_empty()
-            && (pending.len() >= IMPORT_OBJECT_BATCH_MAX_COUNT || exceeds_byte_limit)
-        {
-            flush_imported_objects(
-                destination,
-                &mut pending,
-                &mut pending_bytes,
-                inputs.options,
-                report,
-                progress,
-            )
-            .await?;
-        }
-        pending_bytes = pending_bytes.saturating_add(payload_bytes);
-        pending.push((*oid, stored));
     }
     flush_imported_objects(
         destination,
@@ -1084,28 +1809,47 @@ where
             .collect::<HashSet<_>>();
         let mut mirror_batch = Vec::with_capacity(IMPORT_OBJECT_BATCH_MAX_COUNT);
         let mut mirror_bytes = 0usize;
-        for oid in native.loose_oids {
-            if covered.contains(&oid) || newly_reachable.contains(&oid) {
-                continue;
-            }
-            let object = match read_source_object_verified(inputs.source, &oid) {
-                Ok(object) => object,
-                Err(_) => {
-                    mirror_loose_complete = false;
-                    continue;
+        let mut mirror_requests = native
+            .loose_oids
+            .iter()
+            .filter(|oid| !covered.contains(oid) && !newly_reachable.contains(oid))
+            .map(|oid| (*oid, None))
+            .collect::<VecDeque<_>>();
+        while !mirror_requests.is_empty() {
+            let mirror_objects = read_source_object_wave(
+                inputs.source.odb.clone(),
+                &mut mirror_requests,
+                execution,
+                pool,
+            )
+            .await?;
+            for (oid, object) in mirror_objects {
+                let object = match object {
+                    Ok(object) => object,
+                    Err(_) => {
+                        mirror_loose_complete = false;
+                        continue;
+                    }
+                };
+                let stored = StoredObject::new(object.kind, object.data);
+                let payload_bytes = stored.data.len();
+                if !mirror_batch.is_empty()
+                    && (mirror_batch.len() >= IMPORT_OBJECT_BATCH_MAX_COUNT
+                        || mirror_bytes.saturating_add(payload_bytes)
+                            > IMPORT_OBJECT_BATCH_MAX_BYTES)
+                {
+                    write_mirror_loose_batch(destination, &mut mirror_batch, report).await?;
+                    mirror_bytes = 0;
                 }
-            };
-            let stored = StoredObject::new(object.kind, object.data);
-            let payload_bytes = stored.data.len();
-            if !mirror_batch.is_empty()
-                && (mirror_batch.len() >= IMPORT_OBJECT_BATCH_MAX_COUNT
-                    || mirror_bytes.saturating_add(payload_bytes) > IMPORT_OBJECT_BATCH_MAX_BYTES)
-            {
-                write_mirror_loose_batch(destination, &mut mirror_batch, report).await?;
-                mirror_bytes = 0;
+                mirror_bytes = mirror_bytes.saturating_add(payload_bytes);
+                mirror_batch.push((oid, stored));
+                if mirror_batch.len() >= IMPORT_OBJECT_BATCH_MAX_COUNT
+                    || mirror_bytes >= IMPORT_OBJECT_BATCH_MAX_BYTES
+                {
+                    write_mirror_loose_batch(destination, &mut mirror_batch, report).await?;
+                    mirror_bytes = 0;
+                }
             }
-            mirror_bytes = mirror_bytes.saturating_add(payload_bytes);
-            mirror_batch.push((oid, stored));
         }
         write_mirror_loose_batch(destination, &mut mirror_batch, report).await?;
     }
@@ -1126,7 +1870,7 @@ fn validate_native_pack_readability(source: &NativeSourcePack) -> Result<()> {
         let object = pack::read_object_from_pack_bytes(&source.data, &source.index, &entry.oid)?;
         let decoded_size = u64::try_from(object.data.len())
             .map_err(|_| Error::Protocol("native pack object size exceeds u64".to_owned()))?;
-        if (object.kind, decoded_size) != expected {
+        if object.kind != expected.kind || decoded_size != expected.size {
             return Err(Error::Protocol(format!(
                 "source pack metadata does not match verified object {oid}"
             )));
@@ -1135,7 +1879,7 @@ fn validate_native_pack_readability(source: &NativeSourcePack) -> Result<()> {
     Ok(())
 }
 
-fn prepare_native_stored_pack(source: NativeSourcePack) -> Result<ImportedPack> {
+fn prepare_native_stored_pack(source: &NativeSourcePack) -> Result<ImportedPack> {
     let trailer_start = source
         .data
         .len()
@@ -1164,7 +1908,7 @@ fn prepare_native_stored_pack(source: NativeSourcePack) -> Result<ImportedPack> 
     let mut entries = Vec::with_capacity(source.index.entries.len());
     for entry in &source.index.entries {
         let oid = ObjectId::from_bytes(&entry.oid)?;
-        let (kind, size) = source.object_metadata.get(&oid).copied().ok_or_else(|| {
+        let metadata = source.object_metadata.get(&oid).copied().ok_or_else(|| {
             Error::Protocol("native pack object has no validated metadata".to_owned())
         })?;
         let stored_span = stored_spans.get(&entry.offset).copied().ok_or_else(|| {
@@ -1172,16 +1916,16 @@ fn prepare_native_stored_pack(source: NativeSourcePack) -> Result<ImportedPack> 
         })?;
         entries.push(PackObjectIndex {
             oid,
-            kind,
+            kind: metadata.kind,
             offset: entry.offset,
-            size,
+            size: metadata.size,
             compressed_size: stored_span,
         });
     }
     entries.sort_by_key(|entry| entry.offset);
     Ok(ImportedPack {
-        metadata: source.metadata,
-        data: source.data,
+        metadata: source.metadata.clone(),
+        data: Arc::clone(&source.data),
         index: entries,
     })
 }
@@ -1260,9 +2004,21 @@ fn compute_commit_generations(
     }
 }
 
-fn read_config(source: &Repository) -> Result<Vec<(String, String)>> {
-    let config = ConfigSet::load_repo_local_only(&source.git_dir)?;
-    Ok(config
+fn discover_source_inputs(git_dir: &std::path::Path) -> Result<SourceImportInputs> {
+    let mut roots = Vec::new();
+    let mut desired_refs = Vec::new();
+    if let Ok(Some(target)) = refs::read_symbolic_ref(git_dir, "HEAD") {
+        desired_refs.push(("HEAD".to_owned(), StoredRef::Symbolic(target)));
+    } else if let Ok(oid) = refs::resolve_ref(git_dir, "HEAD") {
+        desired_refs.push(("HEAD".to_owned(), StoredRef::Direct(oid)));
+        roots.push(ImportWork::object(oid));
+    }
+    for (name, oid) in refs::list_refs(git_dir, "refs/")? {
+        desired_refs.push((name, StoredRef::Direct(oid)));
+        roots.push(ImportWork::object(oid));
+    }
+    let config = ConfigSet::load_repo_local_only(git_dir)?;
+    let config_entries = config
         .entries()
         .iter()
         .filter_map(|entry| {
@@ -1271,7 +2027,12 @@ fn read_config(source: &Repository) -> Result<Vec<(String, String)>> {
                 .as_ref()
                 .map(|value| (entry.key.clone(), value.clone()))
         })
-        .collect())
+        .collect();
+    Ok(SourceImportInputs {
+        roots,
+        desired_refs,
+        config_entries,
+    })
 }
 
 async fn resolve_pending_tree_sizes<S>(
@@ -1355,20 +2116,17 @@ fn maybe_checkpoint(
     progress(ImportProgressEvent::Checkpoint(checkpoint))
 }
 
-fn index_tree(
+fn merge_parsed_tree(
     tree_oid: ObjectId,
-    data: &[u8],
+    entries: Vec<ParsedTreeEntry>,
     stack: &mut Vec<ImportWork>,
     indexed: &mut Vec<IndexedTreeEntry>,
     object_sizes: &HashMap<ObjectId, u64>,
     pending_size_entries: &mut HashMap<ObjectId, Vec<usize>>,
-) -> Result<usize> {
+) -> usize {
     let initial_len = indexed.len();
-    for entry in parse_tree(data)? {
-        let name = String::from_utf8(entry.name)
-            .map_err(|_| Error::PathNotFound("tree entry name is not UTF-8".to_owned()))?;
-        let kind = kind_for_mode(entry.mode);
-        let size = if kind == ObjectKind::Blob {
+    for entry in entries {
+        let size = if entry.kind == ObjectKind::Blob {
             object_sizes.get(&entry.oid).copied()
         } else {
             None
@@ -1376,13 +2134,13 @@ fn index_tree(
         let entry_index = indexed.len();
         indexed.push(IndexedTreeEntry {
             tree_oid,
-            path: name,
+            path: entry.name,
             mode: entry.mode,
             oid: entry.oid,
-            kind,
+            kind: entry.kind,
             size,
         });
-        if kind == ObjectKind::Blob && size.is_none() {
+        if entry.kind == ObjectKind::Blob && size.is_none() {
             pending_size_entries
                 .entry(entry.oid)
                 .or_default()
@@ -1391,10 +2149,10 @@ fn index_tree(
         // Gitlinks name commits from another repository. Their object IDs are not
         // required (or generally available) in the superproject object database.
         if entry.mode != 0o160000 {
-            stack.push(ImportWork::expected(entry.oid, kind));
+            stack.push(ImportWork::expected(entry.oid, entry.kind));
         }
     }
-    Ok(indexed.len() - initial_len)
+    indexed.len() - initial_len
 }
 
 fn kind_for_mode(mode: u32) -> ObjectKind {

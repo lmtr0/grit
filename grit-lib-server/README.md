@@ -37,7 +37,8 @@ The example below uses:
 when every object in that pack belongs to the imported closure or the manifest from a previously
 completed import. Mixed reachable/unreachable, promisor, thin, corrupt, or hash-incompatible packs
 automatically use the ordinary loose-object traversal. Backends that do not advertise native pack
-support are unchanged.
+support use the portable traversal, but still share the bounded source-read pipeline described
+below.
 
 Retention verifies one immutable version-2 index snapshot, binds its embedded pack checksum to the
 validated pack trailer, and checks every index CRC against the corresponding packed byte span.
@@ -46,12 +47,31 @@ canonical-hash verified. Resolved payloads are discarded after validation rather
 loose copies; the delta-base cache remains bounded, with peak transient memory additionally
 depending on the largest active object/delta chain being verified. FullMirror applies this
 validation to unreachable packed objects as well. Pack-native import therefore removes retained
-uncompressed object storage,
-duplicate long-lived allocations, and later whole-pack copies, but it deliberately retains the
-serial decode CPU needed to prove that every published object is readable. Bounded parallel
-validation is a separate optimization for wall time. These checks protect against corrupt or
-mismatched source files; the source checksums are integrity checks, not signatures for accepting an
-adversarial repository as trusted input.
+uncompressed object storage, duplicate long-lived allocations, and later whole-pack copies.
+Ref/config/pack discovery, source reads, commit/tree/tag parsing, tree-entry preparation, and
+whole-pack validation run on blocking workers outside the async executor. The caller only merges
+prepared traversal/index records and computes commit generations. `ImportExecutionOptions`
+defaults to a fixed four-worker pool and 128 MiB of conservative decode-and-preparation working set
+in flight.
+The limit covers completed prepared records retained until wave merge as well as decoding. Delta
+estimates include recursively retained inflated instructions,
+the active base, and the result. One unknown or oversized job may exceed the configured byte limit,
+but it runs alone; the process-wide 96 MiB delta cache and 32 MiB write batch are additional bounds.
+Tree preparation charges worst-case geometric capacity (including minimum nonzero capacity) for
+both simultaneously live parsed/prepared entry vectors, plus copied names from the shortest
+structurally parseable entry; commit/tag preparation charges parent vectors, parsed strings and
+messages, raw forms, and allocation slack. Overflowed estimates become unknown and run alone.
+Worker results are handled in scheduling order within a wave, so completion timing cannot change
+semantic state or progress counts. Changing execution limits may change traversal, progress-event,
+and batch order. Existing `import_repository_with_options` callers retain these defaults; use
+`import_repository_with_execution_options` to pass custom execution limits. The portable pipeline
+is used by every backend; direct pack retention remains specific to backends that advertise it.
+Normal completion joins the pool before publication. Cancellation skips queued jobs and transfers
+active-worker joins to a reaper created before the pool workers, so dropping the import future
+never waits on stuck source I/O. The reaper joins workers after active operations return and then
+self-terminates; cancellation does not synchronously join the reaper itself.
+These checks protect against corrupt or mismatched source files; the source checksums are integrity
+checks, not signatures for accepting an adversarial repository as trusted input.
 
 Set `native_pack_import` to `Disabled` for the portable traversal unconditionally, or to
 `FullMirror` to retain all compatible local packs and copy local loose objects, including

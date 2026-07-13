@@ -46,7 +46,8 @@ pub mod prelude {
     pub use crate::externalized::{ExternalStorageOptions, PgExternalizedStorage};
     pub use crate::ids::{RepositoryId, TenantId};
     pub use crate::import::{
-        import_repository, import_repository_with_options, ImportCheckpoint, ImportOptions,
+        import_repository, import_repository_with_execution_options,
+        import_repository_with_options, ImportCheckpoint, ImportExecutionOptions, ImportOptions,
         ImportProgressEvent, ImportReport, NativePackImportMode,
     };
     pub use crate::layered::LayeredCache;
