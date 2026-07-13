@@ -9,7 +9,9 @@ use sqlx::{PgPool, Row};
 use crate::error::{Error, Result};
 use crate::external::ExternalByteStore;
 use crate::ids::{RepositoryId, TenantId};
-use crate::sqlx_postgres::PgServerStorage;
+use crate::sqlx_postgres::{
+    write_imported_object_rows_in_transaction, ImportedObjectRow, PgServerStorage,
+};
 use crate::storage::{
     BrowseIndex, CommitGraphStore, ConfigStore, IndexedCommit, IndexedTreeEntry, ObjectStore,
     PackMetadata, PackObjectIndex, PackStore, RefStore, ReflogEntry, ReflogStore, StoredObject,
@@ -186,6 +188,40 @@ where
         object: &StoredObject,
     ) -> Result<()> {
         self.write_object(tenant, repository, oid, object).await
+    }
+
+    async fn write_imported_objects(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        objects: Vec<(ObjectId, StoredObject)>,
+    ) -> Result<()> {
+        if !self.options.write_loose_objects_externally {
+            return self
+                .sql
+                .write_imported_objects(tenant, repository, objects)
+                .await;
+        }
+        if objects.is_empty() {
+            return Ok(());
+        }
+
+        let mut rows = Vec::with_capacity(objects.len());
+        for (oid, object) in objects {
+            let key = self.object_key(tenant, repository, &oid);
+            self.bytes.put_if_absent(&key, &object.data).await?;
+            rows.push(ImportedObjectRow::external(
+                oid,
+                object.kind,
+                self.options.backend_name.clone(),
+                key,
+            ));
+        }
+
+        let mut tx = self.pool().begin().await?;
+        write_imported_object_rows_in_transaction(&mut tx, tenant, repository, &rows).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn object_exists(

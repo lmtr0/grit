@@ -13,6 +13,9 @@ use crate::storage::{
     StoredRef,
 };
 
+const IMPORT_OBJECT_BATCH_MAX_COUNT: usize = 2_000;
+const IMPORT_OBJECT_BATCH_MAX_BYTES: usize = 32 * 1024 * 1024;
+
 enum ImportWork {
     Object(ObjectId),
 }
@@ -225,6 +228,8 @@ where
     let mut pending_size_entries = HashMap::<ObjectId, Vec<usize>>::new();
     let mut tree_entries = Vec::<IndexedTreeEntry>::new();
     let mut indexed_tree_batches = Vec::new();
+    let mut pending_objects = Vec::with_capacity(IMPORT_OBJECT_BATCH_MAX_COUNT);
+    let mut pending_object_bytes = 0usize;
     let mut stack = roots;
     while let Some(work) = stack.pop() {
         let ImportWork::Object(oid) = work;
@@ -233,21 +238,6 @@ where
         }
         let object = source.odb.read(&oid)?;
         let stored = StoredObject::new(object.kind, object.data);
-        destination
-            .storage()
-            .write_imported_object(
-                destination.tenant(),
-                destination.repository(),
-                &oid,
-                &stored,
-            )
-            .await?;
-        report.objects += 1;
-        progress(ImportProgressEvent::Object {
-            oid,
-            kind: object.kind,
-        })?;
-        maybe_checkpoint(&options, &mut report, &mut progress)?;
 
         let object_size = stored.data.len() as u64;
         object_sizes.insert(oid, object_size);
@@ -292,7 +282,48 @@ where
             }
             ObjectKind::Blob => {}
         }
+
+        let payload_bytes = stored.data.len();
+        let exceeds_byte_limit =
+            pending_object_bytes.saturating_add(payload_bytes) > IMPORT_OBJECT_BATCH_MAX_BYTES;
+        if !pending_objects.is_empty()
+            && (pending_objects.len() >= IMPORT_OBJECT_BATCH_MAX_COUNT || exceeds_byte_limit)
+        {
+            flush_imported_objects(
+                destination,
+                &mut pending_objects,
+                &mut pending_object_bytes,
+                &options,
+                &mut report,
+                &mut progress,
+            )
+            .await?;
+        }
+        pending_object_bytes = pending_object_bytes.saturating_add(payload_bytes);
+        pending_objects.push((oid, stored));
+        if pending_objects.len() >= IMPORT_OBJECT_BATCH_MAX_COUNT
+            || pending_object_bytes >= IMPORT_OBJECT_BATCH_MAX_BYTES
+        {
+            flush_imported_objects(
+                destination,
+                &mut pending_objects,
+                &mut pending_object_bytes,
+                &options,
+                &mut report,
+                &mut progress,
+            )
+            .await?;
+        }
     }
+    flush_imported_objects(
+        destination,
+        &mut pending_objects,
+        &mut pending_object_bytes,
+        &options,
+        &mut report,
+        &mut progress,
+    )
+    .await?;
 
     destination
         .storage()
@@ -393,6 +424,44 @@ where
         count += 1;
     }
     Ok(count)
+}
+
+async fn flush_imported_objects<S, P>(
+    destination: &crate::repository::ServerRepository<S>,
+    pending: &mut Vec<(ObjectId, StoredObject)>,
+    pending_bytes: &mut usize,
+    options: &ImportOptions,
+    report: &mut ImportReport,
+    progress: &mut P,
+) -> Result<()>
+where
+    S: ServerStorage,
+    P: FnMut(ImportProgressEvent) -> Result<()>,
+{
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let events = pending
+        .iter()
+        .map(|(oid, object)| (*oid, object.kind))
+        .collect::<Vec<_>>();
+    destination
+        .storage()
+        .write_imported_objects(
+            destination.tenant(),
+            destination.repository(),
+            std::mem::take(pending),
+        )
+        .await?;
+    *pending_bytes = 0;
+
+    for (oid, kind) in events {
+        report.objects += 1;
+        progress(ImportProgressEvent::Object { oid, kind })?;
+        maybe_checkpoint(options, report, progress)?;
+    }
+    Ok(())
 }
 
 fn maybe_checkpoint(

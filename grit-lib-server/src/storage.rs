@@ -195,6 +195,40 @@ pub trait ObjectStore: Send + Sync {
         self.write_object(tenant, repository, oid, object).await
     }
 
+    /// Write a batch of owned objects whose commit metadata will be indexed separately.
+    ///
+    /// `objects` contains object ids paired with their header-stripped payloads. Ownership lets
+    /// backends move payload bytes directly into storage rather than clone them. The default
+    /// implementation safely delegates each value to [`Self::write_imported_object`]; backends
+    /// should override this method when they can amortize locks, transactions, or remote calls.
+    ///
+    /// # Parameters
+    ///
+    /// - `tenant`: Tenant that owns the repository.
+    /// - `repository`: Repository that receives the objects.
+    /// - `objects`: Owned object ids and payloads to store.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` after the complete batch has been stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns backend errors encountered while storing any object in the batch. Backends whose
+    /// storage supports transactions should make the batch atomic.
+    async fn write_imported_objects(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        objects: Vec<(ObjectId, StoredObject)>,
+    ) -> Result<()> {
+        for (oid, object) in objects {
+            self.write_imported_object(tenant, repository, &oid, &object)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Return whether an object exists.
     async fn object_exists(
         &self,

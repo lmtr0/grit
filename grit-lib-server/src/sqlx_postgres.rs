@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use grit_lib::objects::{HashAlgo, ObjectId, ObjectKind};
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
 use time::OffsetDateTime;
 
 use crate::error::{Error, Result};
@@ -836,6 +836,84 @@ async fn write_object_in_transaction(
     Ok(())
 }
 
+/// One loose-object row prepared for an importer bulk insert.
+pub(crate) struct ImportedObjectRow {
+    oid: ObjectId,
+    kind: ObjectKind,
+    payload: ImportedObjectPayload,
+}
+
+enum ImportedObjectPayload {
+    Database(Vec<u8>),
+    External { backend: String, key: String },
+}
+
+impl ImportedObjectRow {
+    /// Prepare one object whose payload remains in PostgreSQL.
+    pub(crate) fn database(oid: ObjectId, object: StoredObject) -> Self {
+        Self {
+            oid,
+            kind: object.kind,
+            payload: ImportedObjectPayload::Database(object.data),
+        }
+    }
+
+    /// Prepare one object whose payload has been placed in an external byte store.
+    pub(crate) fn external(oid: ObjectId, kind: ObjectKind, backend: String, key: String) -> Self {
+        Self {
+            oid,
+            kind,
+            payload: ImportedObjectPayload::External { backend, key },
+        }
+    }
+}
+
+/// Insert imported loose-object rows in bind-limit-safe, set-based statements.
+///
+/// All chunks execute through `tx`, so the caller retains one transaction boundary for the
+/// complete importer batch. An empty `rows` slice is a successful no-op.
+///
+/// # Errors
+///
+/// Returns SQLx errors from executing any object-row chunk.
+pub(crate) async fn write_imported_object_rows_in_transaction(
+    tx: &mut Transaction<'static, Postgres>,
+    tenant: &TenantId,
+    repository: &RepositoryId,
+    rows: &[ImportedObjectRow],
+) -> Result<()> {
+    const POSTGRES_BIND_LIMIT: usize = 65_535;
+    const BINDS_PER_ROW: usize = 7;
+
+    for chunk in rows.chunks(POSTGRES_BIND_LIMIT / BINDS_PER_ROW) {
+        let mut query = QueryBuilder::<Postgres>::new(
+            "insert into grit_objects
+                (tenant_id, repository_id, oid, kind, data, storage_backend, storage_key) ",
+        );
+        query.push_values(chunk, |mut row, object| {
+            row.push_bind(tenant.as_str())
+                .push_bind(repository.as_str())
+                .push_bind(object.oid.to_hex())
+                .push_bind(kind_to_name(object.kind));
+            match &object.payload {
+                ImportedObjectPayload::Database(data) => {
+                    row.push_bind(Some(data.as_slice()))
+                        .push_bind("database")
+                        .push_bind(None::<&str>);
+                }
+                ImportedObjectPayload::External { backend, key } => {
+                    row.push_bind(None::<&[u8]>)
+                        .push_bind(backend.as_str())
+                        .push_bind(Some(key.as_str()));
+                }
+            }
+        });
+        query.push(" on conflict (tenant_id, repository_id, oid) do nothing");
+        query.build().persistent(false).execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
 async fn write_ref_in_transaction(
     tx: &mut Transaction<'static, Postgres>,
     tenant: &TenantId,
@@ -1220,6 +1298,25 @@ impl ObjectStore for PgServerStorage {
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         write_object_in_transaction(&mut tx, tenant, repository, oid, object).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn write_imported_objects(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        objects: Vec<(ObjectId, StoredObject)>,
+    ) -> Result<()> {
+        if objects.is_empty() {
+            return Ok(());
+        }
+        let rows = objects
+            .into_iter()
+            .map(|(oid, object)| ImportedObjectRow::database(oid, object))
+            .collect::<Vec<_>>();
+        let mut tx = self.pool.begin().await?;
+        write_imported_object_rows_in_transaction(&mut tx, tenant, repository, &rows).await?;
         tx.commit().await?;
         Ok(())
     }

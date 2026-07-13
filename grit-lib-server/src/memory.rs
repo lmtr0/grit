@@ -185,6 +185,24 @@ impl ObjectStore for MemoryBackend {
         self.store_object(repo_key(tenant, repository), *oid, object)
     }
 
+    async fn write_imported_objects(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        imported: Vec<(ObjectId, StoredObject)>,
+    ) -> Result<()> {
+        let repo = repo_key(tenant, repository);
+        self.objects
+            .write()
+            .map(|mut objects| {
+                objects.reserve(imported.len());
+                for (oid, object) in imported {
+                    objects.entry((repo.clone(), oid)).or_insert(object);
+                }
+            })
+            .map_err(|_| Error::Backend("memory object lock poisoned".to_owned()))
+    }
+
     async fn object_exists(
         &self,
         tenant: &TenantId,

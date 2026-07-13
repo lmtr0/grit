@@ -111,6 +111,30 @@ where
             .await
     }
 
+    async fn write_imported_objects(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        objects: Vec<(ObjectId, StoredObject)>,
+    ) -> Result<()> {
+        let cached = objects
+            .iter()
+            .map(|(oid, object)| {
+                Ok((
+                    CacheKey::Object(oid.to_hex()),
+                    CacheValue::typed(CacheValueKind::Object, encode_object(object)?),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.storage
+            .write_imported_objects(tenant, repository, objects)
+            .await?;
+        for (key, value) in cached {
+            self.cache.put(tenant, repository, &key, value).await?;
+        }
+        Ok(())
+    }
+
     async fn object_exists(
         &self,
         tenant: &TenantId,
