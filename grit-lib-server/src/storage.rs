@@ -288,12 +288,12 @@ pub trait ConfigStore: Send + Sync {
     ) -> Result<Vec<(String, String)>>;
 }
 
-/// Tree entry indexed for hosting UI path browsing.
+/// Direct child entry indexed for hosting UI path browsing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexedTreeEntry {
     /// Tree object id that owns this entry.
     pub tree_oid: ObjectId,
-    /// Entry path relative to the tree root.
+    /// Direct child name relative to the owning tree.
     pub path: String,
     /// Entry mode.
     pub mode: u32,
@@ -323,7 +323,7 @@ pub struct IndexedCommit {
 /// Query index operations for repository-browsing UI.
 #[async_trait]
 pub trait BrowseIndex: Send + Sync {
-    /// Upsert indexed entries for a tree.
+    /// Upsert direct child entries for their owning trees.
     async fn upsert_tree_entries(
         &self,
         tenant: &TenantId,
@@ -331,7 +331,7 @@ pub trait BrowseIndex: Send + Sync {
         entries: &[IndexedTreeEntry],
     ) -> Result<()>;
 
-    /// Replace all browse-index entries for a repository with `entries`.
+    /// Replace all direct-tree browse-index entries for a repository with `entries`.
     ///
     /// Backends that cannot perform a repository-wide replacement atomically may fall back to an
     /// idempotent upsert, but repair-capable backends should remove stale rows before inserting
@@ -345,7 +345,7 @@ pub trait BrowseIndex: Send + Sync {
         self.upsert_tree_entries(tenant, repository, entries).await
     }
 
-    /// List direct entries below `tree_oid` and `prefix`.
+    /// List direct child entries of `tree_oid` whose names start with `prefix`.
     async fn list_tree_entries(
         &self,
         tenant: &TenantId,
@@ -354,7 +354,10 @@ pub trait BrowseIndex: Send + Sync {
         prefix: &str,
     ) -> Result<Vec<IndexedTreeEntry>>;
 
-    /// Read blob contents for a path resolved through the browse index.
+    /// Read blob contents for a direct child name resolved through the browse index.
+    ///
+    /// Repository-level callers should use [`crate::repository::ServerRepository`] for paths with
+    /// multiple components; this low-level operation addresses exactly one owning tree.
     async fn read_blob_at_path(
         &self,
         tenant: &TenantId,

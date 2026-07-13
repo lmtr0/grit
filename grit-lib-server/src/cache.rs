@@ -26,9 +26,9 @@ pub enum CacheKey {
     RefList(String),
     /// Parsed commit summary by hex commit object id.
     CommitSummary(String),
-    /// Tree listing by tree object id and path prefix.
+    /// Direct-child tree listing by tree object id and name prefix.
     TreeList { tree: String, prefix: String },
-    /// Tree/path lookup.
+    /// Direct-child tree/name lookup.
     TreePath { tree: String, path: String },
     /// Config lookup by key.
     Config(String),

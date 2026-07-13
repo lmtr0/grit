@@ -412,8 +412,8 @@ where
     pub async fn tree_at(&self, revision: &str, path: &str) -> Result<TreeView> {
         let root = self.resolve_tree_root(revision).await?;
         let path = normalize_tree_path(path);
-        let (oid, prefix) = if path.is_empty() {
-            (root, String::new())
+        let oid = if path.is_empty() {
+            root
         } else {
             let entry = self
                 .tree_entry(&root, &path)
@@ -425,16 +425,20 @@ where
                     actual: object_kind_name(entry.kind),
                 });
             }
-            (entry.oid, format!("{path}/"))
+            entry.oid
         };
-        let entries = self
-            .storage
-            .list_tree_entries(&self.tenant, &self.repository, &root, &prefix)
-            .await?
-            .into_iter()
-            .filter(|entry| is_direct_child(&entry.path, &path))
-            .map(TreeEntryView::from)
-            .collect();
+        let mut entries = self.direct_tree_entries_with_paths(&oid, &path).await?;
+        if entries.is_empty() && !path.is_empty() {
+            entries = self
+                .storage
+                .list_tree_entries(&self.tenant, &self.repository, &root, &format!("{path}/"))
+                .await?
+                .into_iter()
+                .filter(|entry| is_direct_child(&entry.path, &path))
+                .map(TreeEntryView::from)
+                .collect();
+            entries.sort_by(|left, right| left.path.cmp(&right.path));
+        }
         Ok(TreeView {
             root,
             path,
@@ -453,10 +457,9 @@ where
     /// Returns [`Error::PathNotFound`] for missing paths, [`Error::UnexpectedObjectKind`] when the
     /// path names a tree or non-blob object, plus backend and object parsing errors.
     pub async fn blob_at(&self, revision: &str, path: &str) -> Result<BlobView> {
-        let (root, path, entry) = self.resolve_blob_entry(revision, path).await?;
+        let (_, path, entry) = self.resolve_blob_entry(revision, path).await?;
         let object = self
-            .storage
-            .read_blob_at_path(&self.tenant, &self.repository, &root, &path)
+            .read_object(&entry.oid)
             .await?
             .ok_or_else(|| Error::PathNotFound(path.clone()))?;
         if object.kind != ObjectKind::Blob {
@@ -509,12 +512,11 @@ where
         B: ExternalByteStore,
         U: ContentUrlSigner,
     {
-        let (root, path, entry) = self.resolve_blob_entry(revision, path).await?;
+        let (_, path, entry) = self.resolve_blob_entry(revision, path).await?;
         let inline_threshold = u64::try_from(options.inline_threshold)
             .map_err(|_| Error::Backend("blob inline threshold exceeds u64".to_owned()))?;
         let object = self
-            .storage
-            .read_blob_at_path(&self.tenant, &self.repository, &root, &path)
+            .read_object(&entry.oid)
             .await?
             .ok_or_else(|| Error::PathNotFound(path.clone()))?;
         if object.kind != ObjectKind::Blob {
@@ -925,15 +927,64 @@ where
 
     /// List indexed tree entries below `prefix`.
     ///
+    /// This compatibility API composes direct-tree index rows into paths relative to `tree_oid`.
+    /// Prefer [`Self::tree_at`] when only one directory listing is needed.
+    ///
     /// # Errors
     ///
     /// Returns backend errors from the configured browse index.
     pub async fn list_tree(&self, tree_oid: &ObjectId, prefix: &str) -> Result<Vec<TreeEntryView>> {
-        let entries = self
+        let legacy_entries = self
             .storage
             .list_tree_entries(&self.tenant, &self.repository, tree_oid, prefix)
             .await?;
-        Ok(entries.into_iter().map(TreeEntryView::from).collect())
+        if legacy_entries.iter().any(|entry| entry.path.contains('/')) {
+            return Ok(legacy_entries
+                .into_iter()
+                .map(TreeEntryView::from)
+                .collect());
+        }
+
+        let (parent, child_prefix) = prefix.rsplit_once('/').unwrap_or(("", prefix));
+        if prefix.starts_with('/') || (!parent.is_empty() && parent.split('/').any(str::is_empty)) {
+            return Ok(Vec::new());
+        }
+        let start_tree = if parent.is_empty() {
+            *tree_oid
+        } else {
+            let Some(entry) = self.tree_entry(tree_oid, parent).await? else {
+                return Ok(Vec::new());
+            };
+            if entry.kind != ObjectKind::Tree {
+                return Ok(Vec::new());
+            }
+            entry.oid
+        };
+
+        let mut entries = Vec::new();
+        let mut stack = vec![(start_tree, parent.to_owned(), child_prefix.to_owned())];
+        while let Some((current, parent, name_prefix)) = stack.pop() {
+            let direct = self.direct_tree_entries(&current, &name_prefix).await?;
+            for entry in direct {
+                let path = if parent.is_empty() {
+                    entry.path.clone()
+                } else {
+                    format!("{parent}/{}", entry.path)
+                };
+                if entry.kind == ObjectKind::Tree {
+                    stack.push((entry.oid, path.clone(), String::new()));
+                }
+                entries.push(TreeEntryView {
+                    path,
+                    mode: entry.mode,
+                    oid: entry.oid,
+                    kind: entry.kind,
+                    size: entry.size,
+                });
+            }
+        }
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(entries)
     }
 
     /// Read blob contents at an indexed tree path.
@@ -946,18 +997,11 @@ where
         tree_oid: &ObjectId,
         path: &str,
     ) -> Result<Option<BlobView>> {
-        let entries = self
-            .storage
-            .list_tree_entries(&self.tenant, &self.repository, tree_oid, path)
-            .await?;
-        let Some(entry) = entries.into_iter().find(|entry| entry.path == path) else {
+        let path = normalize_tree_path(path);
+        let Some(entry) = self.tree_entry(tree_oid, &path).await? else {
             return Ok(None);
         };
-        let Some(object) = self
-            .storage
-            .read_blob_at_path(&self.tenant, &self.repository, tree_oid, path)
-            .await?
-        else {
+        let Some(object) = self.read_object(&entry.oid).await? else {
             return Ok(None);
         };
         if object.kind != ObjectKind::Blob {
@@ -1223,12 +1267,85 @@ where
     }
 
     async fn tree_entry(&self, root: &ObjectId, path: &str) -> Result<Option<IndexedTreeEntry>> {
-        Ok(self
-            .storage
-            .list_tree_entries(&self.tenant, &self.repository, root, path)
+        let mut current = *root;
+        let mut resolved = String::new();
+        let components = path
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let component_count = components.len();
+        for (index, component) in components.into_iter().enumerate() {
+            let full_path = if resolved.is_empty() {
+                component.clone()
+            } else {
+                format!("{resolved}/{component}")
+            };
+            let direct = self
+                .storage
+                .list_tree_entries(&self.tenant, &self.repository, &current, &component)
+                .await?
+                .into_iter()
+                .find(|entry| entry.path == component);
+            let mut entry = if let Some(entry) = direct {
+                entry
+            } else {
+                let Some(entry) = self
+                    .storage
+                    .list_tree_entries(&self.tenant, &self.repository, root, &full_path)
+                    .await?
+                    .into_iter()
+                    .find(|entry| entry.path == full_path)
+                else {
+                    return Ok(None);
+                };
+                entry
+            };
+            resolved = full_path;
+            entry.path.clone_from(&resolved);
+            if index + 1 == component_count {
+                return Ok(Some(entry));
+            }
+            if entry.kind != ObjectKind::Tree {
+                return Ok(None);
+            }
+            current = entry.oid;
+        }
+        Ok(None)
+    }
+
+    async fn direct_tree_entries_with_paths(
+        &self,
+        tree_oid: &ObjectId,
+        parent: &str,
+    ) -> Result<Vec<TreeEntryView>> {
+        let mut entries = self
+            .direct_tree_entries(tree_oid, "")
             .await?
             .into_iter()
-            .find(|entry| entry.path == path))
+            .map(|mut entry| {
+                if !parent.is_empty() {
+                    entry.path = format!("{parent}/{}", entry.path);
+                }
+                TreeEntryView::from(entry)
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(entries)
+    }
+
+    async fn direct_tree_entries(
+        &self,
+        tree_oid: &ObjectId,
+        prefix: &str,
+    ) -> Result<Vec<IndexedTreeEntry>> {
+        Ok(self
+            .storage
+            .list_tree_entries(&self.tenant, &self.repository, tree_oid, prefix)
+            .await?
+            .into_iter()
+            .filter(|entry| !entry.path.contains('/'))
+            .collect())
     }
 
     async fn commit_summaries(&self, oids: Vec<ObjectId>) -> Result<Vec<CommitSummary>> {
@@ -1553,9 +1670,6 @@ fn normalize_tree_path(path: &str) -> String {
 }
 
 fn is_direct_child(candidate: &str, parent: &str) -> bool {
-    if parent.is_empty() {
-        return !candidate.is_empty() && !candidate.contains('/');
-    }
     let Some(rest) = candidate.strip_prefix(parent) else {
         return false;
     };

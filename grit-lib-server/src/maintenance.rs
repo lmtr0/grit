@@ -1,6 +1,6 @@
 //! Maintenance, repair, and migration utilities for server-backed repositories.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write as _;
 use std::path::Path;
@@ -98,9 +98,9 @@ pub enum ConsistencyIssue {
     },
     /// A browse-index row names an object that is not stored.
     MissingBrowseIndexObject {
-        /// Root tree used by the browse index.
+        /// Tree object that owns the indexed entry.
         tree: ObjectId,
-        /// Indexed path.
+        /// Indexed direct child name.
         path: String,
         /// Missing object id.
         oid: ObjectId,
@@ -125,7 +125,9 @@ pub struct ExportReport {
     pub config_entries: usize,
 }
 
-/// Rebuild the browse index from stored commit and tree objects.
+/// Rebuild the direct-tree browse index from stored tree objects.
+///
+/// This repository-wide replacement also removes stale legacy flattened browse rows.
 ///
 /// # Errors
 ///
@@ -401,29 +403,14 @@ async fn build_browse_index<S>(repo: &ServerRepository<S>) -> Result<Vec<Indexed
 where
     S: ServerStorage,
 {
-    let mut roots = HashSet::new();
-    for (oid, _) in repo
-        .storage()
-        .list_object_ids(repo.tenant(), repo.repository(), Some(ObjectKind::Commit))
-        .await?
-    {
-        let Some(object) = repo.read_object(&oid).await? else {
-            continue;
-        };
-        let commit = parse_commit(&object.data)?;
-        roots.insert(commit.tree);
-    }
-    for (oid, _) in repo
+    let tree_oids = repo
         .storage()
         .list_object_ids(repo.tenant(), repo.repository(), Some(ObjectKind::Tree))
-        .await?
-    {
-        roots.insert(oid);
-    }
+        .await?;
 
     let mut entries = Vec::new();
-    for root in roots {
-        append_browse_entries(repo, root, &mut entries).await?;
+    for (tree_oid, _) in tree_oids {
+        append_browse_entries(repo, tree_oid, &mut entries).await?;
     }
     entries.sort_by(|left, right| {
         left.tree_oid
@@ -436,51 +423,40 @@ where
 
 async fn append_browse_entries<S>(
     repo: &ServerRepository<S>,
-    root: ObjectId,
+    tree_oid: ObjectId,
     entries: &mut Vec<IndexedTreeEntry>,
 ) -> Result<()>
 where
     S: ServerStorage,
 {
-    let mut stack = vec![(root, String::new())];
-    while let Some((tree_oid, prefix)) = stack.pop() {
-        let object = repo
-            .read_object(&tree_oid)
-            .await?
-            .ok_or_else(|| Error::ObjectNotFound(tree_oid.to_hex()))?;
-        if object.kind != ObjectKind::Tree {
-            return Err(Error::UnexpectedObjectKind {
-                expected: "tree",
-                actual: object_kind_name(object.kind),
-            });
-        }
-        for entry in parse_tree(&object.data)? {
-            let name = String::from_utf8_lossy(&entry.name).into_owned();
-            let path = if prefix.is_empty() {
-                name
-            } else {
-                format!("{prefix}/{name}")
-            };
-            let kind = kind_for_mode(entry.mode);
-            let size = if kind == ObjectKind::Blob {
-                repo.read_object(&entry.oid)
-                    .await?
-                    .map(|object| object.data.len() as u64)
-            } else {
-                None
-            };
-            entries.push(IndexedTreeEntry {
-                tree_oid: root,
-                path: path.clone(),
-                mode: entry.mode,
-                oid: entry.oid,
-                kind,
-                size,
-            });
-            if kind == ObjectKind::Tree {
-                stack.push((entry.oid, path));
-            }
-        }
+    let object = repo
+        .read_object(&tree_oid)
+        .await?
+        .ok_or_else(|| Error::ObjectNotFound(tree_oid.to_hex()))?;
+    if object.kind != ObjectKind::Tree {
+        return Err(Error::UnexpectedObjectKind {
+            expected: "tree",
+            actual: object_kind_name(object.kind),
+        });
+    }
+    for entry in parse_tree(&object.data)? {
+        let name = String::from_utf8_lossy(&entry.name).into_owned();
+        let kind = kind_for_mode(entry.mode);
+        let size = if kind == ObjectKind::Blob {
+            repo.read_object(&entry.oid)
+                .await?
+                .map(|object| object.data.len() as u64)
+        } else {
+            None
+        };
+        entries.push(IndexedTreeEntry {
+            tree_oid,
+            path: name,
+            mode: entry.mode,
+            oid: entry.oid,
+            kind,
+            size,
+        });
     }
     Ok(())
 }

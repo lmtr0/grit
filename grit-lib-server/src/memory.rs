@@ -470,8 +470,8 @@ impl BrowseIndex for MemoryBackend {
             .read()
             .map(|trees| {
                 trees
-                    .iter()
-                    .filter(|((candidate_repo, candidate_tree, path), _)| {
+                    .range((repo.clone(), *tree_oid, prefix.to_owned())..)
+                    .take_while(|((candidate_repo, candidate_tree, path), _)| {
                         candidate_repo == &repo
                             && candidate_tree == tree_oid
                             && path.starts_with(prefix)

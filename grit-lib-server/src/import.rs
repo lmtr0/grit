@@ -12,11 +12,6 @@ use crate::storage::{IndexedTreeEntry, ServerStorage, StoredObject, StoredRef};
 
 enum ImportWork {
     Object(ObjectId),
-    Tree {
-        oid: ObjectId,
-        root: ObjectId,
-        prefix: String,
-    },
 }
 
 /// Summary of an import run.
@@ -28,7 +23,7 @@ pub struct ImportReport {
     pub config_entries: usize,
     /// Number of unique reachable objects imported.
     pub objects: usize,
-    /// Number of tree entries indexed.
+    /// Number of unique direct tree entries indexed.
     pub tree_entries: usize,
     /// Number of commit graph rows rebuilt from imported commits.
     pub commit_graph_entries: usize,
@@ -94,7 +89,7 @@ pub enum ImportProgressEvent {
     },
     /// Tree entries were indexed.
     TreeEntries {
-        /// Root tree whose browse entries were indexed.
+        /// Tree object whose direct browse entries were indexed.
         tree_oid: ObjectId,
         /// Number of entries indexed in this batch.
         entries: usize,
@@ -121,6 +116,10 @@ where
 }
 
 /// Import reachable repository data with explicit options and progress reporting.
+///
+/// Direct entries discovered during import are upserted by immutable tree object id. Existing
+/// entries for stored objects outside the current reachable closure are preserved. Use
+/// [`crate::maintenance::repair_browse_index`] to migrate or remove legacy flattened rows.
 ///
 /// The `progress` callback receives events after durable writes complete. Returning an error from
 /// the callback aborts the import and returns that error.
@@ -218,60 +217,41 @@ where
     }
 
     let mut seen = HashSet::new();
-    let mut indexed_trees = HashSet::new();
+    let mut tree_entries = Vec::new();
+    let mut indexed_tree_batches = Vec::new();
     let mut stack = roots;
     while let Some(work) = stack.pop() {
-        let (oid, tree_context) = match work {
-            ImportWork::Object(oid) => (oid, None),
-            ImportWork::Tree { oid, root, prefix } => (oid, Some((root, prefix))),
-        };
-        let first_object_visit = seen.insert(oid);
-        if !first_object_visit && tree_context.is_none() {
+        let ImportWork::Object(oid) = work;
+        if !seen.insert(oid) {
             continue;
         }
         let object = source.odb.read(&oid)?;
-        if first_object_visit {
-            let stored = StoredObject::new(object.kind, object.data.clone());
-            destination
-                .storage()
-                .write_object(
-                    destination.tenant(),
-                    destination.repository(),
-                    &oid,
-                    &stored,
-                )
-                .await?;
-            report.objects += 1;
-            progress(ImportProgressEvent::Object {
-                oid,
-                kind: object.kind,
-            })?;
-            maybe_checkpoint(&options, &mut report, &mut progress)?;
-        }
+        let stored = StoredObject::new(object.kind, object.data.clone());
+        destination
+            .storage()
+            .write_object(
+                destination.tenant(),
+                destination.repository(),
+                &oid,
+                &stored,
+            )
+            .await?;
+        report.objects += 1;
+        progress(ImportProgressEvent::Object {
+            oid,
+            kind: object.kind,
+        })?;
+        maybe_checkpoint(&options, &mut report, &mut progress)?;
 
         match object.kind {
             ObjectKind::Commit => {
                 let commit = parse_commit(&object.data)?;
-                stack.push(ImportWork::Tree {
-                    oid: commit.tree,
-                    root: commit.tree,
-                    prefix: String::new(),
-                });
+                stack.push(ImportWork::Object(commit.tree));
                 stack.extend(commit.parents.into_iter().map(ImportWork::Object));
             }
             ObjectKind::Tree => {
-                let (root, prefix) = tree_context.unwrap_or((oid, String::new()));
-                if !indexed_trees.insert((root, oid, prefix.clone())) {
-                    continue;
-                }
-                let indexed =
-                    index_tree(destination, source, root, &prefix, &object.data, &mut stack)
-                        .await?;
-                report.tree_entries += indexed;
-                progress(ImportProgressEvent::TreeEntries {
-                    tree_oid: root,
-                    entries: indexed,
-                })?;
+                let indexed = index_tree(source, oid, &object.data, &mut stack, &mut tree_entries)?;
+                indexed_tree_batches.push((oid, indexed));
             }
             ObjectKind::Tag => {
                 let tag = parse_tag(&object.data)?;
@@ -279,6 +259,19 @@ where
             }
             ObjectKind::Blob => {}
         }
+    }
+
+    destination
+        .storage()
+        .upsert_tree_entries(
+            destination.tenant(),
+            destination.repository(),
+            &tree_entries,
+        )
+        .await?;
+    report.tree_entries = tree_entries.len();
+    for (tree_oid, entries) in indexed_tree_batches {
+        progress(ImportProgressEvent::TreeEntries { tree_oid, entries })?;
     }
 
     report.commit_graph_entries = destination.repair_commit_graph().await?;
@@ -336,26 +329,17 @@ fn maybe_checkpoint(
     progress(ImportProgressEvent::Checkpoint(checkpoint))
 }
 
-async fn index_tree<S>(
-    destination: &crate::repository::ServerRepository<S>,
+fn index_tree(
     source: &Repository,
-    root_tree_oid: ObjectId,
-    prefix: &str,
+    tree_oid: ObjectId,
     data: &[u8],
     stack: &mut Vec<ImportWork>,
-) -> Result<usize>
-where
-    S: ServerStorage,
-{
-    let mut entries = Vec::new();
+    indexed: &mut Vec<IndexedTreeEntry>,
+) -> Result<usize> {
+    let initial_len = indexed.len();
     for entry in parse_tree(data)? {
         let name = String::from_utf8(entry.name)
             .map_err(|_| Error::PathNotFound("tree entry name is not UTF-8".to_owned()))?;
-        let path = if prefix.is_empty() {
-            name
-        } else {
-            format!("{prefix}/{name}")
-        };
         let kind = kind_for_mode(entry.mode);
         let size = if kind == ObjectKind::Blob {
             source
@@ -366,32 +350,17 @@ where
         } else {
             None
         };
-        entries.push(IndexedTreeEntry {
-            tree_oid: root_tree_oid,
-            path,
+        indexed.push(IndexedTreeEntry {
+            tree_oid,
+            path: name,
             mode: entry.mode,
             oid: entry.oid,
             kind,
             size,
         });
-        match kind {
-            ObjectKind::Tree => stack.push(ImportWork::Tree {
-                oid: entry.oid,
-                root: root_tree_oid,
-                prefix: entries
-                    .last()
-                    .map(|entry| entry.path.clone())
-                    .unwrap_or_default(),
-            }),
-            _ => stack.push(ImportWork::Object(entry.oid)),
-        }
+        stack.push(ImportWork::Object(entry.oid));
     }
-    let count = entries.len();
-    destination
-        .storage()
-        .upsert_tree_entries(destination.tenant(), destination.repository(), &entries)
-        .await?;
-    Ok(count)
+    Ok(indexed.len() - initial_len)
 }
 
 fn kind_for_mode(mode: u32) -> ObjectKind {
