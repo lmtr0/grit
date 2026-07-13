@@ -221,7 +221,9 @@ where
 
     let mut seen = HashSet::new();
     let mut indexed_commits = HashMap::new();
-    let mut tree_entries = Vec::new();
+    let mut object_sizes = HashMap::new();
+    let mut pending_size_entries = HashMap::<ObjectId, Vec<usize>>::new();
+    let mut tree_entries = Vec::<IndexedTreeEntry>::new();
     let mut indexed_tree_batches = Vec::new();
     let mut stack = roots;
     while let Some(work) = stack.pop() {
@@ -230,7 +232,7 @@ where
             continue;
         }
         let object = source.odb.read(&oid)?;
-        let stored = StoredObject::new(object.kind, object.data.clone());
+        let stored = StoredObject::new(object.kind, object.data);
         destination
             .storage()
             .write_imported_object(
@@ -247,9 +249,19 @@ where
         })?;
         maybe_checkpoint(&options, &mut report, &mut progress)?;
 
-        match object.kind {
+        let object_size = stored.data.len() as u64;
+        object_sizes.insert(oid, object_size);
+        if let Some(entries) = pending_size_entries.remove(&oid) {
+            for entry_index in entries {
+                if let Some(entry) = tree_entries.get_mut(entry_index) {
+                    entry.size = Some(object_size);
+                }
+            }
+        }
+
+        match stored.kind {
             ObjectKind::Commit => {
-                let commit = parse_commit(&object.data)?;
+                let commit = parse_commit(&stored.data)?;
                 stack.push(ImportWork::Object(commit.tree));
                 stack.extend(commit.parents.iter().copied().map(ImportWork::Object));
                 indexed_commits.insert(
@@ -264,11 +276,18 @@ where
                 );
             }
             ObjectKind::Tree => {
-                let indexed = index_tree(source, oid, &object.data, &mut stack, &mut tree_entries)?;
+                let indexed = index_tree(
+                    oid,
+                    &stored.data,
+                    &mut stack,
+                    &mut tree_entries,
+                    &object_sizes,
+                    &mut pending_size_entries,
+                )?;
                 indexed_tree_batches.push((oid, indexed));
             }
             ObjectKind::Tag => {
-                let tag = parse_tag(&object.data)?;
+                let tag = parse_tag(&stored.data)?;
                 stack.push(ImportWork::Object(tag.object));
             }
             ObjectKind::Blob => {}
@@ -396,11 +415,12 @@ fn maybe_checkpoint(
 }
 
 fn index_tree(
-    source: &Repository,
     tree_oid: ObjectId,
     data: &[u8],
     stack: &mut Vec<ImportWork>,
     indexed: &mut Vec<IndexedTreeEntry>,
+    object_sizes: &HashMap<ObjectId, u64>,
+    pending_size_entries: &mut HashMap<ObjectId, Vec<usize>>,
 ) -> Result<usize> {
     let initial_len = indexed.len();
     for entry in parse_tree(data)? {
@@ -408,14 +428,11 @@ fn index_tree(
             .map_err(|_| Error::PathNotFound("tree entry name is not UTF-8".to_owned()))?;
         let kind = kind_for_mode(entry.mode);
         let size = if kind == ObjectKind::Blob {
-            source
-                .odb
-                .read(&entry.oid)
-                .ok()
-                .map(|object| object.data.len() as u64)
+            object_sizes.get(&entry.oid).copied()
         } else {
             None
         };
+        let entry_index = indexed.len();
         indexed.push(IndexedTreeEntry {
             tree_oid,
             path: name,
@@ -424,6 +441,12 @@ fn index_tree(
             kind,
             size,
         });
+        if kind == ObjectKind::Blob && size.is_none() {
+            pending_size_entries
+                .entry(entry.oid)
+                .or_default()
+                .push(entry_index);
+        }
         stack.push(ImportWork::Object(entry.oid));
     }
     Ok(indexed.len() - initial_len)
