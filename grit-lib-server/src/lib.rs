@@ -77,9 +77,10 @@ pub mod prelude {
     #[cfg(feature = "s3")]
     pub use crate::s3_byte_store::S3ByteStore;
     pub use crate::storage::{
-        BrowseIndex, CommitGraphStore, ConfigStore, IndexedCommit, ObjectStore, PackMetadata,
-        PackObjectIndex, PackStore, PackedObject, RefStore, ReflogEntry, ReflogStore, RepackPlan,
-        StoredObject, StoredPack, StoredRef,
+        BrowseIndex, CommitGraphStore, ConfigStore, ImportPublication, ImportPublicationResult,
+        ImportSession, ImportStateStore, IndexedCommit, ObjectStore, PackMetadata, PackObjectIndex,
+        PackStore, PackedObject, RefStore, ReflogEntry, ReflogStore, RepackPlan, StoredObject,
+        StoredPack, StoredRef,
     };
     pub use crate::views::{
         BlobContentDelivery, BlobContentView, BlobDownloadOptions, BlobDownloadView,

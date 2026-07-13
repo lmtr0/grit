@@ -373,6 +373,154 @@ pub struct IndexedCommit {
     pub generation: u32,
 }
 
+/// Repository import session created before importer mutations begin.
+pub struct ImportSession {
+    /// Monotonic repository-local generation used to reject stale concurrent completions.
+    generation: u64,
+    /// Backend-global non-replay token that survives repository deletion and recreation.
+    token: u64,
+    /// Tenant identity bound to this session.
+    tenant: TenantId,
+    /// Repository identity bound to this session.
+    repository: RepositoryId,
+    /// Object ids trusted from the immediately preceding completed import.
+    trusted_objects: Vec<(ObjectId, ObjectKind)>,
+}
+
+impl ImportSession {
+    /// Create a backend-issued import session.
+    pub(crate) fn new(
+        tenant: TenantId,
+        repository: RepositoryId,
+        generation: u64,
+        token: u64,
+        trusted_objects: Vec<(ObjectId, ObjectKind)>,
+    ) -> Self {
+        Self {
+            generation,
+            token,
+            tenant,
+            repository,
+            trusted_objects,
+        }
+    }
+
+    /// Return this session's repository-local generation.
+    #[must_use]
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Return this session's backend-issued non-replay token.
+    #[must_use]
+    pub(crate) fn token(&self) -> u64 {
+        self.token
+    }
+
+    /// Return the tenant bound to this session.
+    #[must_use]
+    pub(crate) fn tenant(&self) -> &TenantId {
+        &self.tenant
+    }
+
+    /// Return the repository bound to this session.
+    #[must_use]
+    pub(crate) fn repository(&self) -> &RepositoryId {
+        &self.repository
+    }
+
+    /// Return object ids trusted by the preceding completed import.
+    #[must_use]
+    pub(crate) fn trusted_objects(&self) -> &[(ObjectId, ObjectKind)] {
+        &self.trusted_objects
+    }
+}
+
+impl std::fmt::Debug for ImportSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ImportSession")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Final visible repository mutations staged by an import.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImportPublication {
+    /// Repository-local config keys and values to publish.
+    pub config_entries: Vec<(String, String)>,
+    /// Complete desired ref snapshot, including `HEAD` when present.
+    pub refs: Vec<(String, StoredRef)>,
+    /// Whether refs absent from `refs` should be deleted.
+    pub prune_deleted_refs: bool,
+    /// Objects read and verified from the source during this import session.
+    pub newly_trusted: Vec<(ObjectId, ObjectKind)>,
+}
+
+/// Result of guarded import publication.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImportPublicationResult {
+    /// Ref names deleted because they were absent from the desired snapshot.
+    pub pruned_refs: Vec<String>,
+}
+
+/// Durable completion-state operations for incremental repository imports.
+#[async_trait]
+pub trait ImportStateStore: Send + Sync {
+    /// Begin an import and atomically mark its repository incomplete.
+    ///
+    /// Trusted objects are returned only when the preceding import completed. If a prior import
+    /// stopped early, the returned snapshot is empty so retries traverse and verify the source
+    /// closure again. Starting another concurrent import advances the generation and makes older
+    /// sessions ineligible to complete.
+    ///
+    /// # Returns
+    ///
+    /// Returns the new generation and any object ids trusted from the previous completed import.
+    ///
+    /// # Errors
+    ///
+    /// Returns backend errors if the incomplete marker cannot be stored atomically.
+    async fn begin_import(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+    ) -> Result<ImportSession>;
+
+    /// Guard and atomically publish the import's visible repository mutations.
+    ///
+    /// Publication must verify that `session` is the active incomplete generation bound to
+    /// `tenant` and `repository`. A successful call records newly trusted objects but deliberately
+    /// leaves the session incomplete until [`Self::complete_import`] is called after progress
+    /// callbacks accept the durable publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::Error::StaleImportSession`] before applying any visible mutation
+    /// when the session is stale, replayed, cross-repository, or already published.
+    async fn publish_import(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        session: &ImportSession,
+        publication: &ImportPublication,
+    ) -> Result<ImportPublicationResult>;
+
+    /// Mark a successfully published import complete and enable its trusted manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::Error::StaleImportSession`] when `session` is not the active,
+    /// published, incomplete generation for this exact tenant and repository. A session can be
+    /// completed only once.
+    async fn complete_import(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        session: &ImportSession,
+    ) -> Result<()>;
+}
+
 /// Query index operations for repository-browsing UI.
 #[async_trait]
 pub trait BrowseIndex: Send + Sync {
@@ -574,6 +722,7 @@ pub trait ServerStorage:
     + ConfigStore
     + BrowseIndex
     + CommitGraphStore
+    + ImportStateStore
     + PackStore
     + Send
     + Sync
@@ -587,6 +736,7 @@ impl<T> ServerStorage for T where
         + ConfigStore
         + BrowseIndex
         + CommitGraphStore
+        + ImportStateStore
         + PackStore
         + Send
         + Sync

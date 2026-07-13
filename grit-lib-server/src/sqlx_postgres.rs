@@ -11,9 +11,10 @@ use time::OffsetDateTime;
 use crate::error::{Error, Result};
 use crate::ids::{RepositoryId, TenantId};
 use crate::storage::{
-    BrowseIndex, CommitGraphStore, ConfigStore, IndexedCommit, IndexedTreeEntry, ObjectStore,
-    PackMetadata, PackObjectIndex, PackStore, RefStore, ReflogEntry, ReflogStore, StoredObject,
-    StoredPack, StoredRef,
+    BrowseIndex, CommitGraphStore, ConfigStore, ImportPublication, ImportPublicationResult,
+    ImportSession, ImportStateStore, IndexedCommit, IndexedTreeEntry, ObjectStore, PackMetadata,
+    PackObjectIndex, PackStore, RefStore, ReflogEntry, ReflogStore, StoredObject, StoredPack,
+    StoredRef,
 };
 
 /// SQL migration statements for the initial server storage schema.
@@ -110,6 +111,27 @@ pub const MIGRATIONS: &[&str] = &[
         parent_oid text not null,
         parent_order integer not null,
         primary key (tenant_id, repository_id, commit_oid, parent_order)
+    )",
+    "create sequence if not exists grit_import_session_token_seq",
+    "create table if not exists grit_import_state (
+        tenant_id text not null,
+        repository_id text not null,
+        generation bigint not null,
+        token bigint not null,
+        complete boolean not null,
+        published boolean not null,
+        primary key (tenant_id, repository_id)
+    )",
+    "alter table grit_import_state
+        add column if not exists published boolean not null default false",
+    "alter table grit_import_state
+        add column if not exists token bigint not null default 0",
+    "create table if not exists grit_import_trusted_objects (
+        tenant_id text not null,
+        repository_id text not null,
+        oid text not null,
+        kind text not null,
+        primary key (tenant_id, repository_id, oid)
     )",
     "create table if not exists grit_packs (
         tenant_id text not null,
@@ -224,6 +246,8 @@ impl PgServerStorage {
         repository: &RepositoryId,
         hash_algo: HashAlgo,
     ) -> Result<PgRepositoryRow> {
+        let mut tx = self.pool.begin().await?;
+        lock_repository_name(&mut tx, tenant, repository).await?;
         let row = sqlx::query(
             "insert into grit_repositories
                 (tenant_id, repository_id, hash_algo, created_at, updated_at)
@@ -235,7 +259,7 @@ impl PgServerStorage {
         .bind(tenant.as_str())
         .bind(repository.as_str())
         .bind(hash_algo.name())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
 
         let Some(row) = row else {
@@ -243,7 +267,9 @@ impl PgServerStorage {
                 "{tenant}/{repository}"
             )));
         };
-        row_to_repository(&row)
+        let repository = row_to_repository(&row)?;
+        tx.commit().await?;
+        Ok(repository)
     }
 
     /// Read a repository metadata row when it exists and has not been deleted.
@@ -365,6 +391,7 @@ impl PgServerStorage {
     pub async fn transaction(&self) -> Result<PgServerStorageTransaction> {
         Ok(PgServerStorageTransaction {
             tx: self.pool.begin().await?,
+            repository_scope: PgTransactionScope::Unscoped,
         })
     }
 
@@ -384,6 +411,7 @@ impl PgServerStorage {
         entry: &ReflogEntry,
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
+        lock_import_repository(&mut tx, tenant, repository).await?;
         write_ref_with_reflog_in_transaction(
             &mut tx, tenant, repository, refname, value, expected, entry,
         )
@@ -394,8 +422,21 @@ impl PgServerStorage {
 }
 
 /// SQL transaction wrapper for multi-table writes.
+///
+/// Child-table mutations are restricted to one tenant/repository identity. This keeps advisory
+/// name locks and repository row locks in canonical order instead of allowing callers to acquire
+/// arbitrary multi-repository lock sequences. Rename must be the first scoped operation; after a
+/// successful rename the transaction is scoped to the destination identity. A failed rename
+/// poisons the lifecycle scope so only [`Self::commit`] or [`Self::rollback`] may follow.
 pub struct PgServerStorageTransaction {
     tx: Transaction<'static, Postgres>,
+    repository_scope: PgTransactionScope,
+}
+
+enum PgTransactionScope {
+    Unscoped,
+    Repository(TenantId, RepositoryId),
+    Lifecycle,
 }
 
 impl PgServerStorageTransaction {
@@ -430,7 +471,31 @@ impl PgServerStorageTransaction {
         repository: &RepositoryId,
         new_repository: &RepositoryId,
     ) -> Result<PgRepositoryRow> {
-        rename_repository_in_transaction(&mut self.tx, tenant, repository, new_repository).await
+        let requested = format!(
+            "{} -> {}",
+            repository_key(tenant, repository),
+            repository_key(tenant, new_repository)
+        );
+        match &self.repository_scope {
+            PgTransactionScope::Unscoped => {
+                self.repository_scope = PgTransactionScope::Lifecycle;
+            }
+            PgTransactionScope::Repository(locked_tenant, locked_repository) => {
+                return Err(Error::TransactionRepositoryScope {
+                    locked: repository_key(locked_tenant, locked_repository),
+                    requested,
+                });
+            }
+            PgTransactionScope::Lifecycle => {
+                return Err(Error::TransactionLifecyclePoisoned { requested });
+            }
+        }
+        let row =
+            rename_repository_in_transaction(&mut self.tx, tenant, repository, new_repository)
+                .await?;
+        self.repository_scope =
+            PgTransactionScope::Repository(tenant.clone(), new_repository.clone());
+        Ok(row)
     }
 
     /// Hard-delete a repository and every scoped SQL row owned by it.
@@ -443,6 +508,7 @@ impl PgServerStorageTransaction {
         tenant: &TenantId,
         repository: &RepositoryId,
     ) -> Result<()> {
+        self.bind_repository_scope(tenant, repository)?;
         delete_repository_in_transaction(&mut self.tx, tenant, repository).await
     }
 
@@ -458,6 +524,7 @@ impl PgServerStorageTransaction {
         oid: &ObjectId,
         object: &StoredObject,
     ) -> Result<()> {
+        self.bind_repository_scope(tenant, repository)?;
         write_object_in_transaction(&mut self.tx, tenant, repository, oid, object).await
     }
 
@@ -475,6 +542,8 @@ impl PgServerStorageTransaction {
         value: &StoredRef,
         expected: Option<Option<StoredRef>>,
     ) -> Result<()> {
+        self.bind_repository_scope(tenant, repository)?;
+        lock_import_repository(&mut self.tx, tenant, repository).await?;
         write_ref_in_transaction(&mut self.tx, tenant, repository, refname, value, expected).await
     }
 
@@ -491,6 +560,8 @@ impl PgServerStorageTransaction {
         refname: &str,
         expected: Option<StoredRef>,
     ) -> Result<()> {
+        self.bind_repository_scope(tenant, repository)?;
+        lock_import_repository(&mut self.tx, tenant, repository).await?;
         delete_ref_in_transaction(&mut self.tx, tenant, repository, refname, expected).await
     }
 
@@ -505,6 +576,7 @@ impl PgServerStorageTransaction {
         repository: &RepositoryId,
         entry: &ReflogEntry,
     ) -> Result<()> {
+        self.bind_repository_scope(tenant, repository)?;
         append_reflog_in_transaction(&mut self.tx, tenant, repository, entry).await
     }
 
@@ -523,6 +595,8 @@ impl PgServerStorageTransaction {
         expected: Option<Option<StoredRef>>,
         entry: &ReflogEntry,
     ) -> Result<()> {
+        self.bind_repository_scope(tenant, repository)?;
+        lock_import_repository(&mut self.tx, tenant, repository).await?;
         write_ref_with_reflog_in_transaction(
             &mut self.tx,
             tenant,
@@ -547,6 +621,8 @@ impl PgServerStorageTransaction {
         key: &str,
         value: &str,
     ) -> Result<()> {
+        self.bind_repository_scope(tenant, repository)?;
+        lock_import_repository(&mut self.tx, tenant, repository).await?;
         set_config_in_transaction(&mut self.tx, tenant, repository, key, value).await
     }
 
@@ -562,7 +638,52 @@ impl PgServerStorageTransaction {
         repository: &RepositoryId,
         entries: &[IndexedTreeEntry],
     ) -> Result<()> {
+        self.bind_repository_scope(tenant, repository)?;
         upsert_tree_entries_in_transaction(&mut self.tx, tenant, repository, entries).await
+    }
+
+    /// Store a pack and its object index rows within the transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns repository lifecycle or backend validation errors, or SQLx errors from the
+    /// backend.
+    pub async fn write_pack(
+        &mut self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        pack: &StoredPack,
+    ) -> Result<PackMetadata> {
+        self.bind_repository_scope(tenant, repository)?;
+        write_pack_in_transaction(&mut self.tx, tenant, repository, pack).await
+    }
+
+    fn bind_repository_scope(
+        &mut self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+    ) -> Result<()> {
+        let requested = (tenant.clone(), repository.clone());
+        match &self.repository_scope {
+            PgTransactionScope::Unscoped => {
+                self.repository_scope = PgTransactionScope::Repository(requested.0, requested.1);
+                Ok(())
+            }
+            PgTransactionScope::Repository(locked_tenant, locked_repository)
+                if locked_tenant == &requested.0 && locked_repository == &requested.1 =>
+            {
+                Ok(())
+            }
+            PgTransactionScope::Repository(locked_tenant, locked_repository) => {
+                Err(Error::TransactionRepositoryScope {
+                    locked: repository_key(locked_tenant, locked_repository),
+                    requested: repository_key(tenant, repository),
+                })
+            }
+            PgTransactionScope::Lifecycle => Err(Error::TransactionLifecyclePoisoned {
+                requested: repository_key(tenant, repository),
+            }),
+        }
     }
 }
 
@@ -695,31 +816,40 @@ async fn rename_repository_in_transaction(
     repository: &RepositoryId,
     new_repository: &RepositoryId,
 ) -> Result<PgRepositoryRow> {
-    let source_exists: Option<i32> = sqlx::query_scalar(
-        "select 1 from grit_repositories
-         where tenant_id = $1 and repository_id = $2 and deleted_at is null
-         for update",
-    )
-    .bind(tenant.as_str())
-    .bind(repository.as_str())
-    .fetch_optional(&mut **tx)
-    .await?;
-    if source_exists.is_none() {
+    let (first, second) = if repository.as_str() <= new_repository.as_str() {
+        (repository, new_repository)
+    } else {
+        (new_repository, repository)
+    };
+    lock_repository_name(tx, tenant, first).await?;
+    if first != second {
+        lock_repository_name(tx, tenant, second).await?;
+    }
+    let mut source_is_live = false;
+    let mut destination_exists = false;
+    for candidate in [first, second] {
+        let is_live: Option<bool> = sqlx::query_scalar(
+            "select deleted_at is null from grit_repositories
+             where tenant_id = $1 and repository_id = $2
+             for update",
+        )
+        .bind(tenant.as_str())
+        .bind(candidate.as_str())
+        .fetch_optional(&mut **tx)
+        .await?;
+        if candidate == repository {
+            source_is_live = is_live.unwrap_or(false);
+        }
+        if candidate == new_repository {
+            destination_exists = is_live.is_some();
+        }
+    }
+    if !source_is_live {
         return Err(Error::RepositoryNotFound(repository_key(
             tenant, repository,
         )));
     }
-
-    let destination_exists: Option<i32> = sqlx::query_scalar(
-        "select 1 from grit_repositories
-         where tenant_id = $1 and repository_id = $2
-         for update",
-    )
-    .bind(tenant.as_str())
-    .bind(new_repository.as_str())
-    .fetch_optional(&mut **tx)
-    .await?;
-    if destination_exists.is_some() {
+    if destination_exists {
         return Err(Error::RepositoryAlreadyExists(repository_key(
             tenant,
             new_repository,
@@ -734,6 +864,8 @@ async fn rename_repository_in_transaction(
         "grit_tree_entries",
         "grit_commits",
         "grit_commit_parents",
+        "grit_import_state",
+        "grit_import_trusted_objects",
         "grit_packs",
         "grit_pack_objects",
     ] {
@@ -761,7 +893,14 @@ async fn rename_repository_in_transaction(
     .bind(repository.as_str())
     .bind(new_repository.as_str())
     .fetch_one(&mut **tx)
-    .await?;
+    .await
+    .map_err(|error| {
+        if is_unique_violation(&error) {
+            Error::RepositoryAlreadyExists(repository_key(tenant, new_repository))
+        } else {
+            error.into()
+        }
+    })?;
     row_to_repository(&row)
 }
 
@@ -770,6 +909,7 @@ async fn delete_repository_in_transaction(
     tenant: &TenantId,
     repository: &RepositoryId,
 ) -> Result<()> {
+    lock_repository_name(tx, tenant, repository).await?;
     let row: Option<i32> = sqlx::query_scalar(
         "select 1 from grit_repositories
          where tenant_id = $1 and repository_id = $2 and deleted_at is null
@@ -793,6 +933,8 @@ async fn delete_repository_in_transaction(
         "grit_tree_entries",
         "grit_commits",
         "grit_commit_parents",
+        "grit_import_trusted_objects",
+        "grit_import_state",
         "grit_packs",
         "grit_pack_objects",
     ] {
@@ -814,6 +956,40 @@ async fn delete_repository_in_transaction(
     Ok(())
 }
 
+/// Lock one tenant-scoped repository name until the current transaction ends.
+///
+/// PostgreSQL cannot row-lock an absent name, so lifecycle operations additionally serialize on
+/// a 64-bit advisory key derived with `hashtextextended`. The length-prefixed, domain-separated
+/// input prevents ambiguous tenant/repository concatenations. A theoretical hash collision only
+/// serializes unrelated names and cannot allow conflicting lifecycle operations to overlap.
+async fn lock_repository_name(
+    tx: &mut Transaction<'static, Postgres>,
+    tenant: &TenantId,
+    repository: &RepositoryId,
+) -> Result<()> {
+    const REPOSITORY_NAME_LOCK_SEED: i64 = 0x4752_4954_5245_504f;
+    let tenant = tenant.as_str();
+    let repository = repository.as_str();
+    let identity = format!(
+        "grit:repository-name:v1:{}:{tenant}:{}:{repository}",
+        tenant.len(),
+        repository.len()
+    );
+    sqlx::query("select pg_advisory_xact_lock(hashtextextended($1, $2))")
+        .bind(identity)
+        .bind(REPOSITORY_NAME_LOCK_SEED)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+fn is_unique_violation(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::Database(database) if database.code().as_deref() == Some("23505")
+    )
+}
+
 async fn write_object_in_transaction(
     tx: &mut Transaction<'static, Postgres>,
     tenant: &TenantId,
@@ -821,6 +997,7 @@ async fn write_object_in_transaction(
     oid: &ObjectId,
     object: &StoredObject,
 ) -> Result<()> {
+    lock_import_repository(tx, tenant, repository).await?;
     sqlx::query(
         "insert into grit_objects (tenant_id, repository_id, oid, kind, data)
          values ($1, $2, $3, $4, $5)
@@ -882,6 +1059,7 @@ pub(crate) async fn write_imported_object_rows_in_transaction(
     repository: &RepositoryId,
     rows: &[ImportedObjectRow],
 ) -> Result<()> {
+    lock_import_repository(tx, tenant, repository).await?;
     const POSTGRES_BIND_LIMIT: usize = 65_535;
     const BINDS_PER_ROW: usize = 7;
 
@@ -914,6 +1092,279 @@ pub(crate) async fn write_imported_object_rows_in_transaction(
     Ok(())
 }
 
+async fn begin_import_in_transaction(
+    tx: &mut Transaction<'static, Postgres>,
+    tenant: &TenantId,
+    repository: &RepositoryId,
+) -> Result<ImportSession> {
+    lock_import_repository(tx, tenant, repository).await?;
+    sqlx::query(
+        "insert into grit_import_state
+            (tenant_id, repository_id, generation, token, complete, published)
+         values ($1, $2, 0, 0, false, false)
+         on conflict (tenant_id, repository_id) do nothing",
+    )
+    .bind(tenant.as_str())
+    .bind(repository.as_str())
+    .execute(&mut **tx)
+    .await?;
+    let state = sqlx::query(
+        "select generation, complete from grit_import_state
+         where tenant_id = $1 and repository_id = $2
+         for update",
+    )
+    .bind(tenant.as_str())
+    .bind(repository.as_str())
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    let row = state.ok_or_else(|| Error::Backend("import state row disappeared".to_owned()))?;
+    let current: i64 = row.try_get("generation")?;
+    let generation = current
+        .checked_add(1)
+        .ok_or_else(|| Error::Backend("import generation overflow".to_owned()))?;
+    let token: i64 = sqlx::query_scalar("select nextval('grit_import_session_token_seq')")
+        .fetch_one(&mut **tx)
+        .await?;
+    let was_complete: bool = row.try_get("complete")?;
+    sqlx::query(
+        "update grit_import_state
+         set generation = $3, token = $4, complete = false, published = false
+         where tenant_id = $1 and repository_id = $2",
+    )
+    .bind(tenant.as_str())
+    .bind(repository.as_str())
+    .bind(generation)
+    .bind(token)
+    .execute(&mut **tx)
+    .await?;
+
+    let trusted_objects = if was_complete {
+        sqlx::query(
+            "select oid, kind from grit_import_trusted_objects
+             where tenant_id = $1 and repository_id = $2
+             order by oid",
+        )
+        .bind(tenant.as_str())
+        .bind(repository.as_str())
+        .fetch_all(&mut **tx)
+        .await?
+        .into_iter()
+        .map(|row| {
+            let oid: String = row.try_get("oid")?;
+            let kind: String = row.try_get("kind")?;
+            Ok((ObjectId::from_hex(&oid)?, name_to_kind(&kind)?))
+        })
+        .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+
+    Ok(ImportSession::new(
+        tenant.clone(),
+        repository.clone(),
+        u64::try_from(generation)
+            .map_err(|_| Error::Backend("import generation is negative".to_owned()))?,
+        u64::try_from(token)
+            .map_err(|_| Error::Backend("import session token is negative".to_owned()))?,
+        trusted_objects,
+    ))
+}
+
+async fn publish_import_in_transaction(
+    tx: &mut Transaction<'static, Postgres>,
+    tenant: &TenantId,
+    repository: &RepositoryId,
+    session: &ImportSession,
+    publication: &ImportPublication,
+) -> Result<ImportPublicationResult> {
+    lock_import_repository(tx, tenant, repository).await?;
+    if session.tenant() != tenant || session.repository() != repository {
+        return Err(stale_import_session(tenant, repository, session));
+    }
+    let state = sqlx::query(
+        "select generation, token, complete, published from grit_import_state
+         where tenant_id = $1 and repository_id = $2
+         for update",
+    )
+    .bind(tenant.as_str())
+    .bind(repository.as_str())
+    .fetch_optional(&mut **tx)
+    .await?;
+    let session_generation = i64::try_from(session.generation())
+        .map_err(|_| Error::Backend("import generation exceeds i64".to_owned()))?;
+    let session_token = i64::try_from(session.token())
+        .map_err(|_| Error::Backend("import session token exceeds i64".to_owned()))?;
+    let valid = state
+        .map(|row| {
+            Ok::<_, sqlx::Error>(
+                row.try_get::<i64, _>("generation")? == session_generation
+                    && row.try_get::<i64, _>("token")? == session_token
+                    && !row.try_get::<bool, _>("complete")?
+                    && !row.try_get::<bool, _>("published")?,
+            )
+        })
+        .transpose()?
+        .unwrap_or(false);
+    if !valid {
+        return Err(stale_import_session(tenant, repository, session));
+    }
+
+    for (key, value) in &publication.config_entries {
+        set_config_in_transaction(tx, tenant, repository, key, value).await?;
+    }
+    let desired_refs = publication
+        .refs
+        .iter()
+        .map(|(refname, _)| refname.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let pruned_refs = if publication.prune_deleted_refs {
+        let existing = sqlx::query_scalar::<_, String>(
+            "select refname from grit_refs
+             where tenant_id = $1 and repository_id = $2
+             order by refname",
+        )
+        .bind(tenant.as_str())
+        .bind(repository.as_str())
+        .fetch_all(&mut **tx)
+        .await?;
+        existing
+            .into_iter()
+            .filter(|refname| !desired_refs.contains(refname.as_str()))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    for refname in &pruned_refs {
+        delete_ref_in_transaction(tx, tenant, repository, refname, None).await?;
+    }
+    for (refname, value) in &publication.refs {
+        write_ref_in_transaction(tx, tenant, repository, refname, value, None).await?;
+    }
+
+    const POSTGRES_BIND_LIMIT: usize = 65_535;
+    const BINDS_PER_ROW: usize = 4;
+    for chunk in publication
+        .newly_trusted
+        .chunks(POSTGRES_BIND_LIMIT / BINDS_PER_ROW)
+    {
+        let mut query = QueryBuilder::<Postgres>::new(
+            "insert into grit_import_trusted_objects
+                (tenant_id, repository_id, oid, kind) ",
+        );
+        query.push_values(chunk, |mut row, (oid, kind)| {
+            row.push_bind(tenant.as_str())
+                .push_bind(repository.as_str())
+                .push_bind(oid.to_hex())
+                .push_bind(kind_to_name(*kind));
+        });
+        query.push(" on conflict (tenant_id, repository_id, oid) do nothing");
+        query.build().persistent(false).execute(&mut **tx).await?;
+    }
+
+    sqlx::query(
+        "update grit_import_state
+         set published = true
+         where tenant_id = $1 and repository_id = $2 and generation = $3",
+    )
+    .bind(tenant.as_str())
+    .bind(repository.as_str())
+    .bind(session_generation)
+    .execute(&mut **tx)
+    .await?;
+    Ok(ImportPublicationResult { pruned_refs })
+}
+
+async fn complete_import_in_transaction(
+    tx: &mut Transaction<'static, Postgres>,
+    tenant: &TenantId,
+    repository: &RepositoryId,
+    session: &ImportSession,
+) -> Result<()> {
+    lock_import_repository(tx, tenant, repository).await?;
+    if session.tenant() != tenant || session.repository() != repository {
+        return Err(stale_import_session(tenant, repository, session));
+    }
+    let state = sqlx::query(
+        "select generation, token, complete, published from grit_import_state
+         where tenant_id = $1 and repository_id = $2
+         for update",
+    )
+    .bind(tenant.as_str())
+    .bind(repository.as_str())
+    .fetch_optional(&mut **tx)
+    .await?;
+    let session_generation = i64::try_from(session.generation())
+        .map_err(|_| Error::Backend("import generation exceeds i64".to_owned()))?;
+    let session_token = i64::try_from(session.token())
+        .map_err(|_| Error::Backend("import session token exceeds i64".to_owned()))?;
+    let valid = state
+        .map(|row| {
+            Ok::<_, sqlx::Error>(
+                row.try_get::<i64, _>("generation")? == session_generation
+                    && row.try_get::<i64, _>("token")? == session_token
+                    && !row.try_get::<bool, _>("complete")?
+                    && row.try_get::<bool, _>("published")?,
+            )
+        })
+        .transpose()?
+        .unwrap_or(false);
+    if !valid {
+        return Err(stale_import_session(tenant, repository, session));
+    }
+    sqlx::query(
+        "update grit_import_state
+         set complete = true
+         where tenant_id = $1 and repository_id = $2 and generation = $3",
+    )
+    .bind(tenant.as_str())
+    .bind(repository.as_str())
+    .bind(session_generation)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Acquire the canonical advisory-name then live-row lock pair for a repository mutation.
+///
+/// Repeated calls for the same identity in one transaction are safe. Callers that need multiple
+/// repository identities must acquire them in deterministic identity order; the public
+/// transaction wrapper prevents arbitrary multi-repository child mutations.
+pub(crate) async fn lock_import_repository(
+    tx: &mut Transaction<'static, Postgres>,
+    tenant: &TenantId,
+    repository: &RepositoryId,
+) -> Result<()> {
+    lock_repository_name(tx, tenant, repository).await?;
+    let exists: Option<i32> = sqlx::query_scalar(
+        "select 1 from grit_repositories
+         where tenant_id = $1 and repository_id = $2 and deleted_at is null
+         for update",
+    )
+    .bind(tenant.as_str())
+    .bind(repository.as_str())
+    .fetch_optional(&mut **tx)
+    .await?;
+    if exists.is_none() {
+        return Err(Error::RepositoryNotFound(repository_key(
+            tenant, repository,
+        )));
+    }
+    Ok(())
+}
+
+fn stale_import_session(
+    tenant: &TenantId,
+    repository: &RepositoryId,
+    session: &ImportSession,
+) -> Error {
+    Error::StaleImportSession {
+        tenant: tenant.as_str().to_owned(),
+        repository: repository.as_str().to_owned(),
+        generation: session.generation(),
+    }
+}
+
 async fn write_ref_in_transaction(
     tx: &mut Transaction<'static, Postgres>,
     tenant: &TenantId,
@@ -922,6 +1373,7 @@ async fn write_ref_in_transaction(
     value: &StoredRef,
     expected: Option<Option<StoredRef>>,
 ) -> Result<()> {
+    lock_import_repository(tx, tenant, repository).await?;
     let (target_oid, symbolic_target) = ref_columns(value);
     match expected {
         None => {
@@ -1014,6 +1466,7 @@ async fn delete_ref_in_transaction(
     refname: &str,
     expected: Option<StoredRef>,
 ) -> Result<()> {
+    lock_import_repository(tx, tenant, repository).await?;
     let guarded = expected.is_some();
     let rows = match expected {
         None => {
@@ -1066,6 +1519,7 @@ async fn append_reflog_in_transaction(
     repository: &RepositoryId,
     entry: &ReflogEntry,
 ) -> Result<()> {
+    lock_import_repository(tx, tenant, repository).await?;
     sqlx::query(
         "insert into grit_reflog
             (tenant_id, repository_id, refname, old_oid, new_oid, actor, message, written_at)
@@ -1117,6 +1571,7 @@ async fn set_config_in_transaction(
     key: &str,
     value: &str,
 ) -> Result<()> {
+    lock_import_repository(tx, tenant, repository).await?;
     sqlx::query(
         "insert into grit_config (tenant_id, repository_id, key, value)
          values ($1, $2, $3, $4)
@@ -1138,6 +1593,7 @@ async fn upsert_tree_entries_in_transaction(
     repository: &RepositoryId,
     entries: &[IndexedTreeEntry],
 ) -> Result<()> {
+    lock_import_repository(tx, tenant, repository).await?;
     for entry in entries {
         let size = entry
             .size
@@ -1174,6 +1630,7 @@ async fn write_pack_in_transaction(
     repository: &RepositoryId,
     pack: &StoredPack,
 ) -> Result<PackMetadata> {
+    lock_import_repository(tx, tenant, repository).await?;
     let object_count = i32::try_from(pack.metadata.object_count)
         .map_err(|_| Error::Backend("pack object count exceeds i32".to_owned()))?;
     let size_bytes = i64::try_from(pack.metadata.size_bytes)
@@ -1238,6 +1695,47 @@ async fn write_pack_in_transaction(
 }
 
 #[async_trait]
+impl ImportStateStore for PgServerStorage {
+    async fn begin_import(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+    ) -> Result<ImportSession> {
+        let mut tx = self.pool.begin().await?;
+        let session = begin_import_in_transaction(&mut tx, tenant, repository).await?;
+        tx.commit().await?;
+        Ok(session)
+    }
+
+    async fn publish_import(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        session: &ImportSession,
+        publication: &ImportPublication,
+    ) -> Result<ImportPublicationResult> {
+        let mut tx = self.pool.begin().await?;
+        let result =
+            publish_import_in_transaction(&mut tx, tenant, repository, session, publication)
+                .await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    async fn complete_import(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        session: &ImportSession,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        complete_import_in_transaction(&mut tx, tenant, repository, session).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
 impl ObjectStore for PgServerStorage {
     async fn read_object(
         &self,
@@ -1298,6 +1796,20 @@ impl ObjectStore for PgServerStorage {
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         write_object_in_transaction(&mut tx, tenant, repository, oid, object).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn write_imported_object(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        oid: &ObjectId,
+        object: &StoredObject,
+    ) -> Result<()> {
+        let row = ImportedObjectRow::database(*oid, object.clone());
+        let mut tx = self.pool.begin().await?;
+        write_imported_object_rows_in_transaction(&mut tx, tenant, repository, &[row]).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1442,6 +1954,7 @@ impl RefStore for PgServerStorage {
         expected: Option<Option<StoredRef>>,
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
+        lock_import_repository(&mut tx, tenant, repository).await?;
         write_ref_in_transaction(&mut tx, tenant, repository, refname, value, expected).await?;
         tx.commit().await?;
         Ok(())
@@ -1455,6 +1968,7 @@ impl RefStore for PgServerStorage {
         expected: Option<StoredRef>,
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
+        lock_import_repository(&mut tx, tenant, repository).await?;
         delete_ref_in_transaction(&mut tx, tenant, repository, refname, expected).await?;
         tx.commit().await?;
         Ok(())
@@ -1563,6 +2077,7 @@ impl ConfigStore for PgServerStorage {
         value: &str,
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
+        lock_import_repository(&mut tx, tenant, repository).await?;
         set_config_in_transaction(&mut tx, tenant, repository, key, value).await?;
         tx.commit().await?;
         Ok(())
@@ -1600,6 +2115,7 @@ impl BrowseIndex for PgServerStorage {
         entries: &[IndexedTreeEntry],
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
+        lock_import_repository(&mut tx, tenant, repository).await?;
         upsert_tree_entries_in_transaction(&mut tx, tenant, repository, entries).await?;
         tx.commit().await?;
         Ok(())
@@ -1612,6 +2128,7 @@ impl BrowseIndex for PgServerStorage {
         entries: &[IndexedTreeEntry],
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
+        lock_import_repository(&mut tx, tenant, repository).await?;
         sqlx::query(
             "delete from grit_tree_entries
              where tenant_id = $1 and repository_id = $2",
@@ -1703,6 +2220,7 @@ impl CommitGraphStore for PgServerStorage {
         commits: &[IndexedCommit],
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
+        lock_import_repository(&mut tx, tenant, repository).await?;
         for commit in commits {
             let generation = i32::try_from(commit.generation)
                 .map_err(|_| Error::Backend("commit generation exceeds i32".to_owned()))?;

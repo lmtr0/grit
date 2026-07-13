@@ -4,18 +4,20 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use grit_lib::objects::{ObjectId, ObjectKind};
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::error::{Error, Result};
 use crate::external::ExternalByteStore;
 use crate::ids::{RepositoryId, TenantId};
 use crate::sqlx_postgres::{
-    write_imported_object_rows_in_transaction, ImportedObjectRow, PgServerStorage,
+    lock_import_repository, write_imported_object_rows_in_transaction, ImportedObjectRow,
+    PgServerStorage,
 };
 use crate::storage::{
-    BrowseIndex, CommitGraphStore, ConfigStore, IndexedCommit, IndexedTreeEntry, ObjectStore,
-    PackMetadata, PackObjectIndex, PackStore, RefStore, ReflogEntry, ReflogStore, StoredObject,
-    StoredPack, StoredRef,
+    BrowseIndex, CommitGraphStore, ConfigStore, ImportPublication, ImportPublicationResult,
+    ImportSession, ImportStateStore, IndexedCommit, IndexedTreeEntry, ObjectStore, PackMetadata,
+    PackObjectIndex, PackStore, RefStore, ReflogEntry, ReflogStore, StoredObject, StoredPack,
+    StoredRef,
 };
 
 /// Configuration for a PostgreSQL-backed repository that externalizes immutable bytes.
@@ -161,22 +163,14 @@ where
             return self.sql.write_object(tenant, repository, oid, object).await;
         }
 
+        let mut tx = self.pool().begin().await?;
+        lock_import_repository(&mut tx, tenant, repository).await?;
         let key = self.object_key(tenant, repository, oid);
         self.bytes.put_if_absent(&key, &object.data).await?;
-        sqlx::query(
-            "insert into grit_objects
-                (tenant_id, repository_id, oid, kind, data, storage_backend, storage_key)
-             values ($1, $2, $3, $4, null, $5, $6)
-             on conflict (tenant_id, repository_id, oid) do nothing",
-        )
-        .bind(tenant.as_str())
-        .bind(repository.as_str())
-        .bind(oid.to_hex())
-        .bind(kind_to_name(object.kind))
-        .bind(&self.options.backend_name)
-        .bind(key)
-        .execute(self.pool())
-        .await?;
+        let row =
+            ImportedObjectRow::external(*oid, object.kind, self.options.backend_name.clone(), key);
+        write_imported_object_rows_in_transaction(&mut tx, tenant, repository, &[row]).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -187,7 +181,21 @@ where
         oid: &ObjectId,
         object: &StoredObject,
     ) -> Result<()> {
-        self.write_object(tenant, repository, oid, object).await
+        if !self.options.write_loose_objects_externally {
+            return self
+                .sql
+                .write_imported_object(tenant, repository, oid, object)
+                .await;
+        }
+        let mut tx = self.pool().begin().await?;
+        lock_import_repository(&mut tx, tenant, repository).await?;
+        let key = self.object_key(tenant, repository, oid);
+        self.bytes.put_if_absent(&key, &object.data).await?;
+        let row =
+            ImportedObjectRow::external(*oid, object.kind, self.options.backend_name.clone(), key);
+        write_imported_object_rows_in_transaction(&mut tx, tenant, repository, &[row]).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn write_imported_objects(
@@ -206,6 +214,8 @@ where
             return Ok(());
         }
 
+        let mut tx = self.pool().begin().await?;
+        lock_import_repository(&mut tx, tenant, repository).await?;
         let mut rows = Vec::with_capacity(objects.len());
         for (oid, object) in objects {
             let key = self.object_key(tenant, repository, &oid);
@@ -218,7 +228,6 @@ where
             ));
         }
 
-        let mut tx = self.pool().begin().await?;
         write_imported_object_rows_in_transaction(&mut tx, tenant, repository, &rows).await?;
         tx.commit().await?;
         Ok(())
@@ -315,6 +324,41 @@ where
         .fetch_optional(self.pool())
         .await?;
         row.as_ref().map(stored_bytes_from_row).transpose()
+    }
+}
+
+#[async_trait]
+impl<B> ImportStateStore for PgExternalizedStorage<B>
+where
+    B: ExternalByteStore,
+{
+    async fn begin_import(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+    ) -> Result<ImportSession> {
+        self.sql.begin_import(tenant, repository).await
+    }
+
+    async fn publish_import(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        session: &ImportSession,
+        publication: &ImportPublication,
+    ) -> Result<ImportPublicationResult> {
+        self.sql
+            .publish_import(tenant, repository, session, publication)
+            .await
+    }
+
+    async fn complete_import(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        session: &ImportSession,
+    ) -> Result<()> {
+        self.sql.complete_import(tenant, repository, session).await
     }
 }
 
@@ -568,6 +612,8 @@ where
             return self.sql.write_pack(tenant, repository, pack).await;
         }
 
+        let mut tx = self.pool().begin().await?;
+        lock_import_repository(&mut tx, tenant, repository).await?;
         let key = self.pack_key(
             tenant,
             repository,
@@ -578,15 +624,17 @@ where
                 .unwrap_or("sha1"),
         );
         self.bytes.put_if_absent(&key, &pack.data).await?;
-        write_external_pack_metadata(
-            self.pool(),
+        let metadata = write_external_pack_metadata_in_transaction(
+            &mut tx,
             tenant,
             repository,
             pack,
             &self.options.backend_name,
             &key,
         )
-        .await
+        .await?;
+        tx.commit().await?;
+        Ok(metadata)
     }
 
     async fn read_pack_metadata(
@@ -690,21 +738,21 @@ where
     }
 }
 
-async fn write_external_pack_metadata(
-    pool: &PgPool,
+async fn write_external_pack_metadata_in_transaction(
+    tx: &mut Transaction<'static, Postgres>,
     tenant: &TenantId,
     repository: &RepositoryId,
     pack: &StoredPack,
     backend_name: &str,
     storage_key: &str,
 ) -> Result<PackMetadata> {
+    lock_import_repository(tx, tenant, repository).await?;
     let object_count = i32::try_from(pack.metadata.object_count)
         .map_err(|_| Error::Backend("pack object count exceeds i32".to_owned()))?;
     let size_bytes = i64::try_from(pack.metadata.size_bytes)
         .map_err(|_| Error::Backend("pack size exceeds i64".to_owned()))?;
     let pack_checksum = bytes_to_hex(&pack.metadata.pack_checksum);
     let index_checksum = bytes_to_hex(&pack.metadata.index_checksum);
-    let mut tx = pool.begin().await?;
     let row = sqlx::query(
         "insert into grit_packs
             (tenant_id, repository_id, pack_checksum, index_checksum, data,
@@ -722,7 +770,7 @@ async fn write_external_pack_metadata(
     .bind(storage_key)
     .bind(object_count)
     .bind(size_bytes)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
 
     sqlx::query(
@@ -732,7 +780,7 @@ async fn write_external_pack_metadata(
     .bind(tenant.as_str())
     .bind(repository.as_str())
     .bind(&pack_checksum)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
 
     for entry in &pack.index {
@@ -756,11 +804,10 @@ async fn write_external_pack_metadata(
         .bind(offset)
         .bind(size)
         .bind(compressed_size)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     }
 
-    tx.commit().await?;
     row_to_pack_metadata(&row)
 }
 

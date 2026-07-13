@@ -21,6 +21,20 @@ pub enum Error {
     /// A repository could not be created or renamed because the destination exists.
     #[error("repository already exists: {0}")]
     RepositoryAlreadyExists(String),
+    /// A multi-operation PostgreSQL transaction attempted to switch repository lock scope.
+    #[error("transaction repository scope is {locked}, cannot mutate {requested}")]
+    TransactionRepositoryScope {
+        /// Repository identity already locked by the transaction.
+        locked: String,
+        /// Different repository identity or lifecycle pair requested later.
+        requested: String,
+    },
+    /// A failed transaction-scoped lifecycle operation requires the transaction to end.
+    #[error("transaction lifecycle scope is poisoned, cannot mutate {requested}")]
+    TransactionLifecyclePoisoned {
+        /// Child or lifecycle mutation rejected after the failed lifecycle operation.
+        requested: String,
+    },
     /// A requested ref was not found.
     #[error("ref not found: {0}")]
     RefNotFound(String),
@@ -44,6 +58,16 @@ pub enum Error {
         old_oid: String,
         /// Proposed branch tip.
         new_oid: String,
+    },
+    /// An import session was stale, replayed, or used for a different repository.
+    #[error("import session {generation} is stale for {tenant}/{repository}")]
+    StaleImportSession {
+        /// Tenant whose import session was superseded.
+        tenant: String,
+        /// Repository whose import session was superseded.
+        repository: String,
+        /// Superseded repository-local import generation.
+        generation: u64,
     },
     /// A push policy hook rejected a ref update.
     #[error("push policy rejected {refname}: {reason}")]

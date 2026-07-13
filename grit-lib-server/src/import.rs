@@ -9,8 +9,8 @@ use grit_lib::repo::Repository;
 
 use crate::error::{Error, Result};
 use crate::storage::{
-    commit_time_from_identity, IndexedCommit, IndexedTreeEntry, ServerStorage, StoredObject,
-    StoredRef,
+    commit_time_from_identity, ImportPublication, IndexedCommit, IndexedTreeEntry, ServerStorage,
+    StoredObject, StoredRef,
 };
 
 const IMPORT_OBJECT_BATCH_MAX_COUNT: usize = 2_000;
@@ -102,7 +102,7 @@ pub enum ImportProgressEvent {
     },
     /// A progress checkpoint was reached.
     Checkpoint(ImportCheckpoint),
-    /// Import completed.
+    /// Durable repository publication completed and is ready for its trusted completion marker.
     Completed(ImportReport),
 }
 
@@ -126,6 +126,12 @@ where
 /// Direct entries discovered during import are upserted by immutable tree object id. Existing
 /// entries for stored objects outside the current reachable closure are preserved. Use
 /// [`crate::maintenance::repair_browse_index`] to migrate or remove legacy flattened rows.
+/// After a completed import, subsequent runs stop at object ids recorded in the durable trusted
+/// manifest. A failed run leaves the repository incomplete, so its retry traverses the source
+/// closure without trusting objects written by the partial run. Ref updates and pruning are
+/// published only after object and query-index writes finish. Progress callbacks for final config,
+/// ref, prune, and completion events run after guarded publication but before the trusted
+/// completion marker; rejecting any such event leaves the import incomplete.
 ///
 /// The `progress` callback receives events after durable writes complete. Returning an error from
 /// the callback aborts the import and returns that error.
@@ -144,85 +150,35 @@ where
     S: ServerStorage,
     P: FnMut(ImportProgressEvent) -> Result<()>,
 {
-    let mut report = ImportReport {
-        config_entries: import_config(destination, source, &mut progress).await?,
-        ..ImportReport::default()
-    };
     let mut roots = Vec::new();
-    let mut imported_refs = HashSet::new();
+    let mut desired_refs = Vec::new();
 
     if let Ok(Some(target)) = refs::read_symbolic_ref(&source.git_dir, "HEAD") {
-        destination
-            .storage()
-            .write_ref(
-                destination.tenant(),
-                destination.repository(),
-                "HEAD",
-                &StoredRef::Symbolic(target),
-                None,
-            )
-            .await?;
-        imported_refs.insert("HEAD".to_owned());
-        report.refs += 1;
-        progress(ImportProgressEvent::Ref {
-            refname: "HEAD".to_owned(),
-        })?;
+        desired_refs.push(("HEAD".to_owned(), StoredRef::Symbolic(target)));
     } else if let Ok(oid) = refs::resolve_ref(&source.git_dir, "HEAD") {
-        destination
-            .storage()
-            .write_ref(
-                destination.tenant(),
-                destination.repository(),
-                "HEAD",
-                &StoredRef::Direct(oid),
-                None,
-            )
-            .await?;
-        imported_refs.insert("HEAD".to_owned());
+        desired_refs.push(("HEAD".to_owned(), StoredRef::Direct(oid)));
         roots.push(ImportWork::Object(oid));
-        report.refs += 1;
-        progress(ImportProgressEvent::Ref {
-            refname: "HEAD".to_owned(),
-        })?;
     }
 
     for (name, oid) in refs::list_refs(&source.git_dir, "refs/")? {
-        destination
-            .storage()
-            .write_ref(
-                destination.tenant(),
-                destination.repository(),
-                &name,
-                &StoredRef::Direct(oid),
-                None,
-            )
-            .await?;
-        imported_refs.insert(name.clone());
+        desired_refs.push((name, StoredRef::Direct(oid)));
         roots.push(ImportWork::Object(oid));
-        report.refs += 1;
-        progress(ImportProgressEvent::Ref { refname: name })?;
     }
+    let config_entries = read_config(source)?;
 
-    if options.prune_deleted_refs {
-        for (refname, _) in destination.list_refs("").await? {
-            if imported_refs.contains(&refname) {
-                continue;
-            }
-            destination
-                .storage()
-                .delete_ref(
-                    destination.tenant(),
-                    destination.repository(),
-                    &refname,
-                    None,
-                )
-                .await?;
-            report.pruned_refs += 1;
-            progress(ImportProgressEvent::PrunedRef { refname })?;
-        }
-    }
+    let session = destination
+        .storage()
+        .begin_import(destination.tenant(), destination.repository())
+        .await?;
+    let trusted_objects = session
+        .trusted_objects()
+        .iter()
+        .map(|(oid, _)| *oid)
+        .collect::<HashSet<_>>();
+    let mut report = ImportReport::default();
 
     let mut seen = HashSet::new();
+    let mut newly_trusted = Vec::new();
     let mut indexed_commits = HashMap::new();
     let mut object_sizes = HashMap::new();
     let mut pending_size_entries = HashMap::<ObjectId, Vec<usize>>::new();
@@ -236,8 +192,12 @@ where
         if !seen.insert(oid) {
             continue;
         }
+        if trusted_objects.contains(&oid) {
+            continue;
+        }
         let object = source.odb.read(&oid)?;
         let stored = StoredObject::new(object.kind, object.data);
+        newly_trusted.push((oid, stored.kind));
 
         let object_size = stored.data.len() as u64;
         object_sizes.insert(oid, object_size);
@@ -324,42 +284,103 @@ where
         &mut progress,
     )
     .await?;
+    resolve_pending_tree_sizes(destination, &mut tree_entries, pending_size_entries).await?;
 
-    destination
-        .storage()
-        .upsert_tree_entries(
-            destination.tenant(),
-            destination.repository(),
-            &tree_entries,
-        )
-        .await?;
+    if !tree_entries.is_empty() {
+        destination
+            .storage()
+            .upsert_tree_entries(
+                destination.tenant(),
+                destination.repository(),
+                &tree_entries,
+            )
+            .await?;
+    }
     report.tree_entries = tree_entries.len();
     for (tree_oid, entries) in indexed_tree_batches {
         progress(ImportProgressEvent::TreeEntries { tree_oid, entries })?;
     }
 
-    compute_commit_generations(&mut indexed_commits);
+    let existing_commits = if indexed_commits.is_empty() {
+        HashMap::new()
+    } else {
+        destination
+            .storage()
+            .list_indexed_commits(destination.tenant(), destination.repository())
+            .await?
+            .into_iter()
+            .map(|commit| (commit.oid, commit))
+            .collect()
+    };
+    compute_commit_generations(&mut indexed_commits, &existing_commits);
     let mut indexed_commits = indexed_commits.into_values().collect::<Vec<_>>();
     indexed_commits.sort_by_key(|commit| commit.oid);
-    destination
+    if !indexed_commits.is_empty() {
+        destination
+            .storage()
+            .upsert_commits(
+                destination.tenant(),
+                destination.repository(),
+                &indexed_commits,
+            )
+            .await?;
+    }
+    report.commit_graph_entries = indexed_commits.len();
+
+    let publication = ImportPublication {
+        config_entries,
+        refs: desired_refs,
+        prune_deleted_refs: options.prune_deleted_refs,
+        newly_trusted,
+    };
+    let publication_result = destination
         .storage()
-        .upsert_commits(
+        .publish_import(
             destination.tenant(),
             destination.repository(),
-            &indexed_commits,
+            &session,
+            &publication,
         )
         .await?;
-    report.commit_graph_entries = indexed_commits.len();
+    report.config_entries = publication.config_entries.len();
+    for (key, _) in &publication.config_entries {
+        progress(ImportProgressEvent::ConfigEntry { key: key.clone() })?;
+    }
+    for (refname, _) in &publication.refs {
+        report.refs += 1;
+        progress(ImportProgressEvent::Ref {
+            refname: refname.clone(),
+        })?;
+    }
+    for refname in publication_result.pruned_refs {
+        report.pruned_refs += 1;
+        progress(ImportProgressEvent::PrunedRef { refname })?;
+    }
     progress(ImportProgressEvent::Completed(report.clone()))?;
+    destination
+        .storage()
+        .complete_import(destination.tenant(), destination.repository(), &session)
+        .await?;
     Ok(report)
 }
 
-fn compute_commit_generations(commits: &mut HashMap<ObjectId, IndexedCommit>) {
+fn compute_commit_generations(
+    commits: &mut HashMap<ObjectId, IndexedCommit>,
+    existing: &HashMap<ObjectId, IndexedCommit>,
+) {
     let mut remaining_parents = HashMap::with_capacity(commits.len());
     let mut children = HashMap::<ObjectId, Vec<ObjectId>>::new();
 
+    let new_oids = commits.keys().copied().collect::<HashSet<_>>();
     for commit in commits.values_mut() {
-        commit.generation = 1;
+        commit.generation = commit
+            .parents
+            .iter()
+            .filter(|parent| !new_oids.contains(parent))
+            .filter_map(|parent| existing.get(parent))
+            .map(|parent| parent.generation.saturating_add(1))
+            .max()
+            .unwrap_or(1);
     }
     for commit in commits.values() {
         let mut parent_count = 0usize;
@@ -395,35 +416,41 @@ fn compute_commit_generations(commits: &mut HashMap<ObjectId, IndexedCommit>) {
     }
 }
 
-async fn import_config<S>(
+fn read_config(source: &Repository) -> Result<Vec<(String, String)>> {
+    let config = ConfigSet::load_repo_local_only(&source.git_dir)?;
+    Ok(config
+        .entries()
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .value
+                .as_ref()
+                .map(|value| (entry.key.clone(), value.clone()))
+        })
+        .collect())
+}
+
+async fn resolve_pending_tree_sizes<S>(
     destination: &crate::repository::ServerRepository<S>,
-    source: &Repository,
-    progress: &mut impl FnMut(ImportProgressEvent) -> Result<()>,
-) -> Result<usize>
+    tree_entries: &mut [IndexedTreeEntry],
+    pending: HashMap<ObjectId, Vec<usize>>,
+) -> Result<()>
 where
     S: ServerStorage,
 {
-    let config = ConfigSet::load_repo_local_only(&source.git_dir)?;
-    let mut count = 0;
-    for entry in config.entries() {
-        let Some(value) = entry.value.as_deref() else {
-            continue;
-        };
-        destination
-            .storage()
-            .set_config(
-                destination.tenant(),
-                destination.repository(),
-                &entry.key,
-                value,
-            )
-            .await?;
-        progress(ImportProgressEvent::ConfigEntry {
-            key: entry.key.clone(),
-        })?;
-        count += 1;
+    for (oid, entry_indexes) in pending {
+        let object = destination
+            .read_object(&oid)
+            .await?
+            .ok_or_else(|| Error::ObjectNotFound(oid.to_hex()))?;
+        let size = object.data.len() as u64;
+        for entry_index in entry_indexes {
+            if let Some(entry) = tree_entries.get_mut(entry_index) {
+                entry.size = Some(size);
+            }
+        }
     }
-    Ok(count)
+    Ok(())
 }
 
 async fn flush_imported_objects<S, P>(

@@ -1,6 +1,6 @@
 //! In-memory backend for tests and local prototyping.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::RwLock;
 
 use async_trait::async_trait;
@@ -10,9 +10,10 @@ use crate::cache::{Cache, CacheKey, CacheValue, EventPublisher, InvalidationEven
 use crate::error::{Error, Result};
 use crate::ids::{RepositoryId, TenantId};
 use crate::storage::{
-    commit_time_from_identity, BrowseIndex, CommitGraphStore, ConfigStore, IndexedCommit,
-    IndexedTreeEntry, ObjectStore, PackMetadata, PackObjectIndex, PackStore, RefStore, ReflogEntry,
-    ReflogStore, StoredObject, StoredPack, StoredRef,
+    commit_time_from_identity, BrowseIndex, CommitGraphStore, ConfigStore, ImportPublication,
+    ImportPublicationResult, ImportSession, ImportStateStore, IndexedCommit, IndexedTreeEntry,
+    ObjectStore, PackMetadata, PackObjectIndex, PackStore, RefStore, ReflogEntry, ReflogStore,
+    StoredObject, StoredPack, StoredRef,
 };
 
 type RepoKey = (TenantId, RepositoryId);
@@ -24,6 +25,15 @@ type CommitKey = (RepoKey, ObjectId);
 type CacheEntryKey = (RepoKey, CacheKey);
 type PackKey = (RepoKey, Vec<u8>);
 
+#[derive(Default)]
+struct MemoryImportState {
+    generation: u64,
+    token: u64,
+    complete: bool,
+    published: bool,
+    trusted_objects: HashMap<ObjectId, ObjectKind>,
+}
+
 /// In-memory repository backend.
 #[derive(Default)]
 pub struct MemoryBackend {
@@ -33,10 +43,159 @@ pub struct MemoryBackend {
     config: RwLock<BTreeMap<ConfigKey, String>>,
     trees: RwLock<BTreeMap<TreeKey, IndexedTreeEntry>>,
     commits: RwLock<BTreeMap<CommitKey, IndexedCommit>>,
+    imports: RwLock<HashMap<RepoKey, MemoryImportState>>,
+    import_sequence: RwLock<u64>,
     packs: RwLock<HashMap<PackKey, StoredPack>>,
     pack_sequence: RwLock<u64>,
     cache: RwLock<HashMap<CacheEntryKey, CacheValue>>,
     events: RwLock<Vec<InvalidationEvent>>,
+}
+
+#[async_trait]
+impl ImportStateStore for MemoryBackend {
+    async fn begin_import(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+    ) -> Result<ImportSession> {
+        let token = {
+            let mut sequence = self
+                .import_sequence
+                .write()
+                .map_err(|_| Error::Backend("memory import sequence lock poisoned".to_owned()))?;
+            *sequence = sequence
+                .checked_add(1)
+                .ok_or_else(|| Error::Backend("import session token overflow".to_owned()))?;
+            *sequence
+        };
+        let mut imports = self
+            .imports
+            .write()
+            .map_err(|_| Error::Backend("memory import state lock poisoned".to_owned()))?;
+        let state = imports.entry(repo_key(tenant, repository)).or_default();
+        let mut trusted_objects = if state.complete {
+            state
+                .trusted_objects
+                .iter()
+                .map(|(oid, kind)| (*oid, *kind))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        trusted_objects.sort_by_key(|(oid, _)| *oid);
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| Error::Backend("import generation overflow".to_owned()))?;
+        state.complete = false;
+        state.published = false;
+        state.token = token;
+        Ok(ImportSession::new(
+            tenant.clone(),
+            repository.clone(),
+            state.generation,
+            token,
+            trusted_objects,
+        ))
+    }
+
+    async fn publish_import(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        session: &ImportSession,
+        publication: &ImportPublication,
+    ) -> Result<ImportPublicationResult> {
+        let repo = repo_key(tenant, repository);
+        let mut imports = self
+            .imports
+            .write()
+            .map_err(|_| Error::Backend("memory import state lock poisoned".to_owned()))?;
+        let state = imports.entry(repo.clone()).or_default();
+        if session.tenant() != tenant
+            || session.repository() != repository
+            || state.generation != session.generation()
+            || state.token != session.token()
+            || state.complete
+            || state.published
+        {
+            return Err(stale_import_session(tenant, repository, session));
+        }
+
+        let mut config = self
+            .config
+            .write()
+            .map_err(|_| Error::Backend("memory config lock poisoned".to_owned()))?;
+        let mut refs = self
+            .refs
+            .write()
+            .map_err(|_| Error::Backend("memory ref lock poisoned".to_owned()))?;
+        for (key, value) in &publication.config_entries {
+            config.insert((repo.clone(), key.clone()), value.clone());
+        }
+        let desired = publication
+            .refs
+            .iter()
+            .map(|(refname, _)| refname.as_str())
+            .collect::<HashSet<_>>();
+        let pruned_refs = if publication.prune_deleted_refs {
+            refs.keys()
+                .filter(|(candidate_repo, refname)| {
+                    candidate_repo == &repo && !desired.contains(refname.as_str())
+                })
+                .map(|(_, refname)| refname.clone())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        for refname in &pruned_refs {
+            refs.remove(&(repo.clone(), refname.clone()));
+        }
+        for (refname, value) in &publication.refs {
+            refs.insert((repo.clone(), refname.clone()), value.clone());
+        }
+        state
+            .trusted_objects
+            .extend(publication.newly_trusted.iter().copied());
+        state.published = true;
+        Ok(ImportPublicationResult { pruned_refs })
+    }
+
+    async fn complete_import(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        session: &ImportSession,
+    ) -> Result<()> {
+        let mut imports = self
+            .imports
+            .write()
+            .map_err(|_| Error::Backend("memory import state lock poisoned".to_owned()))?;
+        let state = imports.entry(repo_key(tenant, repository)).or_default();
+        if session.tenant() != tenant
+            || session.repository() != repository
+            || state.generation != session.generation()
+            || state.token != session.token()
+            || state.complete
+            || !state.published
+        {
+            return Err(stale_import_session(tenant, repository, session));
+        }
+        state.complete = true;
+        Ok(())
+    }
+}
+
+fn stale_import_session(
+    tenant: &TenantId,
+    repository: &RepositoryId,
+    session: &ImportSession,
+) -> Error {
+    Error::StaleImportSession {
+        tenant: tenant.as_str().to_owned(),
+        repository: repository.as_str().to_owned(),
+        generation: session.generation(),
+    }
 }
 
 fn repo_key(tenant: &TenantId, repository: &RepositoryId) -> RepoKey {
