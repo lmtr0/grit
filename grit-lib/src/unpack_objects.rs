@@ -775,14 +775,34 @@ impl PackReader {
     fn read_type_size(&mut self) -> Result<(u8, usize)> {
         let c = self.read_byte()?;
         let type_code = (c >> 4) & 0x7;
-        let mut size = (c & 0x0f) as usize;
+        let mut size = u64::from(c & 0x0f);
         let mut shift = 4u32;
         let mut cur = c;
         while cur & 0x80 != 0 {
             cur = self.read_byte()?;
-            size |= ((cur & 0x7f) as usize) << shift;
-            shift += 7;
+            let part_bits = u64::from(cur & 0x7f);
+            if shift >= u64::BITS || part_bits > (u64::MAX >> shift) {
+                return Err(Error::CorruptObject(
+                    "pack object size header overflow".to_owned(),
+                ));
+            }
+            size = size.checked_add(part_bits << shift).ok_or_else(|| {
+                Error::CorruptObject("pack object size header overflow".to_owned())
+            })?;
+            if cur & 0x80 != 0 {
+                shift = shift.checked_add(7).ok_or_else(|| {
+                    Error::CorruptObject("pack object size header is too long".to_owned())
+                })?;
+                if shift >= u64::BITS {
+                    return Err(Error::CorruptObject(
+                        "pack object size header is too long".to_owned(),
+                    ));
+                }
+            }
         }
+        let size = usize::try_from(size).map_err(|_| {
+            Error::CorruptObject("pack object size exceeds the platform address space".to_owned())
+        })?;
         Ok((type_code, size))
     }
 
@@ -795,7 +815,11 @@ impl PackReader {
         let mut value = (c & 0x7f) as usize;
         while c & 0x80 != 0 {
             c = self.read_byte()?;
-            value = (value + 1) << 7 | (c & 0x7f) as usize;
+            value = value
+                .checked_add(1)
+                .and_then(|value| value.checked_mul(1 << 7))
+                .map(|value| value | usize::from(c & 0x7f))
+                .ok_or_else(|| Error::CorruptObject("ofs-delta offset overflow".to_owned()))?;
         }
         Ok(value)
     }
@@ -807,10 +831,32 @@ impl PackReader {
     fn decompress(&mut self, expected_size: usize) -> Result<Vec<u8>> {
         let slice = &self.data[self.pos..];
         let mut decoder = ZlibDecoder::new(slice);
-        let mut out = Vec::with_capacity(expected_size);
-        decoder
-            .read_to_end(&mut out)
-            .map_err(|e| Error::Zlib(e.to_string()))?;
+        let mut out = Vec::new();
+        out.try_reserve(expected_size.min(64 * 1024))
+            .map_err(|error| {
+                Error::CorruptObject(format!("cannot reserve pack object buffer: {error}"))
+            })?;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = decoder
+                .read(&mut buffer)
+                .map_err(|error| Error::Zlib(error.to_string()))?;
+            if read == 0 {
+                break;
+            }
+            let new_len = out.len().checked_add(read).ok_or_else(|| {
+                Error::CorruptObject("decompressed pack object size overflow".to_owned())
+            })?;
+            if new_len > expected_size {
+                return Err(Error::CorruptObject(format!(
+                    "pack object exceeds declared size {expected_size}"
+                )));
+            }
+            out.try_reserve(read).map_err(|error| {
+                Error::CorruptObject(format!("cannot grow pack object buffer: {error}"))
+            })?;
+            out.extend_from_slice(&buffer[..read]);
+        }
         if out.len() != expected_size {
             return Err(Error::CorruptObject(format!(
                 "decompressed {} bytes but expected {}",
@@ -818,7 +864,12 @@ impl PackReader {
                 expected_size
             )));
         }
-        self.pos += decoder.total_in() as usize;
+        let consumed = usize::try_from(decoder.total_in()).map_err(|_| {
+            Error::CorruptObject("compressed pack object size exceeds usize".to_owned())
+        })?;
+        self.pos = self.pos.checked_add(consumed).ok_or_else(|| {
+            Error::CorruptObject("compressed pack object position overflow".to_owned())
+        })?;
         Ok(out)
     }
 }
@@ -873,6 +924,14 @@ impl<'a> StreamingPackReader<'a> {
                 ));
             }
         }
+        Ok(())
+    }
+
+    fn append_pending(&mut self, bytes: &[u8]) -> Result<()> {
+        self.pending.try_reserve(bytes.len()).map_err(|error| {
+            Error::CorruptObject(format!("cannot grow compressed pack buffer: {error}"))
+        })?;
+        self.pending.extend_from_slice(bytes);
         Ok(())
     }
 
@@ -941,14 +1000,34 @@ impl<'a> StreamingPackReader<'a> {
     fn read_type_size(&mut self) -> Result<(u8, usize)> {
         let c = self.read_byte()?;
         let type_code = (c >> 4) & 0x7;
-        let mut size = (c & 0x0f) as usize;
+        let mut size = u64::from(c & 0x0f);
         let mut shift = 4u32;
         let mut cur = c;
         while cur & 0x80 != 0 {
             cur = self.read_byte()?;
-            size |= ((cur & 0x7f) as usize) << shift;
-            shift += 7;
+            let part_bits = u64::from(cur & 0x7f);
+            if shift >= u64::BITS || part_bits > (u64::MAX >> shift) {
+                return Err(Error::CorruptObject(
+                    "pack object size header overflow".to_owned(),
+                ));
+            }
+            size = size.checked_add(part_bits << shift).ok_or_else(|| {
+                Error::CorruptObject("pack object size header overflow".to_owned())
+            })?;
+            if cur & 0x80 != 0 {
+                shift = shift.checked_add(7).ok_or_else(|| {
+                    Error::CorruptObject("pack object size header is too long".to_owned())
+                })?;
+                if shift >= u64::BITS {
+                    return Err(Error::CorruptObject(
+                        "pack object size header is too long".to_owned(),
+                    ));
+                }
+            }
         }
+        let size = usize::try_from(size).map_err(|_| {
+            Error::CorruptObject("pack object size exceeds the platform address space".to_owned())
+        })?;
         Ok((type_code, size))
     }
 
@@ -957,7 +1036,11 @@ impl<'a> StreamingPackReader<'a> {
         let mut value = (c & 0x7f) as usize;
         while c & 0x80 != 0 {
             c = self.read_byte()?;
-            value = (value + 1) << 7 | (c & 0x7f) as usize;
+            value = value
+                .checked_add(1)
+                .and_then(|value| value.checked_mul(1 << 7))
+                .map(|value| value | usize::from(c & 0x7f))
+                .ok_or_else(|| Error::CorruptObject("ofs-delta offset overflow".to_owned()))?;
         }
         Ok(value)
     }
@@ -984,7 +1067,11 @@ impl<'a> StreamingPackReader<'a> {
                 let mut sink = [0u8; 1];
                 match z.read(&mut sink) {
                     Ok(0) => {
-                        let consumed = z.total_in() as usize;
+                        let consumed = usize::try_from(z.total_in()).map_err(|_| {
+                            Error::CorruptObject(
+                                "compressed pack object size exceeds usize".to_owned(),
+                            )
+                        })?;
                         if consumed > self.pending.len() {
                             return Err(Error::CorruptObject(
                                 "zlib total_in exceeds pending buffer".to_owned(),
@@ -998,11 +1085,14 @@ impl<'a> StreamingPackReader<'a> {
                                     self.stream_pos
                                 )));
                             }
-                            self.pending.extend_from_slice(&scratch[..n]);
+                            self.append_pending(&scratch[..n])?;
                             continue;
                         }
                         self.pack_hasher.update(&self.pending[..consumed]);
-                        self.stream_pos += consumed;
+                        self.stream_pos =
+                            self.stream_pos.checked_add(consumed).ok_or_else(|| {
+                                Error::CorruptObject("pack stream position overflow".to_owned())
+                            })?;
                         self.pending.drain(..consumed);
                         self.enforce_max_input()?;
                         return Ok(Vec::new());
@@ -1020,7 +1110,7 @@ impl<'a> StreamingPackReader<'a> {
                                 self.stream_pos
                             )));
                         }
-                        self.pending.extend_from_slice(&scratch[..n]);
+                        self.append_pending(&scratch[..n])?;
                     }
                     Err(e) => return Err(Error::Zlib(e.to_string())),
                 }
@@ -1030,9 +1120,12 @@ impl<'a> StreamingPackReader<'a> {
         const CHUNK: usize = 64 * 1024;
         let mut scratch = [0u8; CHUNK];
 
-        let mut out = vec![0u8; expected_size];
+        let mut out = Vec::new();
+        out.try_reserve(expected_size.min(CHUNK)).map_err(|error| {
+            Error::CorruptObject(format!("cannot reserve pack object buffer: {error}"))
+        })?;
         let mut z = Decompress::new(true);
-        let mut out_pos = 0usize;
+        let mut output = [0u8; CHUNK];
         let mut eof = false;
         loop {
             if self.pending.is_empty() && !eof {
@@ -1040,7 +1133,7 @@ impl<'a> StreamingPackReader<'a> {
                 if n == 0 {
                     eof = true;
                 } else {
-                    self.pending.extend_from_slice(&scratch[..n]);
+                    self.append_pending(&scratch[..n])?;
                 }
             }
 
@@ -1053,38 +1146,58 @@ impl<'a> StreamingPackReader<'a> {
             let before_in = z.total_in();
             let before_out = z.total_out();
             let status = z
-                .decompress(self.pending.as_slice(), &mut out[out_pos..], flush)
+                .decompress(self.pending.as_slice(), &mut output, flush)
                 .map_err(|e| Error::Zlib(e.to_string()))?;
-            let consumed = (z.total_in() - before_in) as usize;
+            let consumed = usize::try_from(z.total_in() - before_in).map_err(|_| {
+                Error::CorruptObject("compressed pack object size exceeds usize".to_owned())
+            })?;
             if consumed > self.pending.len() {
                 return Err(Error::CorruptObject(
                     "zlib consumed more than pending buffer".to_owned(),
                 ));
             }
             self.pack_hasher.update(&self.pending[..consumed]);
-            self.stream_pos += consumed;
+            self.stream_pos = self
+                .stream_pos
+                .checked_add(consumed)
+                .ok_or_else(|| Error::CorruptObject("pack stream position overflow".to_owned()))?;
             self.pending.drain(..consumed);
             self.enforce_max_input()?;
-            out_pos += (z.total_out() - before_out) as usize;
+            let produced = usize::try_from(z.total_out() - before_out).map_err(|_| {
+                Error::CorruptObject("decompressed pack object size exceeds usize".to_owned())
+            })?;
+            let new_len = out.len().checked_add(produced).ok_or_else(|| {
+                Error::CorruptObject("decompressed pack object size overflow".to_owned())
+            })?;
+            if new_len > expected_size {
+                return Err(Error::CorruptObject(format!(
+                    "pack object exceeds declared size {expected_size}"
+                )));
+            }
+            out.try_reserve(produced).map_err(|error| {
+                Error::CorruptObject(format!("cannot grow pack object buffer: {error}"))
+            })?;
+            out.extend_from_slice(&output[..produced]);
 
             match status {
                 Status::StreamEnd => {
-                    if out_pos != expected_size {
+                    if out.len() != expected_size {
                         return Err(Error::CorruptObject(format!(
-                            "decompressed size mismatch: got {out_pos}, want {expected_size}"
+                            "decompressed size mismatch: got {}, want {expected_size}",
+                            out.len()
                         )));
                     }
                     return Ok(out);
                 }
                 Status::Ok | Status::BufError => {
-                    if consumed == 0 && !eof {
+                    if consumed == 0 && produced == 0 && !eof {
                         let n = self.inner.read(&mut scratch).map_err(Error::Io)?;
                         if n == 0 {
                             eof = true;
                         } else {
-                            self.pending.extend_from_slice(&scratch[..n]);
+                            self.append_pending(&scratch[..n])?;
                         }
-                    } else if eof && self.pending.is_empty() && out_pos != expected_size {
+                    } else if eof && self.pending.is_empty() && out.len() != expected_size {
                         return Err(Error::CorruptObject(format!(
                             "pack stream truncated (zlib) at offset {}",
                             self.stream_pos
@@ -1149,7 +1262,12 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
         )));
     }
     let dest_size = read_delta_varint(delta, &mut pos)?;
-    let mut result = Vec::with_capacity(dest_size);
+    let mut result = Vec::new();
+    result
+        .try_reserve(dest_size.min(64 * 1024))
+        .map_err(|error| {
+            Error::CorruptObject(format!("cannot reserve delta result buffer: {error}"))
+        })?;
 
     while pos < delta.len() {
         let cmd = delta[pos];
@@ -1198,15 +1316,18 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
                     base.len()
                 ))
             })?;
-            result.extend_from_slice(chunk);
+            extend_delta_result(&mut result, chunk, dest_size)?;
         } else {
             // INSERT instruction: copy the next `cmd` literal bytes verbatim.
             let n = cmd as usize;
+            let end = pos.checked_add(n).ok_or_else(|| {
+                Error::CorruptObject("delta INSERT range overflows usize".to_owned())
+            })?;
             let chunk = delta
-                .get(pos..pos + n)
+                .get(pos..end)
                 .ok_or_else(|| Error::CorruptObject("truncated delta INSERT data".to_owned()))?;
-            result.extend_from_slice(chunk);
-            pos += n;
+            extend_delta_result(&mut result, chunk, dest_size)?;
+            pos = end;
         }
     }
 
@@ -1220,6 +1341,23 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
     Ok(result)
 }
 
+fn extend_delta_result(result: &mut Vec<u8>, chunk: &[u8], expected_size: usize) -> Result<()> {
+    let new_len = result
+        .len()
+        .checked_add(chunk.len())
+        .ok_or_else(|| Error::CorruptObject("delta result size overflow".to_owned()))?;
+    if new_len > expected_size {
+        return Err(Error::CorruptObject(format!(
+            "delta result exceeds declared size {expected_size}"
+        )));
+    }
+    result.try_reserve(chunk.len()).map_err(|error| {
+        Error::CorruptObject(format!("cannot grow delta result buffer: {error}"))
+    })?;
+    result.extend_from_slice(chunk);
+    Ok(())
+}
+
 /// Read a variable-length little-endian integer from `data` starting at `*pos`.
 ///
 /// Advances `*pos` past the consumed bytes.
@@ -1231,10 +1369,21 @@ fn read_delta_varint(data: &[u8], pos: &mut usize) -> Result<usize> {
             .get(*pos)
             .ok_or_else(|| Error::CorruptObject("truncated delta varint".to_owned()))?;
         *pos += 1;
-        value |= ((b & 0x7f) as usize) << shift;
-        shift += 7;
+        let part_bits = usize::from(b & 0x7f);
+        if shift >= usize::BITS || part_bits > (usize::MAX >> shift) {
+            return Err(Error::CorruptObject("delta varint overflow".to_owned()));
+        }
+        value = value
+            .checked_add(part_bits << shift)
+            .ok_or_else(|| Error::CorruptObject("delta varint overflow".to_owned()))?;
         if b & 0x80 == 0 {
             break;
+        }
+        shift = shift
+            .checked_add(7)
+            .ok_or_else(|| Error::CorruptObject("delta varint overflow".to_owned()))?;
+        if shift >= usize::BITS {
+            return Err(Error::CorruptObject("delta varint overflow".to_owned()));
         }
     }
     Ok(value)

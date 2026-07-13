@@ -11,9 +11,9 @@ use crate::error::{Error, Result};
 use crate::ids::{RepositoryId, TenantId};
 use crate::storage::{
     BrowseIndex, CommitGraphStore, ConfigStore, ImportPublication, ImportPublicationResult,
-    ImportSession, ImportStateStore, IndexedCommit, IndexedTreeEntry, ObjectStore, PackMetadata,
-    PackObjectIndex, PackStore, RefStore, ReflogEntry, ReflogStore, StoredObject, StoredPack,
-    StoredRef,
+    ImportSession, ImportStateStore, ImportedPack, IndexedCommit, IndexedTreeEntry, ObjectStore,
+    PackMetadata, PackObjectIndex, PackStore, RefStore, ReflogEntry, ReflogStore, StoredObject,
+    StoredPack, StoredRef,
 };
 
 /// Storage wrapper that caches immutable repository data.
@@ -494,6 +494,24 @@ where
     S: PackStore,
     C: Cache,
 {
+    fn supports_native_pack_import(&self) -> bool {
+        self.storage.supports_native_pack_import()
+    }
+
+    async fn write_imported_packs(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        packs: Vec<ImportedPack>,
+    ) -> Result<Vec<PackMetadata>> {
+        let metadata = self
+            .storage
+            .write_imported_packs(tenant, repository, packs)
+            .await?;
+        self.cache.invalidate_repository(tenant, repository).await?;
+        Ok(metadata)
+    }
+
     async fn write_pack(
         &self,
         tenant: &TenantId,
@@ -537,6 +555,18 @@ where
     ) -> Result<Option<Vec<u8>>> {
         self.storage
             .read_pack_range(tenant, repository, pack_checksum, start, len)
+            .await
+    }
+
+    async fn read_packed_object_data(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        pack_checksum: &[u8],
+        oid: &ObjectId,
+    ) -> Result<Option<StoredObject>> {
+        self.storage
+            .read_packed_object_data(tenant, repository, pack_checksum, oid)
             .await
     }
 

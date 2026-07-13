@@ -30,6 +30,35 @@ The example below uses:
 - `grit_lib::repo::Repository`
 - `grit_lib::objects::HashAlgo`
 
+### Memory import pack modes
+
+`ImportOptions::default()` uses `NativePackImportMode::Reachable`. With
+`MemoryBackend`, a self-contained local source pack is retained as shared immutable bytes only
+when every object in that pack belongs to the imported closure or the manifest from a previously
+completed import. Mixed reachable/unreachable, promisor, thin, corrupt, or hash-incompatible packs
+automatically use the ordinary loose-object traversal. Backends that do not advertise native pack
+support are unchanged.
+
+Retention verifies one immutable version-2 index snapshot, binds its embedded pack checksum to the
+validated pack trailer, and checks every index CRC against the corresponding packed byte span.
+Before any eligible pack is published, every object—including every blob—is fully decoded and
+canonical-hash verified. Resolved payloads are discarded after validation rather than retained as
+loose copies; the delta-base cache remains bounded, with peak transient memory additionally
+depending on the largest active object/delta chain being verified. FullMirror applies this
+validation to unreachable packed objects as well. Pack-native import therefore removes retained
+uncompressed object storage,
+duplicate long-lived allocations, and later whole-pack copies, but it deliberately retains the
+serial decode CPU needed to prove that every published object is readable. Bounded parallel
+validation is a separate optimization for wall time. These checks protect against corrupt or
+mismatched source files; the source checksums are integrity checks, not signatures for accepting an
+adversarial repository as trusted input.
+
+Set `native_pack_import` to `Disabled` for the portable traversal unconditionally, or to
+`FullMirror` to retain all compatible local packs and copy local loose objects, including
+unreachable objects. `ImportReport::full_mirror_completed` distinguishes a complete local mirror
+from a run that safely fell back for an incompatible pack. Alternates are copied only when their
+objects are reachable; they are not part of the local full mirror.
+
 ## Minimal Dependencies
 
 For a standalone test project near this workspace, use:

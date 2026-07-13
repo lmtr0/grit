@@ -39,7 +39,7 @@ and uses `BTreeMap` nodes, so its actual overhead is higher.
 | P1 | Add owned, byte-bounded bulk storage methods | Reduces copying, locks, futures, and allocator traffic | Per-object overhead to per-batch overhead |
 | P1 | Make re-import genuinely incremental | Avoids recopying the complete reachable closure | Full closure to new closure on normal updates |
 | P2 | Shard memory state by repository and store keys once | Reduces row size and comparison/allocation cost | Lower constants and faster lookup |
-| P2 | Add pack-native import after fixing packed lookup | Avoids inflating and storing every blob separately | Proportional to pack/index bytes rather than uncompressed object bytes |
+| P2 | Add pack-native import after fixing packed lookup | Avoids retaining every decoded blob separately | Retained memory tracks pack/index bytes; validation still decodes every retained object |
 | P3 | Add bounded parallel decode/read stages | Uses available CPU without unbounded memory growth | Wall-time improvement only after P0/P1 fixes |
 
 ## P0: replace flattened browse snapshots with Git-native tree indexing
@@ -279,6 +279,27 @@ fixing the current memory packed-object lookup first:
 After those prerequisites, direct ingestion of compatible source packs plus a
 small loose-object overlay is likely the best long-term representation for a
 large in-memory hosted repository.
+
+Implemented: `MemoryBackend` now retains pack bytes behind shared immutable
+storage, uses a repository-local `ObjectId -> newest PackLocation` index, and
+decodes directly from the shared pack with the bounded delta-base cache in
+`grit-lib`. Import options expose reachable-only and full-local-mirror modes.
+Only self-contained, hash-compatible local packs with a checksum-valid
+version-2 index cryptographically bound to the pack trailer and matching entry
+CRCs are retained. Before publication, every retained object is fully decoded,
+its delta program is applied, and its kind, size, and canonical SHA-1 or SHA-256
+object ID are verified. Each resolved payload is discarded after validation;
+the 96 MiB bounded delta-base cache plus the active object's delta-chain buffers
+remain transient, rather than one uncompressed allocation per imported object.
+FullMirror performs the same validation for unreachable packed objects.
+Consequently, pack-native import primarily removes retained uncompressed
+storage, duplicate long-lived allocation, and whole-pack copies—it does not
+remove decode CPU. The bounded parallel validation described in P3 is the next
+step for reducing wall time. Promisor, thin, corrupt, mixed-reachability,
+alternate, or backend-unsupported cases fall back to the portable reachable
+object traversal. Reachable eligibility includes the durable manifest from a
+previously completed import, so an incremental import does not reject a pack
+merely because its older reachable members were intentionally traversal stops.
 
 ## P3: use bounded parallelism only after reducing the work
 

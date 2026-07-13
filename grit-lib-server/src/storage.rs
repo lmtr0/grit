@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use grit_lib::objects::{HashAlgo, ObjectId, ObjectKind};
 use sha1::{Digest as _, Sha1};
 use sha2::Sha256;
+use std::sync::Arc;
 use time::OffsetDateTime;
 
 use crate::error::Result;
@@ -53,7 +54,8 @@ pub struct PackObjectIndex {
     pub offset: u64,
     /// Uncompressed object payload size.
     pub size: u64,
-    /// Compressed object stream size.
+    /// Compressed object stream size, or a conservative complete entry span for a retained native
+    /// source pack. Callers may safely use it as a range-read lower bound.
     pub compressed_size: u64,
 }
 
@@ -64,6 +66,17 @@ pub struct StoredPack {
     pub metadata: PackMetadata,
     /// Complete raw PACK bytes.
     pub data: Vec<u8>,
+    /// Object index rows in pack order.
+    pub index: Vec<PackObjectIndex>,
+}
+
+/// Validated source pack retained through a shared immutable byte allocation during import.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportedPack {
+    /// Pack metadata.
+    pub metadata: PackMetadata,
+    /// Complete raw PACK bytes shared with the source object database's pack cache.
+    pub data: Arc<Vec<u8>>,
     /// Object index rows in pack order.
     pub index: Vec<PackObjectIndex>,
 }
@@ -624,6 +637,36 @@ pub trait CommitGraphStore: Send + Sync {
 /// Packfile storage operations for one hosted repository.
 #[async_trait]
 pub trait PackStore: Send + Sync {
+    /// Return whether this backend can ingest and resolve delta-capable source packs directly.
+    ///
+    /// The default is `false`; importers must retain their loose-object traversal path unless a
+    /// backend explicitly opts in.
+    fn supports_native_pack_import(&self) -> bool {
+        false
+    }
+
+    /// Atomically install an owned batch of source packs during repository import.
+    ///
+    /// This method is called only when [`Self::supports_native_pack_import`] returns `true` and
+    /// every pack has been validated as self-contained and compatible with the repository hash
+    /// algorithm. The shared byte allocation allows capable backends to retain the source ODB
+    /// cache entry without another full copy. The default rejects the operation so unsupported
+    /// backends continue through the importer's loose-object fallback.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend or protocol error if the complete batch cannot be installed.
+    async fn write_imported_packs(
+        &self,
+        _tenant: &TenantId,
+        _repository: &RepositoryId,
+        _packs: Vec<ImportedPack>,
+    ) -> Result<Vec<PackMetadata>> {
+        Err(crate::error::Error::Backend(
+            "native pack import is not supported by this backend".to_owned(),
+        ))
+    }
+
     /// Store a packfile and its object index rows.
     async fn write_pack(
         &self,
@@ -679,6 +722,21 @@ pub trait PackStore: Send + Sync {
             return Ok(Some(Vec::new()));
         }
         Ok(Some(data[start..end.min(data.len())].to_vec()))
+    }
+
+    /// Decode one object from a stored pack using backend-native shared data and indexes.
+    ///
+    /// Returning `None` asks the repository layer to use its portable range/full-pack decoder.
+    /// Backends that opt into native source-pack import should override this so delta-capable
+    /// reads do not copy the complete pack.
+    async fn read_packed_object_data(
+        &self,
+        _tenant: &TenantId,
+        _repository: &RepositoryId,
+        _pack_checksum: &[u8],
+        _oid: &ObjectId,
+    ) -> Result<Option<StoredObject>> {
+        Ok(None)
     }
 
     /// Return the newest packed representation for an object id.

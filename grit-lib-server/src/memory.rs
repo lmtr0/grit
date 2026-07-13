@@ -1,19 +1,21 @@
 //! In-memory backend for tests and local prototyping.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use grit_lib::objects::{parse_commit, ObjectId, ObjectKind};
+use grit_lib::pack::{PackIndex, PackIndexEntry};
 
 use crate::cache::{Cache, CacheKey, CacheValue, EventPublisher, InvalidationEvent};
 use crate::error::{Error, Result};
 use crate::ids::{RepositoryId, TenantId};
 use crate::storage::{
     commit_time_from_identity, BrowseIndex, CommitGraphStore, ConfigStore, ImportPublication,
-    ImportPublicationResult, ImportSession, ImportStateStore, IndexedCommit, IndexedTreeEntry,
-    ObjectStore, PackMetadata, PackObjectIndex, PackStore, RefStore, ReflogEntry, ReflogStore,
-    StoredObject, StoredPack, StoredRef,
+    ImportPublicationResult, ImportSession, ImportStateStore, ImportedPack, IndexedCommit,
+    IndexedTreeEntry, ObjectStore, PackMetadata, PackObjectIndex, PackStore, RefStore, ReflogEntry,
+    ReflogStore, StoredObject, StoredPack, StoredRef,
 };
 
 type TreeKey = (ObjectId, String);
@@ -36,8 +38,34 @@ struct RepoState {
     trees: RwLock<BTreeMap<TreeKey, IndexedTreeEntry>>,
     commits: RwLock<BTreeMap<ObjectId, IndexedCommit>>,
     import: RwLock<MemoryImportState>,
-    packs: RwLock<HashMap<Vec<u8>, StoredPack>>,
+    packs: RwLock<MemoryPackState>,
     cache: RwLock<HashMap<CacheKey, CacheValue>>,
+}
+
+#[derive(Default)]
+struct MemoryPackState {
+    by_checksum: HashMap<Vec<u8>, Arc<MemoryPack>>,
+    newest_by_oid: HashMap<ObjectId, PackLocation>,
+}
+
+struct MemoryPack {
+    metadata: PackMetadata,
+    data: Arc<Vec<u8>>,
+    entries: Vec<PackObjectIndex>,
+    decode_index: PackIndex,
+}
+
+#[derive(Clone)]
+struct PackLocation {
+    pack: Arc<MemoryPack>,
+    entry_index: usize,
+}
+
+struct PreparedMemoryPack {
+    metadata: PackMetadata,
+    data: Arc<Vec<u8>>,
+    entries: Vec<PackObjectIndex>,
+    decode_index: PackIndex,
 }
 
 /// In-memory repository backend with repository-scoped row storage.
@@ -298,38 +326,152 @@ impl MemoryBackend {
     }
 
     fn next_pack_order(&self) -> Result<u64> {
+        self.reserve_pack_orders(1)
+    }
+
+    fn reserve_pack_orders(&self, count: usize) -> Result<u64> {
         let mut sequence = self
             .pack_sequence
             .write()
             .map_err(|_| Error::Backend("memory pack sequence lock poisoned".to_owned()))?;
-        *sequence = sequence.saturating_add(1);
-        Ok(*sequence)
+        let count = u64::try_from(count)
+            .map_err(|_| Error::Backend("memory pack count exceeds u64".to_owned()))?;
+        let first = sequence
+            .checked_add(1)
+            .ok_or_else(|| Error::Backend("memory pack storage order overflow".to_owned()))?;
+        *sequence = sequence
+            .checked_add(count)
+            .ok_or_else(|| Error::Backend("memory pack storage order overflow".to_owned()))?;
+        Ok(first)
     }
 
-    fn newest_packed_object(
-        repo: &RepoState,
-        oid: &ObjectId,
-    ) -> Result<Option<(PackMetadata, PackObjectIndex, Vec<u8>)>> {
+    fn newest_pack_location(repo: &RepoState, oid: &ObjectId) -> Result<Option<PackLocation>> {
         repo.packs
             .read()
-            .map(|packs| {
-                packs
-                    .values()
-                    .filter_map(|pack| {
-                        pack.index
-                            .iter()
-                            .find(|entry| entry.oid == *oid)
-                            .map(|entry| (pack.metadata.clone(), entry.clone(), pack.data.clone()))
-                    })
-                    .max_by_key(|(metadata, _, _)| metadata.storage_order)
-            })
+            .map(|packs| packs.newest_by_oid.get(oid).cloned())
             .map_err(|_| Error::Backend("memory pack lock poisoned".to_owned()))
     }
 
+    fn prepare_memory_pack(pack: StoredPack) -> Result<PreparedMemoryPack> {
+        Self::prepare_shared_memory_pack(pack.metadata, Arc::new(pack.data), pack.index)
+    }
+
+    fn prepare_shared_memory_pack(
+        metadata: PackMetadata,
+        data: Arc<Vec<u8>>,
+        index: Vec<PackObjectIndex>,
+    ) -> Result<PreparedMemoryPack> {
+        if usize::try_from(metadata.object_count).ok() != Some(index.len()) {
+            return Err(Error::Protocol(
+                "pack metadata object count does not match its index".to_owned(),
+            ));
+        }
+        if u64::try_from(data.len()).ok() != Some(metadata.size_bytes) {
+            return Err(Error::Protocol(
+                "pack metadata size does not match its bytes".to_owned(),
+            ));
+        }
+        let hash_bytes = index
+            .first()
+            .map(|entry| entry.oid.as_bytes().len())
+            .unwrap_or_else(|| metadata.pack_checksum.len());
+        if !matches!(hash_bytes, 20 | 32)
+            || index
+                .iter()
+                .any(|entry| entry.oid.as_bytes().len() != hash_bytes)
+        {
+            return Err(Error::Protocol(
+                "pack index mixes incompatible object hash algorithms".to_owned(),
+            ));
+        }
+        let mut seen_oids = HashSet::with_capacity(index.len());
+        let mut seen_offsets = HashSet::with_capacity(index.len());
+        if index
+            .iter()
+            .any(|entry| !seen_oids.insert(entry.oid) || !seen_offsets.insert(entry.offset))
+        {
+            return Err(Error::Protocol(
+                "pack index contains duplicate object ids or offsets".to_owned(),
+            ));
+        }
+
+        let mut decode_entries = index
+            .iter()
+            .map(|entry| PackIndexEntry {
+                oid: entry.oid.as_bytes().to_vec(),
+                offset: entry.offset,
+                crc32: None,
+            })
+            .collect::<Vec<_>>();
+        decode_entries.sort_by(|left, right| left.oid.cmp(&right.oid));
+        let mut fanout = [0u32; 256];
+        for entry in &decode_entries {
+            if let Some(first) = entry.oid.first() {
+                fanout[usize::from(*first)] = fanout[usize::from(*first)].saturating_add(1);
+            }
+        }
+        let mut cumulative = 0u32;
+        for count in &mut fanout {
+            cumulative = cumulative.saturating_add(*count);
+            *count = cumulative;
+        }
+        let pack_name = metadata
+            .pack_checksum
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let pack_path = PathBuf::from(format!("memory-packs/{pack_name}.pack"));
+        let decode_index = PackIndex {
+            idx_path: pack_path.with_extension("idx"),
+            pack_path,
+            hash_bytes,
+            entries: decode_entries,
+            fanout,
+        };
+        Ok(PreparedMemoryPack {
+            metadata,
+            data,
+            entries: index,
+            decode_index,
+        })
+    }
+
+    fn install_prepared_pack(
+        packs: &mut MemoryPackState,
+        mut prepared: PreparedMemoryPack,
+        storage_order: u64,
+    ) -> PackMetadata {
+        prepared.metadata.storage_order = storage_order;
+        let stored = Arc::new(MemoryPack {
+            metadata: prepared.metadata,
+            data: prepared.data,
+            entries: prepared.entries,
+            decode_index: prepared.decode_index,
+        });
+        for (entry_index, entry) in stored.entries.iter().enumerate() {
+            packs.newest_by_oid.insert(
+                entry.oid,
+                PackLocation {
+                    pack: Arc::clone(&stored),
+                    entry_index,
+                },
+            );
+        }
+        let metadata = stored.metadata.clone();
+        packs
+            .by_checksum
+            .insert(metadata.pack_checksum.clone(), stored);
+        metadata
+    }
+
     fn read_object_from_state(repo: &RepoState, oid: &ObjectId) -> Result<Option<StoredObject>> {
-        if let Some((_, index, data)) = Self::newest_packed_object(repo, oid)? {
-            return crate::packfile::read_object_at_offset(&data, index.offset, oid.algo())
-                .map(Some);
+        if let Some(location) = Self::newest_pack_location(repo, oid)? {
+            let object = grit_lib::pack::read_object_from_pack_bytes(
+                &location.pack.data,
+                &location.pack.decode_index,
+                oid.as_bytes(),
+            )?;
+            return Ok(Some(StoredObject::new(object.kind, object.data)));
         }
         repo.objects
             .read()
@@ -410,7 +552,12 @@ impl ObjectStore for MemoryBackend {
         let Some(repo) = self.existing_repo_state(tenant, repository)? else {
             return Ok(false);
         };
-        if Self::newest_packed_object(&repo, oid)?.is_some() {
+        let packed = repo
+            .packs
+            .read()
+            .map(|packs| packs.newest_by_oid.contains_key(oid))
+            .map_err(|_| Error::Backend("memory pack lock poisoned".to_owned()))?;
+        if packed {
             return Ok(true);
         }
         repo.objects
@@ -443,17 +590,15 @@ impl ObjectStore for MemoryBackend {
                     .collect::<HashMap<_, _>>()
             })
             .map_err(|_| Error::Backend("memory object lock poisoned".to_owned()))?;
-        for pack in repo
+        for (oid, location) in &repo
             .packs
             .read()
             .map_err(|_| Error::Backend("memory pack lock poisoned".to_owned()))?
-            .values()
-            .cloned()
+            .newest_by_oid
         {
-            for entry in pack.index {
-                if kind.is_none_or(|kind| entry.kind == kind) {
-                    ids.entry(entry.oid).or_insert(entry.kind);
-                }
+            let entry = &location.pack.entries[location.entry_index];
+            if kind.is_none_or(|kind| entry.kind == kind) {
+                ids.entry(*oid).or_insert(entry.kind);
             }
         }
         let mut ids = ids.into_iter().collect::<Vec<_>>();
@@ -839,26 +984,68 @@ impl CommitGraphStore for MemoryBackend {
 
 #[async_trait]
 impl PackStore for MemoryBackend {
+    fn supports_native_pack_import(&self) -> bool {
+        true
+    }
+
+    async fn write_imported_packs(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        packs: Vec<ImportedPack>,
+    ) -> Result<Vec<PackMetadata>> {
+        let prepared = packs
+            .into_iter()
+            .map(|pack| Self::prepare_shared_memory_pack(pack.metadata, pack.data, pack.index))
+            .collect::<Result<Vec<_>>>()?;
+        let repo = self.repo_state(tenant, repository)?;
+        let mut stored = repo
+            .packs
+            .write()
+            .map_err(|_| Error::Backend("memory pack lock poisoned".to_owned()))?;
+        let mut metadata = Vec::with_capacity(prepared.len());
+        let mut known_checksums = stored.by_checksum.keys().cloned().collect::<HashSet<_>>();
+        let new_pack_count = prepared
+            .iter()
+            .filter(|pack| known_checksums.insert(pack.metadata.pack_checksum.clone()))
+            .count();
+        let mut next_order = if new_pack_count == 0 {
+            0
+        } else {
+            self.reserve_pack_orders(new_pack_count)?
+        };
+        for pack in prepared {
+            if let Some(existing) = stored.by_checksum.get(&pack.metadata.pack_checksum) {
+                metadata.push(existing.metadata.clone());
+                continue;
+            }
+            metadata.push(Self::install_prepared_pack(&mut stored, pack, next_order));
+            next_order = next_order.saturating_add(1);
+        }
+        Ok(metadata)
+    }
+
     async fn write_pack(
         &self,
         tenant: &TenantId,
         repository: &RepositoryId,
         pack: &StoredPack,
     ) -> Result<PackMetadata> {
+        let prepared = Self::prepare_memory_pack(pack.clone())?;
         let repo = self.repo_state(tenant, repository)?;
-        let key = pack.metadata.pack_checksum.clone();
         let mut packs = repo
             .packs
             .write()
             .map_err(|_| Error::Backend("memory pack lock poisoned".to_owned()))?;
-        if let Some(existing) = packs.get(&key) {
+        if let Some(existing) = packs.by_checksum.get(&prepared.metadata.pack_checksum) {
             return Ok(existing.metadata.clone());
         }
-        let mut stored = pack.clone();
-        stored.metadata.storage_order = self.next_pack_order()?;
-        let metadata = stored.metadata.clone();
-        packs.insert(key, stored);
-        Ok(metadata)
+        let storage_order = self.next_pack_order()?;
+        Ok(Self::install_prepared_pack(
+            &mut packs,
+            prepared,
+            storage_order,
+        ))
     }
 
     async fn read_pack_metadata(
@@ -872,7 +1059,12 @@ impl PackStore for MemoryBackend {
         };
         repo.packs
             .read()
-            .map(|packs| packs.get(pack_checksum).map(|pack| pack.metadata.clone()))
+            .map(|packs| {
+                packs
+                    .by_checksum
+                    .get(pack_checksum)
+                    .map(|pack| pack.metadata.clone())
+            })
             .map_err(|_| Error::Backend("memory pack lock poisoned".to_owned()))
     }
 
@@ -887,8 +1079,76 @@ impl PackStore for MemoryBackend {
         };
         repo.packs
             .read()
-            .map(|packs| packs.get(pack_checksum).map(|pack| pack.data.clone()))
+            .map(|packs| {
+                packs
+                    .by_checksum
+                    .get(pack_checksum)
+                    .map(|pack| pack.data.to_vec())
+            })
             .map_err(|_| Error::Backend("memory pack lock poisoned".to_owned()))
+    }
+
+    async fn read_pack_range(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        pack_checksum: &[u8],
+        start: u64,
+        len: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(repo) = self.existing_repo_state(tenant, repository)? else {
+            return Ok(None);
+        };
+        let start = usize::try_from(start)
+            .map_err(|_| Error::Backend("pack range start exceeds usize".to_owned()))?;
+        let len = usize::try_from(len)
+            .map_err(|_| Error::Backend("pack range length exceeds usize".to_owned()))?;
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| Error::Backend("pack range overflow".to_owned()))?;
+        repo.packs
+            .read()
+            .map(|packs| {
+                packs.by_checksum.get(pack_checksum).map(|pack| {
+                    if start >= pack.data.len() {
+                        Vec::new()
+                    } else {
+                        pack.data[start..end.min(pack.data.len())].to_vec()
+                    }
+                })
+            })
+            .map_err(|_| Error::Backend("memory pack lock poisoned".to_owned()))
+    }
+
+    async fn read_packed_object_data(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        pack_checksum: &[u8],
+        oid: &ObjectId,
+    ) -> Result<Option<StoredObject>> {
+        let Some(repo) = self.existing_repo_state(tenant, repository)? else {
+            return Ok(None);
+        };
+        let pack = repo
+            .packs
+            .read()
+            .map_err(|_| Error::Backend("memory pack lock poisoned".to_owned()))?
+            .by_checksum
+            .get(pack_checksum)
+            .cloned();
+        let Some(pack) = pack else {
+            return Ok(None);
+        };
+        if pack.decode_index.find_offset(oid).is_none() {
+            return Ok(None);
+        }
+        let object = grit_lib::pack::read_object_from_pack_bytes(
+            &pack.data,
+            &pack.decode_index,
+            oid.as_bytes(),
+        )?;
+        Ok(Some(StoredObject::new(object.kind, object.data)))
     }
 
     async fn find_packed_object(
@@ -900,7 +1160,12 @@ impl PackStore for MemoryBackend {
         let Some(repo) = self.existing_repo_state(tenant, repository)? else {
             return Ok(None);
         };
-        Ok(Self::newest_packed_object(&repo, oid)?.map(|(metadata, index, _)| (metadata, index)))
+        Ok(Self::newest_pack_location(&repo, oid)?.map(|location| {
+            (
+                location.pack.metadata.clone(),
+                location.pack.entries[location.entry_index].clone(),
+            )
+        }))
     }
 
     async fn read_pack_index_at_offset(
@@ -916,8 +1181,8 @@ impl PackStore for MemoryBackend {
         repo.packs
             .read()
             .map(|packs| {
-                packs.get(pack_checksum).and_then(|pack| {
-                    pack.index
+                packs.by_checksum.get(pack_checksum).and_then(|pack| {
+                    pack.entries
                         .iter()
                         .find(|entry| entry.offset == offset)
                         .cloned()
@@ -938,6 +1203,7 @@ impl PackStore for MemoryBackend {
             .read()
             .map(|packs| {
                 let mut metadata = packs
+                    .by_checksum
                     .values()
                     .map(|pack| pack.metadata.clone())
                     .collect::<Vec<_>>();
@@ -960,12 +1226,13 @@ impl PackStore for MemoryBackend {
             .read()
             .map(|packs| {
                 let mut rows = packs
+                    .by_checksum
                     .iter()
                     .filter(|(checksum, _)| {
                         pack_checksum.is_none_or(|wanted| checksum.as_slice() == wanted)
                     })
                     .flat_map(|(_, pack)| {
-                        pack.index
+                        pack.entries
                             .iter()
                             .map(|entry| (pack.metadata.clone(), entry.clone()))
                     })

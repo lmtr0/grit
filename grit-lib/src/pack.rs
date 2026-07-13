@@ -23,6 +23,8 @@ pub struct PackIndexEntry {
     pub oid: Vec<u8>,
     /// Byte offset of the object in the corresponding `.pack`.
     pub offset: u64,
+    /// CRC32 of the complete packed entry in a version-2 index.
+    pub crc32: Option<u32>,
 }
 
 /// Parsed data from a `.idx` file (version 2).
@@ -232,30 +234,33 @@ fn show_index_v2(buf: &[u8], pos: &mut usize, hash_size: usize) -> Result<Vec<Sh
         large_offsets.push(read_u64_be(buf, pos)?);
     }
 
-    let mut next_large = 0usize;
+    let mut used_large_offsets = HashSet::with_capacity(large_count);
     let mut entries = Vec::with_capacity(object_count);
     for (i, oid) in oids.iter().enumerate() {
         let raw = offsets32[i];
         let offset = if (raw & 0x8000_0000) == 0 {
             raw as u64
         } else {
-            let idx = (raw & 0x7fff_ffff) as usize;
-            if idx != next_large {
+            let large_index = (raw & 0x7fff_ffff) as usize;
+            if !used_large_offsets.insert(large_index) {
                 return Err(Error::CorruptObject(format!(
-                    "inconsistent 64b offset index at entry {i}"
+                    "duplicate 64b offset index {large_index} at entry {i}"
                 )));
             }
-            let off = large_offsets.get(next_large).copied().ok_or_else(|| {
-                Error::CorruptObject(format!("missing large offset entry {next_large}"))
-            })?;
-            next_large += 1;
-            off
+            large_offsets.get(large_index).copied().ok_or_else(|| {
+                Error::CorruptObject(format!("missing large offset entry {large_index}"))
+            })?
         };
         entries.push(ShowIndexEntry {
             oid: oid.clone(),
             offset,
             crc32: Some(crcs[i]),
         });
+    }
+    if used_large_offsets.len() != large_offsets.len() {
+        return Err(Error::CorruptObject(
+            "unreferenced entries in 64-bit offset table".to_owned(),
+        ));
     }
     Ok(entries)
 }
@@ -749,7 +754,11 @@ fn read_pack_index_v1(idx_path: &Path, bytes: &[u8], verify: bool) -> Result<Pac
                 idx_path.display()
             )));
         }
-        entries.push(PackIndexEntry { oid, offset });
+        entries.push(PackIndexEntry {
+            oid,
+            offset,
+            crc32: None,
+        });
     }
 
     if verify {
@@ -814,11 +823,25 @@ fn read_pack_index_v2(idx_path: &Path, bytes: &[u8], verify: bool) -> Result<Pac
     let idx_file_len = bytes.len();
     let hash_bytes = detect_idx_hash_bytes_v2(idx_file_len, pos, object_count, idx_path)?;
 
+    let trailer_bytes = hash_bytes.checked_mul(2).ok_or_else(|| {
+        Error::CorruptObject(format!("index size overflow in {}", idx_path.display()))
+    })?;
+    let object_table_bytes = object_count
+        .checked_mul(hash_bytes)
+        .and_then(|value| {
+            object_count
+                .checked_mul(8)
+                .and_then(|extra| value.checked_add(extra))
+        })
+        .ok_or_else(|| {
+            Error::CorruptObject(format!("index size overflow in {}", idx_path.display()))
+        })?;
     let need = pos
-        .saturating_add(object_count * hash_bytes)
-        .saturating_add(object_count * 4)
-        .saturating_add(object_count * 4)
-        .saturating_add(40);
+        .checked_add(object_table_bytes)
+        .and_then(|value| value.checked_add(trailer_bytes))
+        .ok_or_else(|| {
+            Error::CorruptObject(format!("index size overflow in {}", idx_path.display()))
+        })?;
     if bytes.len() < need {
         return Err(Error::CorruptObject(format!(
             "truncated idx file {}",
@@ -833,21 +856,36 @@ fn read_pack_index_v2(idx_path: &Path, bytes: &[u8], verify: bool) -> Result<Pac
         oids.push(slice.to_vec());
     }
 
-    pos += object_count * 4;
+    let mut crcs = Vec::with_capacity(object_count);
+    for _ in 0..object_count {
+        crcs.push(read_u32_be(bytes, &mut pos)?);
+    }
 
     let mut offsets32 = Vec::with_capacity(object_count);
-    let mut large_count = 0usize;
     for _ in 0..object_count {
         let v = read_u32_be(bytes, &mut pos)?;
-        if (v & 0x8000_0000) != 0 {
-            large_count += 1;
-        }
         offsets32.push(v);
     }
 
-    if bytes.len() < pos + large_count * 8 + 40 {
-        return Err(Error::CorruptObject(format!(
+    let remaining = bytes.len().checked_sub(pos).ok_or_else(|| {
+        Error::CorruptObject(format!(
             "truncated large offset table in {}",
+            idx_path.display()
+        ))
+    })?;
+    let large_table_bytes = remaining.checked_sub(trailer_bytes).ok_or_else(|| {
+        Error::CorruptObject(format!("truncated index trailer in {}", idx_path.display()))
+    })?;
+    if !large_table_bytes.is_multiple_of(8) {
+        return Err(Error::CorruptObject(format!(
+            "misaligned large offset table in {}",
+            idx_path.display()
+        )));
+    }
+    let large_count = large_table_bytes / 8;
+    if large_count > object_count {
+        return Err(Error::CorruptObject(format!(
+            "too many large offsets in {}",
             idx_path.display()
         )));
     }
@@ -856,20 +894,39 @@ fn read_pack_index_v2(idx_path: &Path, bytes: &[u8], verify: bool) -> Result<Pac
         large_offsets.push(read_u64_be(bytes, &mut pos)?);
     }
 
-    let mut next_large = 0usize;
+    let mut used_large_offsets = HashSet::with_capacity(large_count);
     let mut entries = Vec::with_capacity(object_count);
     for (i, oid) in oids.into_iter().enumerate() {
         let raw = offsets32[i];
         let offset = if (raw & 0x8000_0000) == 0 {
             raw as u64
         } else {
-            let off = large_offsets.get(next_large).copied().ok_or_else(|| {
-                Error::CorruptObject(format!("bad large offset index in {}", idx_path.display()))
+            let large_index = (raw & 0x7fff_ffff) as usize;
+            let offset = large_offsets.get(large_index).copied().ok_or_else(|| {
+                Error::CorruptObject(format!(
+                    "large offset index {large_index} is out of bounds in {}",
+                    idx_path.display()
+                ))
             })?;
-            next_large += 1;
-            off
+            if !used_large_offsets.insert(large_index) {
+                return Err(Error::CorruptObject(format!(
+                    "duplicate large offset index {large_index} in {}",
+                    idx_path.display()
+                )));
+            }
+            offset
         };
-        entries.push(PackIndexEntry { oid, offset });
+        entries.push(PackIndexEntry {
+            oid,
+            offset,
+            crc32: crcs.get(i).copied(),
+        });
+    }
+    if used_large_offsets.len() != large_offsets.len() {
+        return Err(Error::CorruptObject(format!(
+            "unreferenced large offset entries in {}",
+            idx_path.display()
+        )));
     }
 
     let mut pack_path = idx_path.to_path_buf();
@@ -898,31 +955,38 @@ fn detect_idx_hash_bytes_v2(
     object_count: usize,
     idx_path: &Path,
 ) -> Result<usize> {
-    if object_count == 0 {
-        return Ok(20);
-    }
-
     // For a width `hb` (20 for SHA-1, 32 for SHA-256) the v2 index is:
     //   fanout_end + n*hb (OIDs) + n*4 (CRC) + n*4 (offsets)
     //   + large*8 (64-bit offset extension) + hb (pack checksum) + hb (index checksum)
     // The OID width and both trailing checksums all use the repository hash, so the
     // index checksum is `hb`-wide too (Git `packfile.c` `load_idx`). Require the size
     // to match exactly one `(hb, large)` pair with `0 <= large <= n`.
+    let mut candidates = Vec::new();
     for &hb in &[20usize, 32] {
-        let fixed = fanout_end
-            .saturating_add(object_count.saturating_mul(hb + 4 + 4))
-            .saturating_add(2 * hb);
+        let Some(fixed) = object_count
+            .checked_mul(hb + 8)
+            .and_then(|tables| fanout_end.checked_add(tables))
+            .and_then(|value| {
+                hb.checked_mul(2)
+                    .and_then(|trailer| value.checked_add(trailer))
+            })
+        else {
+            continue;
+        };
         if idx_file_len < fixed {
             continue;
         }
         let extra = idx_file_len - fixed;
-        if extra % 8 != 0 {
+        if !extra.is_multiple_of(8) {
             continue;
         }
         if extra / 8 > object_count {
             continue;
         }
-        return Ok(hb);
+        candidates.push(hb);
+    }
+    if let [hash_bytes] = candidates.as_slice() {
+        return Ok(*hash_bytes);
     }
 
     Err(Error::CorruptObject(format!(
@@ -965,8 +1029,8 @@ pub fn hash_object_bytes(kind: ObjectKind, data: &[u8], hash_bytes: usize) -> Re
     }
 }
 
-/// Parse a pack index file (version 1 legacy or version 2), verifying the SHA-1
-/// trailer checksum.
+/// Parse a pack index file (version 1 legacy or version 2), verifying its repository-hash trailer
+/// checksum (SHA-1 or SHA-256).
 ///
 /// Used by `fsck`/`verify-pack` and similar code that wants on-disk validation. Hot
 /// object-lookup paths should call [`read_pack_index_cached`] (which skips trailer
@@ -980,7 +1044,20 @@ pub fn read_pack_index(idx_path: &Path) -> Result<PackIndex> {
     parse_pack_index_bytes(idx_path, &bytes, true)
 }
 
-/// Parse a pack index file without verifying the SHA-1 trailer checksum.
+/// Parse and verify one immutable pack-index byte snapshot.
+///
+/// This is useful when a caller must retain checksum fields from exactly the same bytes that
+/// produced the parsed offset table, without reopening a mutable path.
+///
+/// # Errors
+///
+/// Returns [`Error::CorruptObject`] when the snapshot is malformed or its trailing checksum does
+/// not match, and [`Error::Io`] is not produced because all bytes are already in memory.
+pub fn read_pack_index_snapshot(idx_path: &Path, bytes: &[u8]) -> Result<PackIndex> {
+    parse_pack_index_bytes(idx_path, bytes, true)
+}
+
+/// Parse a pack index file without verifying its trailing checksum.
 ///
 /// Git reads the `.idx` offset table without re-checking its trailer in the MIDX
 /// write path (`midx-write.c`/`packfile.c` `open_pack_index`), so a deliberately
@@ -1218,7 +1295,8 @@ pub fn verify_pack_and_collect(idx_path: &Path) -> Result<Vec<VerifyObjectRecord
                 idx.pack_path.display()
             )));
         }
-        let mut p = offset as usize;
+        let mut p = usize::try_from(offset)
+            .map_err(|_| Error::CorruptObject("pack offset exceeds usize".to_owned()))?;
         let (packed_type, size) = parse_pack_object_header(&pack_bytes, &mut p)?;
         let mut base_oid: Option<Vec<u8>> = None;
         let mut base_link: Option<DeltaBaseLink> = None;
@@ -1354,14 +1432,46 @@ fn packed_type_to_kind(pt: PackedType) -> Result<ObjectKind> {
 /// Returns the decompressed data and advances `pos` past the consumed
 /// compressed bytes.
 fn decompress_pack_data(bytes: &[u8], pos: &mut usize, expected_size: u64) -> Result<Vec<u8>> {
-    let slice = &bytes[*pos..];
+    let expected_size = usize::try_from(expected_size).map_err(|_| {
+        Error::CorruptObject("pack object size exceeds the platform address space".to_owned())
+    })?;
+    let slice = bytes.get(*pos..).ok_or_else(|| {
+        Error::CorruptObject("pack object data starts outside the pack".to_owned())
+    })?;
     let mut decoder = ZlibDecoder::new(slice);
-    let mut out = Vec::with_capacity(expected_size as usize);
-    decoder
-        .read_to_end(&mut out)
-        .map_err(|e| Error::Zlib(e.to_string()))?;
-    *pos += decoder.total_in() as usize;
-    if out.len() as u64 != expected_size {
+    let mut out = Vec::new();
+    out.try_reserve(expected_size.min(64 * 1024))
+        .map_err(|error| {
+            Error::CorruptObject(format!("cannot reserve pack object buffer: {error}"))
+        })?;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = decoder
+            .read(&mut buffer)
+            .map_err(|error| Error::Zlib(error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        let new_len = out.len().checked_add(read).ok_or_else(|| {
+            Error::CorruptObject("decompressed pack object size overflow".to_owned())
+        })?;
+        if new_len > expected_size {
+            return Err(Error::CorruptObject(format!(
+                "pack object exceeds declared size {expected_size}"
+            )));
+        }
+        out.try_reserve(read).map_err(|error| {
+            Error::CorruptObject(format!("cannot grow pack object buffer: {error}"))
+        })?;
+        out.extend_from_slice(&buffer[..read]);
+    }
+    let consumed = usize::try_from(decoder.total_in()).map_err(|_| {
+        Error::CorruptObject("compressed pack object size exceeds usize".to_owned())
+    })?;
+    *pos = pos.checked_add(consumed).ok_or_else(|| {
+        Error::CorruptObject("compressed pack object position overflow".to_owned())
+    })?;
+    if out.len() != expected_size {
         return Err(Error::CorruptObject(format!(
             "pack object size mismatch: expected {expected_size}, got {}",
             out.len()
@@ -1407,7 +1517,8 @@ fn read_pack_object_at(
             "delta chain too deep (>50)".to_owned(),
         ));
     }
-    let mut pos = offset as usize;
+    let mut pos = usize::try_from(offset)
+        .map_err(|_| Error::CorruptObject("pack offset exceeds usize".to_owned()))?;
     let (packed_type, size) = parse_pack_object_header(pack_bytes, &mut pos)?;
 
     match packed_type {
@@ -1591,6 +1702,196 @@ pub fn read_object_from_pack_bytes(
     Ok(Object::new(kind, data))
 }
 
+/// Object kind and uncompressed payload size derived without materializing the payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackedObjectMetadata {
+    /// Resolved Git object kind. Delta objects inherit their base object's kind.
+    pub kind: ObjectKind,
+    /// Uncompressed size of the resolved object payload.
+    pub size: u64,
+}
+
+/// Read object metadata from immutable pack bytes without materializing the object payload.
+///
+/// Direct objects use the kind and size in their pack entry header. For a delta, this follows its
+/// in-pack base metadata and inflates only the delta stream's two leading size varints; it does not
+/// inflate the base or construct the resulting object. The caller remains responsible for
+/// validating the pack trailer and binding the index checksum to that trailer.
+///
+/// # Errors
+///
+/// Returns [`Error::ObjectNotFound`] when `oid` is absent, or [`Error::CorruptObject`] when entry
+/// headers, delta dependencies, or delta size metadata are invalid.
+pub fn read_object_metadata_from_pack_bytes(
+    pack_bytes: &[u8],
+    idx: &PackIndex,
+    oid: &[u8],
+) -> Result<PackedObjectMetadata> {
+    validate_pack_index_object_count(pack_bytes, idx)?;
+    let offset = idx
+        .entries
+        .binary_search_by(|entry| entry.oid.as_slice().cmp(oid))
+        .ok()
+        .map(|position| idx.entries[position].offset)
+        .ok_or_else(|| Error::ObjectNotFound(oid_bytes_to_hex(oid)))?;
+    let mut memo = HashMap::new();
+    let mut visiting = HashSet::new();
+    read_object_metadata_at(pack_bytes, idx, offset, &mut memo, &mut visiting, 0)
+}
+
+/// Read metadata for every indexed object from immutable pack bytes without materializing object
+/// payloads.
+///
+/// Delta base metadata is memoized across entries, keeping the scan linear in the number of pack
+/// entries apart from the small zlib delta-header reads.
+///
+/// # Errors
+///
+/// Returns [`Error::CorruptObject`] when the pack/index count, an entry header, a delta dependency,
+/// or delta size metadata is invalid.
+pub fn read_all_object_metadata_from_pack_bytes(
+    pack_bytes: &[u8],
+    idx: &PackIndex,
+) -> Result<Vec<(Vec<u8>, PackedObjectMetadata)>> {
+    validate_pack_index_object_count(pack_bytes, idx)?;
+    let mut memo = HashMap::with_capacity(idx.entries.len());
+    let mut visiting = HashSet::new();
+    let mut metadata = Vec::with_capacity(idx.entries.len());
+    for entry in &idx.entries {
+        let object_metadata =
+            read_object_metadata_at(pack_bytes, idx, entry.offset, &mut memo, &mut visiting, 0)?;
+        metadata.push((entry.oid.clone(), object_metadata));
+    }
+    Ok(metadata)
+}
+
+fn read_object_metadata_at(
+    pack_bytes: &[u8],
+    idx: &PackIndex,
+    offset: u64,
+    memo: &mut HashMap<u64, PackedObjectMetadata>,
+    visiting: &mut HashSet<u64>,
+    depth: usize,
+) -> Result<PackedObjectMetadata> {
+    if let Some(metadata) = memo.get(&offset) {
+        return Ok(*metadata);
+    }
+    if depth > 50 || !visiting.insert(offset) {
+        return Err(Error::CorruptObject(
+            "cyclic or excessively deep pack delta metadata chain".to_owned(),
+        ));
+    }
+
+    let result = (|| {
+        let mut pos = usize::try_from(offset)
+            .map_err(|_| Error::CorruptObject("pack offset exceeds usize".to_owned()))?;
+        let (packed_type, delta_data_size) = parse_pack_object_header(pack_bytes, &mut pos)?;
+        match packed_type {
+            PackedType::Commit | PackedType::Tree | PackedType::Blob | PackedType::Tag => {
+                Ok(PackedObjectMetadata {
+                    kind: packed_type_to_kind(packed_type)?,
+                    size: delta_data_size,
+                })
+            }
+            PackedType::OfsDelta | PackedType::RefDelta => {
+                let base_offset = match packed_type {
+                    PackedType::OfsDelta => parse_ofs_delta_base(pack_bytes, &mut pos, offset)?,
+                    PackedType::RefDelta => {
+                        let end = pos.checked_add(idx.hash_bytes).ok_or_else(|| {
+                            Error::CorruptObject("ref-delta base offset overflow".to_owned())
+                        })?;
+                        let base_oid = pack_bytes.get(pos..end).ok_or_else(|| {
+                            Error::CorruptObject("truncated ref-delta base OID".to_owned())
+                        })?;
+                        pos = end;
+                        idx.entries
+                            .binary_search_by(|entry| entry.oid.as_slice().cmp(base_oid))
+                            .ok()
+                            .map(|position| idx.entries[position].offset)
+                            .ok_or_else(|| {
+                                Error::CorruptObject(format!(
+                                    "ref-delta base {} is not in the retained pack",
+                                    oid_bytes_to_hex(base_oid)
+                                ))
+                            })?
+                    }
+                    PackedType::Commit | PackedType::Tree | PackedType::Blob | PackedType::Tag => {
+                        return Err(Error::CorruptObject(
+                            "non-delta object reached delta metadata branch".to_owned(),
+                        ));
+                    }
+                };
+                let base = read_object_metadata_at(
+                    pack_bytes,
+                    idx,
+                    base_offset,
+                    memo,
+                    visiting,
+                    depth + 1,
+                )?;
+                let compressed = pack_bytes.get(pos..).ok_or_else(|| {
+                    Error::CorruptObject("delta stream starts outside the pack".to_owned())
+                })?;
+                let mut decoder = ZlibDecoder::new(compressed);
+                let source_size = read_delta_varint_from_reader(&mut decoder)?;
+                let result_size = read_delta_varint_from_reader(&mut decoder)?;
+                if source_size != base.size {
+                    return Err(Error::CorruptObject(format!(
+                        "delta source size {source_size} does not match base size {}",
+                        base.size
+                    )));
+                }
+                if decoder.total_out() > delta_data_size {
+                    return Err(Error::CorruptObject(
+                        "delta size header exceeds declared delta stream size".to_owned(),
+                    ));
+                }
+                Ok(PackedObjectMetadata {
+                    kind: base.kind,
+                    size: result_size,
+                })
+            }
+        }
+    })();
+    visiting.remove(&offset);
+    if let Ok(metadata) = result {
+        memo.insert(offset, metadata);
+    }
+    result
+}
+
+fn read_delta_varint_from_reader(reader: &mut impl Read) -> Result<u64> {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let mut byte = [0u8; 1];
+        reader.read_exact(&mut byte).map_err(|error| {
+            Error::CorruptObject(format!("truncated delta size metadata: {error}"))
+        })?;
+        let part_bits = u64::from(byte[0] & 0x7f);
+        if shift >= u64::BITS || part_bits > (u64::MAX >> shift) {
+            return Err(Error::CorruptObject(
+                "delta size metadata overflow".to_owned(),
+            ));
+        }
+        let part = part_bits << shift;
+        value = value
+            .checked_add(part)
+            .ok_or_else(|| Error::CorruptObject("delta size metadata overflow".to_owned()))?;
+        if byte[0] & 0x80 == 0 {
+            return Ok(value);
+        }
+        shift = shift
+            .checked_add(7)
+            .ok_or_else(|| Error::CorruptObject("delta size metadata overflow".to_owned()))?;
+        if shift >= u64::BITS {
+            return Err(Error::CorruptObject(
+                "delta size metadata overflow".to_owned(),
+            ));
+        }
+    }
+}
+
 fn validate_pack_index_object_count(pack_bytes: &[u8], idx: &PackIndex) -> Result<()> {
     if pack_bytes.len() < 12 || &pack_bytes[0..4] != b"PACK" {
         return Err(Error::CorruptObject("bad pack header".to_owned()));
@@ -1607,19 +1908,12 @@ fn validate_pack_index_object_count(pack_bytes: &[u8], idx: &PackIndex) -> Resul
 }
 
 fn verify_packed_object_hash(kind: ObjectKind, data: &[u8], expected_oid: &[u8]) -> Result<()> {
-    if expected_oid.len() != 20 {
-        return Ok(());
-    }
-    let header = format!("{kind} {}\0", data.len());
-    let mut hasher = Sha1::new();
-    hasher.update(header.as_bytes());
-    hasher.update(data);
-    let actual = hasher.finalize();
+    let actual = hash_object_bytes(kind, data, expected_oid.len())?;
     if actual.as_slice() != expected_oid {
         return Err(Error::CorruptObject(format!(
             "packed object {} hashes to {}",
             oid_bytes_to_hex(expected_oid),
-            oid_bytes_to_hex(actual.as_slice())
+            oid_bytes_to_hex(&actual)
         )));
     }
     Ok(())
@@ -1686,7 +1980,8 @@ pub fn packed_ref_delta_reuse_slice(
             continue;
         }
         let pack_bytes = fs::read(&idx.pack_path).map_err(Error::Io)?;
-        let mut p = entry.offset as usize;
+        let mut p = usize::try_from(entry.offset)
+            .map_err(|_| Error::CorruptObject("pack offset exceeds usize".to_owned()))?;
         let (packed_type, _size) = parse_pack_object_header(&pack_bytes, &mut p)?;
         let base = match packed_type {
             PackedType::RefDelta => {
@@ -1775,7 +2070,8 @@ pub fn packed_delta_base_oid(objects_dir: &Path, oid: &ObjectId) -> Result<Optio
             continue;
         };
         let pack_bytes = fs::read(&idx.pack_path).map_err(Error::Io)?;
-        let mut p = entry.offset as usize;
+        let mut p = usize::try_from(entry.offset)
+            .map_err(|_| Error::CorruptObject("pack offset exceeds usize".to_owned()))?;
         let (packed_type, _) = parse_pack_object_header(&pack_bytes, &mut p)?;
         match packed_type {
             PackedType::RefDelta => {
@@ -1803,7 +2099,9 @@ fn parse_pack_object_header(bytes: &[u8], pos: &mut usize) -> Result<(PackedType
     let first = *bytes.get(*pos).ok_or_else(|| {
         Error::CorruptObject("unexpected end of pack header while decoding object".to_owned())
     })?;
-    *pos += 1;
+    *pos = pos
+        .checked_add(1)
+        .ok_or_else(|| Error::CorruptObject("pack header position overflow".to_owned()))?;
 
     let type_code = (first >> 4) & 0x7;
     let mut size = (first & 0x0f) as u64;
@@ -1813,9 +2111,29 @@ fn parse_pack_object_header(bytes: &[u8], pos: &mut usize) -> Result<(PackedType
         c = *bytes.get(*pos).ok_or_else(|| {
             Error::CorruptObject("unexpected end of variable size header".to_owned())
         })?;
-        *pos += 1;
-        size |= ((c & 0x7f) as u64) << shift;
-        shift += 7;
+        *pos = pos
+            .checked_add(1)
+            .ok_or_else(|| Error::CorruptObject("pack size header position overflow".to_owned()))?;
+        let part_bits = u64::from(c & 0x7f);
+        if shift >= u64::BITS || part_bits > (u64::MAX >> shift) {
+            return Err(Error::CorruptObject(
+                "pack object size header overflow".to_owned(),
+            ));
+        }
+        let part = part_bits << shift;
+        size = size
+            .checked_add(part)
+            .ok_or_else(|| Error::CorruptObject("pack object size header overflow".to_owned()))?;
+        if c & 0x80 != 0 {
+            shift = shift.checked_add(7).ok_or_else(|| {
+                Error::CorruptObject("pack object size header is too long".to_owned())
+            })?;
+            if shift >= u64::BITS {
+                return Err(Error::CorruptObject(
+                    "pack object size header is too long".to_owned(),
+                ));
+            }
+        }
     }
 
     let packed_type = match type_code {
@@ -1855,7 +2173,8 @@ pub fn read_packed_delta_dependency(
     pack_bytes: &[u8],
     object_offset: u64,
 ) -> Result<Option<PackedDeltaDependency>> {
-    let mut pos = object_offset as usize;
+    let mut pos = usize::try_from(object_offset)
+        .map_err(|_| Error::CorruptObject("pack offset exceeds usize".to_owned()))?;
     let (ty, _) = parse_pack_object_header(pack_bytes, &mut pos)?;
     match ty {
         PackedType::OfsDelta => {
@@ -1877,14 +2196,22 @@ fn parse_ofs_delta_base(bytes: &[u8], pos: &mut usize, this_offset: u64) -> Resu
     let mut c = *bytes
         .get(*pos)
         .ok_or_else(|| Error::CorruptObject("truncated ofs-delta header".to_owned()))?;
-    *pos += 1;
+    *pos = pos
+        .checked_add(1)
+        .ok_or_else(|| Error::CorruptObject("ofs-delta position overflow".to_owned()))?;
     let mut value = (c & 0x7f) as u64;
     while (c & 0x80) != 0 {
         c = *bytes
             .get(*pos)
             .ok_or_else(|| Error::CorruptObject("truncated ofs-delta header".to_owned()))?;
-        *pos += 1;
-        value = ((value + 1) << 7) | (c & 0x7f) as u64;
+        *pos = pos
+            .checked_add(1)
+            .ok_or_else(|| Error::CorruptObject("ofs-delta position overflow".to_owned()))?;
+        value = value
+            .checked_add(1)
+            .and_then(|value| value.checked_mul(1 << 7))
+            .map(|value| value | u64::from(c & 0x7f))
+            .ok_or_else(|| Error::CorruptObject("ofs-delta offset overflow".to_owned()))?;
     }
     this_offset
         .checked_sub(value)
@@ -1904,7 +2231,8 @@ pub fn slice_one_pack_object(
     object_start_offset: u64,
     hash_bytes: usize,
 ) -> Result<&[u8]> {
-    let start = object_start_offset as usize;
+    let start = usize::try_from(object_start_offset)
+        .map_err(|_| Error::CorruptObject("pack offset exceeds usize".to_owned()))?;
     let mut pos = start;
     skip_one_pack_object(bytes, &mut pos, object_start_offset, hash_bytes)?;
     Ok(&bytes[start..pos])
@@ -1919,32 +2247,62 @@ pub fn skip_one_pack_object(
     let (packed_type, size) = parse_pack_object_header(bytes, pos)?;
     match packed_type {
         PackedType::Commit | PackedType::Tree | PackedType::Blob | PackedType::Tag => {
-            let mut dec = ZlibDecoder::new(&bytes[*pos..]);
-            let mut tmp = Vec::with_capacity(size as usize);
-            dec.read_to_end(&mut tmp)
-                .map_err(|e| Error::Zlib(e.to_string()))?;
-            *pos += dec.total_in() as usize;
+            consume_pack_data(bytes, pos, size)?;
         }
         PackedType::RefDelta => {
             if *pos + hash_bytes > bytes.len() {
                 return Err(Error::CorruptObject("truncated ref-delta base oid".into()));
             }
-            *pos += hash_bytes;
-            let mut dec = ZlibDecoder::new(&bytes[*pos..]);
-            let mut tmp = Vec::with_capacity(size as usize);
-            dec.read_to_end(&mut tmp)
-                .map_err(|e| Error::Zlib(e.to_string()))?;
-            *pos += dec.total_in() as usize;
+            *pos = pos.checked_add(hash_bytes).ok_or_else(|| {
+                Error::CorruptObject("ref-delta base position overflow".to_owned())
+            })?;
+            consume_pack_data(bytes, pos, size)?;
         }
         PackedType::OfsDelta => {
             let _base_off = parse_ofs_delta_base(bytes, pos, object_start_offset)?;
-            let mut dec = ZlibDecoder::new(&bytes[*pos..]);
-            let mut tmp = Vec::with_capacity(size as usize);
-            dec.read_to_end(&mut tmp)
-                .map_err(|e| Error::Zlib(e.to_string()))?;
-            *pos += dec.total_in() as usize;
+            consume_pack_data(bytes, pos, size)?;
         }
     }
+    Ok(())
+}
+
+fn consume_pack_data(bytes: &[u8], pos: &mut usize, expected_size: u64) -> Result<()> {
+    let expected_size = usize::try_from(expected_size).map_err(|_| {
+        Error::CorruptObject("pack object size exceeds the platform address space".to_owned())
+    })?;
+    let compressed = bytes.get(*pos..).ok_or_else(|| {
+        Error::CorruptObject("pack object data starts outside the pack".to_owned())
+    })?;
+    let mut decoder = ZlibDecoder::new(compressed);
+    let mut buffer = [0u8; 64 * 1024];
+    let mut total = 0usize;
+    loop {
+        let read = decoder
+            .read(&mut buffer)
+            .map_err(|error| Error::Zlib(error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        total = total.checked_add(read).ok_or_else(|| {
+            Error::CorruptObject("decompressed pack object size overflow".to_owned())
+        })?;
+        if total > expected_size {
+            return Err(Error::CorruptObject(format!(
+                "pack object exceeds declared size {expected_size}"
+            )));
+        }
+    }
+    if total != expected_size {
+        return Err(Error::CorruptObject(format!(
+            "pack object size mismatch: expected {expected_size}, got {total}"
+        )));
+    }
+    let consumed = usize::try_from(decoder.total_in()).map_err(|_| {
+        Error::CorruptObject("compressed pack object size exceeds usize".to_owned())
+    })?;
+    *pos = pos.checked_add(consumed).ok_or_else(|| {
+        Error::CorruptObject("compressed pack object position overflow".to_owned())
+    })?;
     Ok(())
 }
 

@@ -166,6 +166,17 @@ where
         else {
             return Ok(None);
         };
+        if let Some(object) = self
+            .storage
+            .read_packed_object_data(&self.tenant, &self.repository, &pack.pack_checksum, oid)
+            .await?
+        {
+            return Ok(Some(PackedObject {
+                pack,
+                index,
+                object,
+            }));
+        }
         if let Some(object) = self.try_read_packed_object_range(&pack, &index).await? {
             return Ok(Some(PackedObject {
                 pack,
@@ -207,6 +218,17 @@ where
             .read_pack_index_at_offset(&self.tenant, &self.repository, pack_checksum, offset)
             .await?
             .ok_or_else(|| Error::ObjectNotFound(format!("pack offset {offset}")))?;
+        if let Some(object) = self
+            .storage
+            .read_packed_object_data(&self.tenant, &self.repository, pack_checksum, &index.oid)
+            .await?
+        {
+            return Ok(PackedObject {
+                pack,
+                index,
+                object,
+            });
+        }
         if let Some(object) = self.try_read_packed_object_range(&pack, &index).await? {
             return Ok(PackedObject {
                 pack,

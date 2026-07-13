@@ -1636,6 +1636,7 @@ dependencies = [
  "aws-sdk-s3",
  "axum",
  "clap",
+ "crc32fast",
  "flate2",
  "futures-util",
  "grit-lib",

@@ -47,7 +47,7 @@ pub mod prelude {
     pub use crate::ids::{RepositoryId, TenantId};
     pub use crate::import::{
         import_repository, import_repository_with_options, ImportCheckpoint, ImportOptions,
-        ImportProgressEvent, ImportReport,
+        ImportProgressEvent, ImportReport, NativePackImportMode,
     };
     pub use crate::layered::LayeredCache;
     pub use crate::maintenance::{
@@ -78,9 +78,9 @@ pub mod prelude {
     pub use crate::s3_byte_store::S3ByteStore;
     pub use crate::storage::{
         BrowseIndex, CommitGraphStore, ConfigStore, ImportPublication, ImportPublicationResult,
-        ImportSession, ImportStateStore, IndexedCommit, ObjectStore, PackMetadata, PackObjectIndex,
-        PackStore, PackedObject, RefStore, ReflogEntry, ReflogStore, RepackPlan, StoredObject,
-        StoredPack, StoredRef,
+        ImportSession, ImportStateStore, ImportedPack, IndexedCommit, ObjectStore, PackMetadata,
+        PackObjectIndex, PackStore, PackedObject, RefStore, ReflogEntry, ReflogStore, RepackPlan,
+        StoredObject, StoredPack, StoredRef,
     };
     pub use crate::views::{
         BlobContentDelivery, BlobContentView, BlobDownloadOptions, BlobDownloadView,
