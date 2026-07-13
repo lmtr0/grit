@@ -1,6 +1,6 @@
 //! Import filesystem-backed repositories into server storage.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use grit_lib::config::ConfigSet;
 use grit_lib::objects::{parse_commit, parse_tag, parse_tree, ObjectId, ObjectKind};
@@ -8,7 +8,10 @@ use grit_lib::refs;
 use grit_lib::repo::Repository;
 
 use crate::error::{Error, Result};
-use crate::storage::{IndexedTreeEntry, ServerStorage, StoredObject, StoredRef};
+use crate::storage::{
+    commit_time_from_identity, IndexedCommit, IndexedTreeEntry, ServerStorage, StoredObject,
+    StoredRef,
+};
 
 enum ImportWork {
     Object(ObjectId),
@@ -25,7 +28,7 @@ pub struct ImportReport {
     pub objects: usize,
     /// Number of unique direct tree entries indexed.
     pub tree_entries: usize,
-    /// Number of commit graph rows rebuilt from imported commits.
+    /// Number of reachable commit graph rows indexed during import.
     pub commit_graph_entries: usize,
     /// Number of refs removed because they no longer exist in the source repository.
     pub pruned_refs: usize,
@@ -217,6 +220,7 @@ where
     }
 
     let mut seen = HashSet::new();
+    let mut indexed_commits = HashMap::new();
     let mut tree_entries = Vec::new();
     let mut indexed_tree_batches = Vec::new();
     let mut stack = roots;
@@ -229,7 +233,7 @@ where
         let stored = StoredObject::new(object.kind, object.data.clone());
         destination
             .storage()
-            .write_object(
+            .write_imported_object(
                 destination.tenant(),
                 destination.repository(),
                 &oid,
@@ -247,7 +251,17 @@ where
             ObjectKind::Commit => {
                 let commit = parse_commit(&object.data)?;
                 stack.push(ImportWork::Object(commit.tree));
-                stack.extend(commit.parents.into_iter().map(ImportWork::Object));
+                stack.extend(commit.parents.iter().copied().map(ImportWork::Object));
+                indexed_commits.insert(
+                    oid,
+                    IndexedCommit {
+                        oid,
+                        tree: commit.tree,
+                        parents: commit.parents,
+                        commit_time: commit_time_from_identity(&commit.committer),
+                        generation: 1,
+                    },
+                );
             }
             ObjectKind::Tree => {
                 let indexed = index_tree(source, oid, &object.data, &mut stack, &mut tree_entries)?;
@@ -274,9 +288,61 @@ where
         progress(ImportProgressEvent::TreeEntries { tree_oid, entries })?;
     }
 
-    report.commit_graph_entries = destination.repair_commit_graph().await?;
+    compute_commit_generations(&mut indexed_commits);
+    let mut indexed_commits = indexed_commits.into_values().collect::<Vec<_>>();
+    indexed_commits.sort_by_key(|commit| commit.oid);
+    destination
+        .storage()
+        .upsert_commits(
+            destination.tenant(),
+            destination.repository(),
+            &indexed_commits,
+        )
+        .await?;
+    report.commit_graph_entries = indexed_commits.len();
     progress(ImportProgressEvent::Completed(report.clone()))?;
     Ok(report)
+}
+
+fn compute_commit_generations(commits: &mut HashMap<ObjectId, IndexedCommit>) {
+    let mut remaining_parents = HashMap::with_capacity(commits.len());
+    let mut children = HashMap::<ObjectId, Vec<ObjectId>>::new();
+
+    for commit in commits.values_mut() {
+        commit.generation = 1;
+    }
+    for commit in commits.values() {
+        let mut parent_count = 0usize;
+        for parent in &commit.parents {
+            if commits.contains_key(parent) {
+                parent_count += 1;
+                children.entry(*parent).or_default().push(commit.oid);
+            }
+        }
+        remaining_parents.insert(commit.oid, parent_count);
+    }
+
+    let mut ready = remaining_parents
+        .iter()
+        .filter_map(|(oid, parent_count)| (*parent_count == 0).then_some(*oid))
+        .collect::<VecDeque<_>>();
+    while let Some(oid) = ready.pop_front() {
+        let generation = commits
+            .get(&oid)
+            .map(|commit| commit.generation)
+            .unwrap_or(1);
+        for child_oid in children.remove(&oid).unwrap_or_default() {
+            if let Some(child) = commits.get_mut(&child_oid) {
+                child.generation = child.generation.max(generation.saturating_add(1));
+            }
+            if let Some(parent_count) = remaining_parents.get_mut(&child_oid) {
+                *parent_count = (*parent_count).saturating_sub(1);
+                if *parent_count == 0 {
+                    ready.push_back(child_oid);
+                }
+            }
+        }
+    }
 }
 
 async fn import_config<S>(

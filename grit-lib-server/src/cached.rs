@@ -91,6 +91,26 @@ where
             .await
     }
 
+    async fn write_imported_object(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        oid: &ObjectId,
+        object: &StoredObject,
+    ) -> Result<()> {
+        self.storage
+            .write_imported_object(tenant, repository, oid, object)
+            .await?;
+        self.cache
+            .put(
+                tenant,
+                repository,
+                &CacheKey::Object(oid.to_hex()),
+                CacheValue::typed(CacheValueKind::Object, encode_object(object)?),
+            )
+            .await
+    }
+
     async fn object_exists(
         &self,
         tenant: &TenantId,

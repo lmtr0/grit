@@ -178,6 +178,16 @@ where
         Ok(())
     }
 
+    async fn write_imported_object(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        oid: &ObjectId,
+        object: &StoredObject,
+    ) -> Result<()> {
+        self.write_object(tenant, repository, oid, object).await
+    }
+
     async fn object_exists(
         &self,
         tenant: &TenantId,

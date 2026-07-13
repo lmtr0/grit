@@ -176,6 +176,25 @@ pub trait ObjectStore: Send + Sync {
         object: &StoredObject,
     ) -> Result<()>;
 
+    /// Write an object whose commit metadata will be indexed separately by an importer.
+    ///
+    /// Backends that derive commit graph rows in [`Self::write_object`] should override this
+    /// method to store only the object. Backends with independent object and commit stores can use
+    /// the default behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns backend errors encountered while storing the object.
+    async fn write_imported_object(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        oid: &ObjectId,
+        object: &StoredObject,
+    ) -> Result<()> {
+        self.write_object(tenant, repository, oid, object).await
+    }
+
     /// Return whether an object exists.
     async fn object_exists(
         &self,

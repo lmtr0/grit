@@ -62,9 +62,18 @@ impl MemoryBackend {
             .map_err(|_| Error::Backend("memory event log lock poisoned".to_owned()))
     }
 
+    fn store_object(&self, repo: RepoKey, oid: ObjectId, object: &StoredObject) -> Result<()> {
+        self.objects
+            .write()
+            .map(|mut objects| {
+                objects.entry((repo, oid)).or_insert_with(|| object.clone());
+            })
+            .map_err(|_| Error::Backend("memory object lock poisoned".to_owned()))
+    }
+
     fn indexed_commit(
         &self,
-        repo: RepoKey,
+        repo: &RepoKey,
         oid: ObjectId,
         object: &StoredObject,
     ) -> Result<Option<IndexedCommit>> {
@@ -72,15 +81,15 @@ impl MemoryBackend {
             return Ok(None);
         }
         let commit = parse_commit(&object.data)?;
-        let generation = self
+        let commits = self
             .commits
             .read()
-            .map_err(|_| Error::Backend("memory commit graph lock poisoned".to_owned()))?
+            .map_err(|_| Error::Backend("memory commit graph lock poisoned".to_owned()))?;
+        let generation = commit
+            .parents
             .iter()
-            .filter(|((candidate_repo, candidate_oid), _)| {
-                candidate_repo == &repo && commit.parents.contains(candidate_oid)
-            })
-            .map(|(_, parent)| parent.generation.saturating_add(1))
+            .filter_map(|parent| commits.get(&(repo.clone(), *parent)))
+            .map(|parent| parent.generation.saturating_add(1))
             .max()
             .unwrap_or(1);
         Ok(Some(IndexedCommit {
@@ -154,16 +163,8 @@ impl ObjectStore for MemoryBackend {
         object: &StoredObject,
     ) -> Result<()> {
         let repo = repo_key(tenant, repository);
-        self.objects
-            .write()
-            .map(|mut objects| {
-                objects
-                    .entry((repo.clone(), *oid))
-                    .or_insert_with(|| object.clone());
-            })
-            .map_err(|_| Error::Backend("memory object lock poisoned".to_owned()))?;
-
-        if let Some(commit) = self.indexed_commit(repo.clone(), *oid, object)? {
+        self.store_object(repo.clone(), *oid, object)?;
+        if let Some(commit) = self.indexed_commit(&repo, *oid, object)? {
             self.commits
                 .write()
                 .map(|mut commits| {
@@ -172,6 +173,16 @@ impl ObjectStore for MemoryBackend {
                 .map_err(|_| Error::Backend("memory commit graph lock poisoned".to_owned()))?;
         }
         Ok(())
+    }
+
+    async fn write_imported_object(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        oid: &ObjectId,
+        object: &StoredObject,
+    ) -> Result<()> {
+        self.store_object(repo_key(tenant, repository), *oid, object)
     }
 
     async fn object_exists(
