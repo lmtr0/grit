@@ -1,7 +1,7 @@
 //! In-memory backend for tests and local prototyping.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use grit_lib::objects::{parse_commit, ObjectId, ObjectKind};
@@ -16,14 +16,7 @@ use crate::storage::{
     StoredObject, StoredPack, StoredRef,
 };
 
-type RepoKey = (TenantId, RepositoryId);
-type ObjectKey = (RepoKey, ObjectId);
-type RefKey = (RepoKey, String);
-type ConfigKey = (RepoKey, String);
-type TreeKey = (RepoKey, ObjectId, String);
-type CommitKey = (RepoKey, ObjectId);
-type CacheEntryKey = (RepoKey, CacheKey);
-type PackKey = (RepoKey, Vec<u8>);
+type TreeKey = (ObjectId, String);
 
 #[derive(Default)]
 struct MemoryImportState {
@@ -34,20 +27,28 @@ struct MemoryImportState {
     trusted_objects: HashMap<ObjectId, ObjectKind>,
 }
 
-/// In-memory repository backend.
+#[derive(Default)]
+struct RepoState {
+    objects: RwLock<HashMap<ObjectId, StoredObject>>,
+    refs: RwLock<BTreeMap<String, StoredRef>>,
+    reflogs: RwLock<BTreeMap<String, Vec<ReflogEntry>>>,
+    config: RwLock<BTreeMap<String, String>>,
+    trees: RwLock<BTreeMap<TreeKey, IndexedTreeEntry>>,
+    commits: RwLock<BTreeMap<ObjectId, IndexedCommit>>,
+    import: RwLock<MemoryImportState>,
+    packs: RwLock<HashMap<Vec<u8>, StoredPack>>,
+    cache: RwLock<HashMap<CacheKey, CacheValue>>,
+}
+
+/// In-memory repository backend with repository-scoped row storage.
+///
+/// Tenant and repository identifiers occur only in the nested repository index; child
+/// collections use their natural keys without repeating repository identifiers in every row.
 #[derive(Default)]
 pub struct MemoryBackend {
-    objects: RwLock<HashMap<ObjectKey, StoredObject>>,
-    refs: RwLock<BTreeMap<RefKey, StoredRef>>,
-    reflogs: RwLock<BTreeMap<RefKey, Vec<ReflogEntry>>>,
-    config: RwLock<BTreeMap<ConfigKey, String>>,
-    trees: RwLock<BTreeMap<TreeKey, IndexedTreeEntry>>,
-    commits: RwLock<BTreeMap<CommitKey, IndexedCommit>>,
-    imports: RwLock<HashMap<RepoKey, MemoryImportState>>,
+    repositories: RwLock<HashMap<TenantId, HashMap<RepositoryId, Arc<RepoState>>>>,
     import_sequence: RwLock<u64>,
-    packs: RwLock<HashMap<PackKey, StoredPack>>,
     pack_sequence: RwLock<u64>,
-    cache: RwLock<HashMap<CacheEntryKey, CacheValue>>,
     events: RwLock<Vec<InvalidationEvent>>,
 }
 
@@ -68,11 +69,11 @@ impl ImportStateStore for MemoryBackend {
                 .ok_or_else(|| Error::Backend("import session token overflow".to_owned()))?;
             *sequence
         };
-        let mut imports = self
-            .imports
+        let repo = self.repo_state(tenant, repository)?;
+        let mut state = repo
+            .import
             .write()
             .map_err(|_| Error::Backend("memory import state lock poisoned".to_owned()))?;
-        let state = imports.entry(repo_key(tenant, repository)).or_default();
         let mut trusted_objects = if state.complete {
             state
                 .trusted_objects
@@ -106,12 +107,13 @@ impl ImportStateStore for MemoryBackend {
         session: &ImportSession,
         publication: &ImportPublication,
     ) -> Result<ImportPublicationResult> {
-        let repo = repo_key(tenant, repository);
-        let mut imports = self
-            .imports
+        let Some(repo) = self.existing_repo_state(tenant, repository)? else {
+            return Err(stale_import_session(tenant, repository, session));
+        };
+        let mut state = repo
+            .import
             .write()
             .map_err(|_| Error::Backend("memory import state lock poisoned".to_owned()))?;
-        let state = imports.entry(repo.clone()).or_default();
         if session.tenant() != tenant
             || session.repository() != repository
             || state.generation != session.generation()
@@ -122,16 +124,16 @@ impl ImportStateStore for MemoryBackend {
             return Err(stale_import_session(tenant, repository, session));
         }
 
-        let mut config = self
+        let mut config = repo
             .config
             .write()
             .map_err(|_| Error::Backend("memory config lock poisoned".to_owned()))?;
-        let mut refs = self
+        let mut refs = repo
             .refs
             .write()
             .map_err(|_| Error::Backend("memory ref lock poisoned".to_owned()))?;
         for (key, value) in &publication.config_entries {
-            config.insert((repo.clone(), key.clone()), value.clone());
+            config.insert(key.clone(), value.clone());
         }
         let desired = publication
             .refs
@@ -140,19 +142,17 @@ impl ImportStateStore for MemoryBackend {
             .collect::<HashSet<_>>();
         let pruned_refs = if publication.prune_deleted_refs {
             refs.keys()
-                .filter(|(candidate_repo, refname)| {
-                    candidate_repo == &repo && !desired.contains(refname.as_str())
-                })
-                .map(|(_, refname)| refname.clone())
+                .filter(|refname| !desired.contains(refname.as_str()))
+                .cloned()
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
         for refname in &pruned_refs {
-            refs.remove(&(repo.clone(), refname.clone()));
+            refs.remove(refname);
         }
         for (refname, value) in &publication.refs {
-            refs.insert((repo.clone(), refname.clone()), value.clone());
+            refs.insert(refname.clone(), value.clone());
         }
         state
             .trusted_objects
@@ -167,11 +167,13 @@ impl ImportStateStore for MemoryBackend {
         repository: &RepositoryId,
         session: &ImportSession,
     ) -> Result<()> {
-        let mut imports = self
-            .imports
+        let Some(repo) = self.existing_repo_state(tenant, repository)? else {
+            return Err(stale_import_session(tenant, repository, session));
+        };
+        let mut state = repo
+            .import
             .write()
             .map_err(|_| Error::Backend("memory import state lock poisoned".to_owned()))?;
-        let state = imports.entry(repo_key(tenant, repository)).or_default();
         if session.tenant() != tenant
             || session.repository() != repository
             || state.generation != session.generation()
@@ -198,10 +200,6 @@ fn stale_import_session(
     }
 }
 
-fn repo_key(tenant: &TenantId, repository: &RepositoryId) -> RepoKey {
-    (tenant.clone(), repository.clone())
-}
-
 impl MemoryBackend {
     /// Create an empty in-memory backend.
     #[must_use]
@@ -221,18 +219,57 @@ impl MemoryBackend {
             .map_err(|_| Error::Backend("memory event log lock poisoned".to_owned()))
     }
 
-    fn store_object(&self, repo: RepoKey, oid: ObjectId, object: &StoredObject) -> Result<()> {
-        self.objects
+    fn repo_state(&self, tenant: &TenantId, repository: &RepositoryId) -> Result<Arc<RepoState>> {
+        if let Some(state) = self
+            .repositories
+            .read()
+            .map_err(|_| Error::Backend("memory repository lock poisoned".to_owned()))?
+            .get(tenant)
+            .and_then(|repositories| repositories.get(repository))
+            .cloned()
+        {
+            return Ok(state);
+        }
+        self.repositories
+            .write()
+            .map(|mut repositories| {
+                repositories
+                    .entry(tenant.clone())
+                    .or_default()
+                    .entry(repository.clone())
+                    .or_insert_with(|| Arc::new(RepoState::default()))
+                    .clone()
+            })
+            .map_err(|_| Error::Backend("memory repository lock poisoned".to_owned()))
+    }
+
+    fn existing_repo_state(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+    ) -> Result<Option<Arc<RepoState>>> {
+        self.repositories
+            .read()
+            .map(|tenants| {
+                tenants
+                    .get(tenant)
+                    .and_then(|repositories| repositories.get(repository))
+                    .cloned()
+            })
+            .map_err(|_| Error::Backend("memory repository lock poisoned".to_owned()))
+    }
+
+    fn store_object(repo: &RepoState, oid: ObjectId, object: &StoredObject) -> Result<()> {
+        repo.objects
             .write()
             .map(|mut objects| {
-                objects.entry((repo, oid)).or_insert_with(|| object.clone());
+                objects.entry(oid).or_insert_with(|| object.clone());
             })
             .map_err(|_| Error::Backend("memory object lock poisoned".to_owned()))
     }
 
     fn indexed_commit(
-        &self,
-        repo: &RepoKey,
+        repo: &RepoState,
         oid: ObjectId,
         object: &StoredObject,
     ) -> Result<Option<IndexedCommit>> {
@@ -240,14 +277,14 @@ impl MemoryBackend {
             return Ok(None);
         }
         let commit = parse_commit(&object.data)?;
-        let commits = self
+        let commits = repo
             .commits
             .read()
             .map_err(|_| Error::Backend("memory commit graph lock poisoned".to_owned()))?;
         let generation = commit
             .parents
             .iter()
-            .filter_map(|parent| commits.get(&(repo.clone(), *parent)))
+            .filter_map(|parent| commits.get(parent))
             .map(|parent| parent.generation.saturating_add(1))
             .max()
             .unwrap_or(1);
@@ -269,22 +306,16 @@ impl MemoryBackend {
         Ok(*sequence)
     }
 
-    async fn newest_packed_object(
-        &self,
-        tenant: &TenantId,
-        repository: &RepositoryId,
+    fn newest_packed_object(
+        repo: &RepoState,
         oid: &ObjectId,
     ) -> Result<Option<(PackMetadata, PackObjectIndex, Vec<u8>)>> {
-        let repo = repo_key(tenant, repository);
-        self.packs
+        repo.packs
             .read()
             .map(|packs| {
                 packs
-                    .iter()
-                    .filter(|((candidate_repo, _), pack)| {
-                        candidate_repo == &repo && pack.index.iter().any(|entry| entry.oid == *oid)
-                    })
-                    .filter_map(|(_, pack)| {
+                    .values()
+                    .filter_map(|pack| {
                         pack.index
                             .iter()
                             .find(|entry| entry.oid == *oid)
@@ -293,6 +324,17 @@ impl MemoryBackend {
                     .max_by_key(|(metadata, _, _)| metadata.storage_order)
             })
             .map_err(|_| Error::Backend("memory pack lock poisoned".to_owned()))
+    }
+
+    fn read_object_from_state(repo: &RepoState, oid: &ObjectId) -> Result<Option<StoredObject>> {
+        if let Some((_, index, data)) = Self::newest_packed_object(repo, oid)? {
+            return crate::packfile::read_object_at_offset(&data, index.offset, oid.algo())
+                .map(Some);
+        }
+        repo.objects
+            .read()
+            .map(|objects| objects.get(oid).cloned())
+            .map_err(|_| Error::Backend("memory object lock poisoned".to_owned()))
     }
 }
 
@@ -304,14 +346,10 @@ impl ObjectStore for MemoryBackend {
         repository: &RepositoryId,
         oid: &ObjectId,
     ) -> Result<Option<StoredObject>> {
-        if let Some((_, index, data)) = self.newest_packed_object(tenant, repository, oid).await? {
-            return crate::packfile::read_object_at_offset(&data, index.offset, oid.algo())
-                .map(Some);
-        }
-        self.objects
-            .read()
-            .map(|objects| objects.get(&(repo_key(tenant, repository), *oid)).cloned())
-            .map_err(|_| Error::Backend("memory object lock poisoned".to_owned()))
+        let Some(repo) = self.existing_repo_state(tenant, repository)? else {
+            return Ok(None);
+        };
+        Self::read_object_from_state(&repo, oid)
     }
 
     async fn write_object(
@@ -321,13 +359,13 @@ impl ObjectStore for MemoryBackend {
         oid: &ObjectId,
         object: &StoredObject,
     ) -> Result<()> {
-        let repo = repo_key(tenant, repository);
-        self.store_object(repo.clone(), *oid, object)?;
-        if let Some(commit) = self.indexed_commit(&repo, *oid, object)? {
-            self.commits
+        let repo = self.repo_state(tenant, repository)?;
+        Self::store_object(&repo, *oid, object)?;
+        if let Some(commit) = Self::indexed_commit(&repo, *oid, object)? {
+            repo.commits
                 .write()
                 .map(|mut commits| {
-                    commits.insert((repo, *oid), commit);
+                    commits.insert(*oid, commit);
                 })
                 .map_err(|_| Error::Backend("memory commit graph lock poisoned".to_owned()))?;
         }
@@ -341,7 +379,8 @@ impl ObjectStore for MemoryBackend {
         oid: &ObjectId,
         object: &StoredObject,
     ) -> Result<()> {
-        self.store_object(repo_key(tenant, repository), *oid, object)
+        let repo = self.repo_state(tenant, repository)?;
+        Self::store_object(&repo, *oid, object)
     }
 
     async fn write_imported_objects(
@@ -350,13 +389,13 @@ impl ObjectStore for MemoryBackend {
         repository: &RepositoryId,
         imported: Vec<(ObjectId, StoredObject)>,
     ) -> Result<()> {
-        let repo = repo_key(tenant, repository);
-        self.objects
+        let repo = self.repo_state(tenant, repository)?;
+        repo.objects
             .write()
             .map(|mut objects| {
                 objects.reserve(imported.len());
                 for (oid, object) in imported {
-                    objects.entry((repo.clone(), oid)).or_insert(object);
+                    objects.entry(oid).or_insert(object);
                 }
             })
             .map_err(|_| Error::Backend("memory object lock poisoned".to_owned()))
@@ -368,16 +407,15 @@ impl ObjectStore for MemoryBackend {
         repository: &RepositoryId,
         oid: &ObjectId,
     ) -> Result<bool> {
-        if self
-            .newest_packed_object(tenant, repository, oid)
-            .await?
-            .is_some()
-        {
+        let Some(repo) = self.existing_repo_state(tenant, repository)? else {
+            return Ok(false);
+        };
+        if Self::newest_packed_object(&repo, oid)?.is_some() {
             return Ok(true);
         }
-        self.objects
+        repo.objects
             .read()
-            .map(|objects| objects.contains_key(&(repo_key(tenant, repository), *oid)))
+            .map(|objects| objects.contains_key(oid))
             .map_err(|_| Error::Backend("memory object lock poisoned".to_owned()))
     }
 
@@ -391,27 +429,26 @@ impl ObjectStore for MemoryBackend {
         repository: &RepositoryId,
         kind: Option<ObjectKind>,
     ) -> Result<Vec<(ObjectId, ObjectKind)>> {
-        let repo = repo_key(tenant, repository);
-        let mut ids = self
+        let Some(repo) = self.existing_repo_state(tenant, repository)? else {
+            return Ok(Vec::new());
+        };
+        let mut ids = repo
             .objects
             .read()
             .map(|objects| {
                 objects
                     .iter()
-                    .filter(|((candidate_repo, _), object)| {
-                        candidate_repo == &repo && kind.is_none_or(|kind| object.kind == kind)
-                    })
-                    .map(|((_, oid), object)| (*oid, object.kind))
+                    .filter(|(_, object)| kind.is_none_or(|kind| object.kind == kind))
+                    .map(|(oid, object)| (*oid, object.kind))
                     .collect::<HashMap<_, _>>()
             })
             .map_err(|_| Error::Backend("memory object lock poisoned".to_owned()))?;
-        for pack in self
+        for pack in repo
             .packs
             .read()
             .map_err(|_| Error::Backend("memory pack lock poisoned".to_owned()))?
-            .iter()
-            .filter(|((candidate_repo, _), _)| candidate_repo == &repo)
-            .map(|(_, pack)| pack.clone())
+            .values()
+            .cloned()
         {
             for entry in pack.index {
                 if kind.is_none_or(|kind| entry.kind == kind) {
@@ -433,12 +470,12 @@ impl RefStore for MemoryBackend {
         repository: &RepositoryId,
         refname: &str,
     ) -> Result<Option<StoredRef>> {
-        self.refs
+        let Some(repo) = self.existing_repo_state(tenant, repository)? else {
+            return Ok(None);
+        };
+        repo.refs
             .read()
-            .map(|refs| {
-                refs.get(&(repo_key(tenant, repository), refname.to_owned()))
-                    .cloned()
-            })
+            .map(|refs| refs.get(refname).cloned())
             .map_err(|_| Error::Backend("memory ref lock poisoned".to_owned()))
     }
 
@@ -450,18 +487,18 @@ impl RefStore for MemoryBackend {
         value: &StoredRef,
         expected: Option<Option<StoredRef>>,
     ) -> Result<()> {
-        let key = (repo_key(tenant, repository), refname.to_owned());
-        let mut refs = self
+        let repo = self.repo_state(tenant, repository)?;
+        let mut refs = repo
             .refs
             .write()
             .map_err(|_| Error::Backend("memory ref lock poisoned".to_owned()))?;
         if let Some(expected) = expected {
-            let current = refs.get(&key).cloned();
+            let current = refs.get(refname).cloned();
             if current != expected {
                 return Err(Error::RefConflict(refname.to_owned()));
             }
         }
-        refs.insert(key, value.clone());
+        refs.insert(refname.to_owned(), value.clone());
         Ok(())
     }
 
@@ -472,18 +509,23 @@ impl RefStore for MemoryBackend {
         refname: &str,
         expected: Option<StoredRef>,
     ) -> Result<()> {
-        let key = (repo_key(tenant, repository), refname.to_owned());
-        let mut refs = self
+        let Some(repo) = self.existing_repo_state(tenant, repository)? else {
+            if expected.is_some() {
+                return Err(Error::RefConflict(refname.to_owned()));
+            }
+            return Ok(());
+        };
+        let mut refs = repo
             .refs
             .write()
             .map_err(|_| Error::Backend("memory ref lock poisoned".to_owned()))?;
         if let Some(expected) = expected {
-            let current = refs.get(&key).cloned();
+            let current = refs.get(refname).cloned();
             if current != Some(expected) {
                 return Err(Error::RefConflict(refname.to_owned()));
             }
         }
-        refs.remove(&key);
+        refs.remove(refname);
         Ok(())
     }
 
@@ -493,15 +535,15 @@ impl RefStore for MemoryBackend {
         repository: &RepositoryId,
         prefix: &str,
     ) -> Result<Vec<(String, StoredRef)>> {
-        let repo = repo_key(tenant, repository);
-        self.refs
+        let Some(repo) = self.existing_repo_state(tenant, repository)? else {
+            return Ok(Vec::new());
+        };
+        repo.refs
             .read()
             .map(|refs| {
                 refs.iter()
-                    .filter(|((candidate_repo, refname), _)| {
-                        candidate_repo == &repo && refname.starts_with(prefix)
-                    })
-                    .map(|((_, refname), value)| (refname.clone(), value.clone()))
+                    .filter(|(refname, _)| refname.starts_with(prefix))
+                    .map(|(refname, value)| (refname.clone(), value.clone()))
                     .collect()
             })
             .map_err(|_| Error::Backend("memory ref lock poisoned".to_owned()))
@@ -516,11 +558,12 @@ impl ReflogStore for MemoryBackend {
         repository: &RepositoryId,
         entry: &ReflogEntry,
     ) -> Result<()> {
-        self.reflogs
+        let repo = self.repo_state(tenant, repository)?;
+        repo.reflogs
             .write()
             .map(|mut reflogs| {
                 reflogs
-                    .entry((repo_key(tenant, repository), entry.refname.clone()))
+                    .entry(entry.refname.clone())
                     .or_default()
                     .push(entry.clone());
             })
@@ -533,14 +576,12 @@ impl ReflogStore for MemoryBackend {
         repository: &RepositoryId,
         refname: &str,
     ) -> Result<Vec<ReflogEntry>> {
-        self.reflogs
+        let Some(repo) = self.existing_repo_state(tenant, repository)? else {
+            return Ok(Vec::new());
+        };
+        repo.reflogs
             .read()
-            .map(|reflogs| {
-                reflogs
-                    .get(&(repo_key(tenant, repository), refname.to_owned()))
-                    .cloned()
-                    .unwrap_or_default()
-            })
+            .map(|reflogs| reflogs.get(refname).cloned().unwrap_or_default())
             .map_err(|_| Error::Backend("memory reflog lock poisoned".to_owned()))
     }
 }
@@ -553,13 +594,12 @@ impl ConfigStore for MemoryBackend {
         repository: &RepositoryId,
         key: &str,
     ) -> Result<Option<String>> {
-        self.config
+        let Some(repo) = self.existing_repo_state(tenant, repository)? else {
+            return Ok(None);
+        };
+        repo.config
             .read()
-            .map(|config| {
-                config
-                    .get(&(repo_key(tenant, repository), key.to_owned()))
-                    .cloned()
-            })
+            .map(|config| config.get(key).cloned())
             .map_err(|_| Error::Backend("memory config lock poisoned".to_owned()))
     }
 
@@ -570,13 +610,11 @@ impl ConfigStore for MemoryBackend {
         key: &str,
         value: &str,
     ) -> Result<()> {
-        self.config
+        let repo = self.repo_state(tenant, repository)?;
+        repo.config
             .write()
             .map(|mut config| {
-                config.insert(
-                    (repo_key(tenant, repository), key.to_owned()),
-                    value.to_owned(),
-                );
+                config.insert(key.to_owned(), value.to_owned());
             })
             .map_err(|_| Error::Backend("memory config lock poisoned".to_owned()))
     }
@@ -587,16 +625,16 @@ impl ConfigStore for MemoryBackend {
         repository: &RepositoryId,
         prefix: &str,
     ) -> Result<Vec<(String, String)>> {
-        let repo = repo_key(tenant, repository);
-        self.config
+        let Some(repo) = self.existing_repo_state(tenant, repository)? else {
+            return Ok(Vec::new());
+        };
+        repo.config
             .read()
             .map(|config| {
                 config
                     .iter()
-                    .filter(|((candidate_repo, key), _)| {
-                        candidate_repo == &repo && key.starts_with(prefix)
-                    })
-                    .map(|((_, key), value)| (key.clone(), value.clone()))
+                    .filter(|(key, _)| key.starts_with(prefix))
+                    .map(|(key, value)| (key.clone(), value.clone()))
                     .collect()
             })
             .map_err(|_| Error::Backend("memory config lock poisoned".to_owned()))
@@ -611,15 +649,12 @@ impl BrowseIndex for MemoryBackend {
         repository: &RepositoryId,
         entries: &[IndexedTreeEntry],
     ) -> Result<()> {
-        let repo = repo_key(tenant, repository);
-        self.trees
+        let repo = self.repo_state(tenant, repository)?;
+        repo.trees
             .write()
             .map(|mut trees| {
                 for entry in entries {
-                    trees.insert(
-                        (repo.clone(), entry.tree_oid, entry.path.clone()),
-                        entry.clone(),
-                    );
+                    trees.insert((entry.tree_oid, entry.path.clone()), entry.clone());
                 }
             })
             .map_err(|_| Error::Backend("memory tree lock poisoned".to_owned()))
@@ -631,16 +666,13 @@ impl BrowseIndex for MemoryBackend {
         repository: &RepositoryId,
         entries: &[IndexedTreeEntry],
     ) -> Result<()> {
-        let repo = repo_key(tenant, repository);
-        self.trees
+        let repo = self.repo_state(tenant, repository)?;
+        repo.trees
             .write()
             .map(|mut trees| {
-                trees.retain(|(candidate_repo, _, _), _| candidate_repo != &repo);
+                trees.clear();
                 for entry in entries {
-                    trees.insert(
-                        (repo.clone(), entry.tree_oid, entry.path.clone()),
-                        entry.clone(),
-                    );
+                    trees.insert((entry.tree_oid, entry.path.clone()), entry.clone());
                 }
             })
             .map_err(|_| Error::Backend("memory tree lock poisoned".to_owned()))
@@ -653,16 +685,16 @@ impl BrowseIndex for MemoryBackend {
         tree_oid: &ObjectId,
         prefix: &str,
     ) -> Result<Vec<IndexedTreeEntry>> {
-        let repo = repo_key(tenant, repository);
-        self.trees
+        let Some(repo) = self.existing_repo_state(tenant, repository)? else {
+            return Ok(Vec::new());
+        };
+        repo.trees
             .read()
             .map(|trees| {
                 trees
-                    .range((repo.clone(), *tree_oid, prefix.to_owned())..)
-                    .take_while(|((candidate_repo, candidate_tree, path), _)| {
-                        candidate_repo == &repo
-                            && candidate_tree == tree_oid
-                            && path.starts_with(prefix)
+                    .range((*tree_oid, prefix.to_owned())..)
+                    .take_while(|((candidate_tree, path), _)| {
+                        candidate_tree == tree_oid && path.starts_with(prefix)
                     })
                     .map(|(_, entry)| entry.clone())
                     .collect()
@@ -677,15 +709,17 @@ impl BrowseIndex for MemoryBackend {
         tree_oid: &ObjectId,
         path: &str,
     ) -> Result<Option<StoredObject>> {
-        let repo = repo_key(tenant, repository);
-        let oid = self
+        let Some(repo) = self.existing_repo_state(tenant, repository)? else {
+            return Ok(None);
+        };
+        let oid = repo
             .trees
             .read()
             .map_err(|_| Error::Backend("memory tree lock poisoned".to_owned()))?
-            .get(&(repo.clone(), *tree_oid, path.to_owned()))
+            .get(&(*tree_oid, path.to_owned()))
             .map(|entry| entry.oid);
         match oid {
-            Some(oid) => self.read_object(tenant, repository, &oid).await,
+            Some(oid) => Self::read_object_from_state(&repo, &oid),
             None => Ok(None),
         }
     }
@@ -699,12 +733,12 @@ impl CommitGraphStore for MemoryBackend {
         repository: &RepositoryId,
         commits: &[IndexedCommit],
     ) -> Result<()> {
-        let repo = repo_key(tenant, repository);
-        self.commits
+        let repo = self.repo_state(tenant, repository)?;
+        repo.commits
             .write()
             .map(|mut stored| {
                 for commit in commits {
-                    stored.insert((repo.clone(), commit.oid), commit.clone());
+                    stored.insert(commit.oid, commit.clone());
                 }
             })
             .map_err(|_| Error::Backend("memory commit graph lock poisoned".to_owned()))
@@ -716,13 +750,13 @@ impl CommitGraphStore for MemoryBackend {
         repository: &RepositoryId,
         commits: &[IndexedCommit],
     ) -> Result<()> {
-        let repo = repo_key(tenant, repository);
-        self.commits
+        let repo = self.repo_state(tenant, repository)?;
+        repo.commits
             .write()
             .map(|mut stored| {
-                stored.retain(|(candidate_repo, _), _| candidate_repo != &repo);
+                stored.clear();
                 for commit in commits {
-                    stored.insert((repo.clone(), commit.oid), commit.clone());
+                    stored.insert(commit.oid, commit.clone());
                 }
             })
             .map_err(|_| Error::Backend("memory commit graph lock poisoned".to_owned()))
@@ -734,9 +768,12 @@ impl CommitGraphStore for MemoryBackend {
         repository: &RepositoryId,
         oid: &ObjectId,
     ) -> Result<Option<IndexedCommit>> {
-        self.commits
+        let Some(repo) = self.existing_repo_state(tenant, repository)? else {
+            return Ok(None);
+        };
+        repo.commits
             .read()
-            .map(|commits| commits.get(&(repo_key(tenant, repository), *oid)).cloned())
+            .map(|commits| commits.get(oid).cloned())
             .map_err(|_| Error::Backend("memory commit graph lock poisoned".to_owned()))
     }
 
@@ -759,16 +796,16 @@ impl CommitGraphStore for MemoryBackend {
         repository: &RepositoryId,
         oid: &ObjectId,
     ) -> Result<Vec<ObjectId>> {
-        let repo = repo_key(tenant, repository);
-        self.commits
+        let Some(repo) = self.existing_repo_state(tenant, repository)? else {
+            return Ok(Vec::new());
+        };
+        repo.commits
             .read()
             .map(|commits| {
                 let mut children = commits
                     .iter()
-                    .filter(|((candidate_repo, _), commit)| {
-                        candidate_repo == &repo && commit.parents.contains(oid)
-                    })
-                    .map(|((_, child), _)| *child)
+                    .filter(|(_, commit)| commit.parents.contains(oid))
+                    .map(|(child, _)| *child)
                     .collect::<Vec<_>>();
                 children.sort();
                 children
@@ -781,15 +818,13 @@ impl CommitGraphStore for MemoryBackend {
         tenant: &TenantId,
         repository: &RepositoryId,
     ) -> Result<Vec<IndexedCommit>> {
-        let repo = repo_key(tenant, repository);
-        self.commits
+        let Some(repo) = self.existing_repo_state(tenant, repository)? else {
+            return Ok(Vec::new());
+        };
+        repo.commits
             .read()
             .map(|commits| {
-                let mut commits = commits
-                    .iter()
-                    .filter(|((candidate_repo, _), _)| candidate_repo == &repo)
-                    .map(|(_, commit)| commit.clone())
-                    .collect::<Vec<_>>();
+                let mut commits = commits.values().cloned().collect::<Vec<_>>();
                 commits.sort_by(|left, right| {
                     right
                         .commit_time
@@ -810,9 +845,9 @@ impl PackStore for MemoryBackend {
         repository: &RepositoryId,
         pack: &StoredPack,
     ) -> Result<PackMetadata> {
-        let repo = repo_key(tenant, repository);
-        let key = (repo, pack.metadata.pack_checksum.clone());
-        let mut packs = self
+        let repo = self.repo_state(tenant, repository)?;
+        let key = pack.metadata.pack_checksum.clone();
+        let mut packs = repo
             .packs
             .write()
             .map_err(|_| Error::Backend("memory pack lock poisoned".to_owned()))?;
@@ -832,13 +867,12 @@ impl PackStore for MemoryBackend {
         repository: &RepositoryId,
         pack_checksum: &[u8],
     ) -> Result<Option<PackMetadata>> {
-        self.packs
+        let Some(repo) = self.existing_repo_state(tenant, repository)? else {
+            return Ok(None);
+        };
+        repo.packs
             .read()
-            .map(|packs| {
-                packs
-                    .get(&(repo_key(tenant, repository), pack_checksum.to_vec()))
-                    .map(|pack| pack.metadata.clone())
-            })
+            .map(|packs| packs.get(pack_checksum).map(|pack| pack.metadata.clone()))
             .map_err(|_| Error::Backend("memory pack lock poisoned".to_owned()))
     }
 
@@ -848,13 +882,12 @@ impl PackStore for MemoryBackend {
         repository: &RepositoryId,
         pack_checksum: &[u8],
     ) -> Result<Option<Vec<u8>>> {
-        self.packs
+        let Some(repo) = self.existing_repo_state(tenant, repository)? else {
+            return Ok(None);
+        };
+        repo.packs
             .read()
-            .map(|packs| {
-                packs
-                    .get(&(repo_key(tenant, repository), pack_checksum.to_vec()))
-                    .map(|pack| pack.data.clone())
-            })
+            .map(|packs| packs.get(pack_checksum).map(|pack| pack.data.clone()))
             .map_err(|_| Error::Backend("memory pack lock poisoned".to_owned()))
     }
 
@@ -864,10 +897,10 @@ impl PackStore for MemoryBackend {
         repository: &RepositoryId,
         oid: &ObjectId,
     ) -> Result<Option<(PackMetadata, PackObjectIndex)>> {
-        Ok(self
-            .newest_packed_object(tenant, repository, oid)
-            .await?
-            .map(|(metadata, index, _)| (metadata, index)))
+        let Some(repo) = self.existing_repo_state(tenant, repository)? else {
+            return Ok(None);
+        };
+        Ok(Self::newest_packed_object(&repo, oid)?.map(|(metadata, index, _)| (metadata, index)))
     }
 
     async fn read_pack_index_at_offset(
@@ -877,17 +910,18 @@ impl PackStore for MemoryBackend {
         pack_checksum: &[u8],
         offset: u64,
     ) -> Result<Option<PackObjectIndex>> {
-        self.packs
+        let Some(repo) = self.existing_repo_state(tenant, repository)? else {
+            return Ok(None);
+        };
+        repo.packs
             .read()
             .map(|packs| {
-                packs
-                    .get(&(repo_key(tenant, repository), pack_checksum.to_vec()))
-                    .and_then(|pack| {
-                        pack.index
-                            .iter()
-                            .find(|entry| entry.offset == offset)
-                            .cloned()
-                    })
+                packs.get(pack_checksum).and_then(|pack| {
+                    pack.index
+                        .iter()
+                        .find(|entry| entry.offset == offset)
+                        .cloned()
+                })
             })
             .map_err(|_| Error::Backend("memory pack lock poisoned".to_owned()))
     }
@@ -897,14 +931,15 @@ impl PackStore for MemoryBackend {
         tenant: &TenantId,
         repository: &RepositoryId,
     ) -> Result<Vec<PackMetadata>> {
-        let repo = repo_key(tenant, repository);
-        self.packs
+        let Some(repo) = self.existing_repo_state(tenant, repository)? else {
+            return Ok(Vec::new());
+        };
+        repo.packs
             .read()
             .map(|packs| {
                 let mut metadata = packs
-                    .iter()
-                    .filter(|((candidate_repo, _), _)| candidate_repo == &repo)
-                    .map(|(_, pack)| pack.metadata.clone())
+                    .values()
+                    .map(|pack| pack.metadata.clone())
                     .collect::<Vec<_>>();
                 metadata.sort_by_key(|pack| pack.storage_order);
                 metadata
@@ -918,15 +953,16 @@ impl PackStore for MemoryBackend {
         repository: &RepositoryId,
         pack_checksum: Option<&[u8]>,
     ) -> Result<Vec<(PackMetadata, PackObjectIndex)>> {
-        let repo = repo_key(tenant, repository);
-        self.packs
+        let Some(repo) = self.existing_repo_state(tenant, repository)? else {
+            return Ok(Vec::new());
+        };
+        repo.packs
             .read()
             .map(|packs| {
                 let mut rows = packs
                     .iter()
-                    .filter(|((candidate_repo, checksum), _)| {
-                        candidate_repo == &repo
-                            && pack_checksum.is_none_or(|wanted| checksum.as_slice() == wanted)
+                    .filter(|(checksum, _)| {
+                        pack_checksum.is_none_or(|wanted| checksum.as_slice() == wanted)
                     })
                     .flat_map(|(_, pack)| {
                         pack.index
@@ -954,13 +990,12 @@ impl Cache for MemoryBackend {
         repository: &RepositoryId,
         key: &CacheKey,
     ) -> Result<Option<CacheValue>> {
-        self.cache
+        let Some(repo) = self.existing_repo_state(tenant, repository)? else {
+            return Ok(None);
+        };
+        repo.cache
             .read()
-            .map(|cache| {
-                cache
-                    .get(&(repo_key(tenant, repository), key.clone()))
-                    .cloned()
-            })
+            .map(|cache| cache.get(key).cloned())
             .map_err(|_| Error::Cache("memory cache lock poisoned".to_owned()))
     }
 
@@ -971,10 +1006,11 @@ impl Cache for MemoryBackend {
         key: &CacheKey,
         value: CacheValue,
     ) -> Result<()> {
-        self.cache
+        let repo = self.repo_state(tenant, repository)?;
+        repo.cache
             .write()
             .map(|mut cache| {
-                cache.insert((repo_key(tenant, repository), key.clone()), value);
+                cache.insert(key.clone(), value);
             })
             .map_err(|_| Error::Cache("memory cache lock poisoned".to_owned()))
     }
@@ -985,10 +1021,13 @@ impl Cache for MemoryBackend {
         repository: &RepositoryId,
         key: &CacheKey,
     ) -> Result<()> {
-        self.cache
+        let Some(repo) = self.existing_repo_state(tenant, repository)? else {
+            return Ok(());
+        };
+        repo.cache
             .write()
             .map(|mut cache| {
-                cache.remove(&(repo_key(tenant, repository), key.clone()));
+                cache.remove(key);
             })
             .map_err(|_| Error::Cache("memory cache lock poisoned".to_owned()))
     }
@@ -998,11 +1037,13 @@ impl Cache for MemoryBackend {
         tenant: &TenantId,
         repository: &RepositoryId,
     ) -> Result<()> {
-        let repo = repo_key(tenant, repository);
-        self.cache
+        let Some(repo) = self.existing_repo_state(tenant, repository)? else {
+            return Ok(());
+        };
+        repo.cache
             .write()
             .map(|mut cache| {
-                cache.retain(|(candidate_repo, _), _| candidate_repo != &repo);
+                cache.clear();
             })
             .map_err(|_| Error::Cache("memory cache lock poisoned".to_owned()))
     }
