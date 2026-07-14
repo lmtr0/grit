@@ -1736,13 +1736,72 @@ async fn install_database_pack_in_transaction(
         ))
     })?;
 
+    replace_pack_index_in_transaction(tx, tenant, repository, &pack_checksum, index, values)
+        .await?;
+
+    row_to_pack_metadata(&row)
+}
+
+/// Install metadata and index rows for pack bytes held by an external backend.
+pub(crate) async fn install_external_pack_in_transaction(
+    tx: &mut Transaction<'static, Postgres>,
+    tenant: &TenantId,
+    repository: &RepositoryId,
+    metadata: &PackMetadata,
+    index: &[PackObjectIndex],
+    values: &PgPackValues,
+    backend_name: &str,
+    storage_key: &str,
+) -> Result<PackMetadata> {
+    let pack_checksum = bytes_to_hex(&metadata.pack_checksum);
+    let index_checksum = bytes_to_hex(&metadata.index_checksum);
+    let row = sqlx::query(
+        "insert into grit_packs
+            (tenant_id, repository_id, pack_checksum, index_checksum, data,
+             storage_backend, storage_key, object_count, size_bytes)
+         values ($1, $2, $3, $4, null, $5, $6, $7, $8)
+         on conflict (tenant_id, repository_id, pack_checksum)
+         do update set pack_checksum = excluded.pack_checksum
+         where grit_packs.object_count = excluded.object_count
+           and grit_packs.size_bytes = excluded.size_bytes
+         returning pack_checksum, index_checksum, object_count, size_bytes, storage_order",
+    )
+    .bind(tenant.as_str())
+    .bind(repository.as_str())
+    .bind(&pack_checksum)
+    .bind(&index_checksum)
+    .bind(backend_name)
+    .bind(storage_key)
+    .bind(values.object_count)
+    .bind(values.size_bytes)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let row = row.ok_or_else(|| {
+        Error::Protocol(format!(
+            "stored pack {pack_checksum} conflicts with imported external metadata"
+        ))
+    })?;
+
+    replace_pack_index_in_transaction(tx, tenant, repository, &pack_checksum, index, values)
+        .await?;
+    row_to_pack_metadata(&row)
+}
+
+async fn replace_pack_index_in_transaction(
+    tx: &mut Transaction<'static, Postgres>,
+    tenant: &TenantId,
+    repository: &RepositoryId,
+    pack_checksum: &str,
+    index: &[PackObjectIndex],
+    values: &PgPackValues,
+) -> Result<()> {
     sqlx::query(
         "delete from grit_pack_objects
          where tenant_id = $1 and repository_id = $2 and pack_checksum = $3",
     )
     .bind(tenant.as_str())
     .bind(repository.as_str())
-    .bind(&pack_checksum)
+    .bind(pack_checksum)
     .execute(&mut **tx)
     .await?;
 
@@ -1762,7 +1821,7 @@ async fn install_database_pack_in_transaction(
             |mut row, (entry, value)| {
                 row.push_bind(tenant.as_str())
                     .push_bind(repository.as_str())
-                    .push_bind(&pack_checksum)
+                    .push_bind(pack_checksum)
                     .push_bind(entry.oid.to_hex())
                     .push_bind(kind_to_name(entry.kind))
                     .push_bind(value.offset)
@@ -1773,10 +1832,10 @@ async fn install_database_pack_in_transaction(
         query.build().persistent(false).execute(&mut **tx).await?;
     }
 
-    row_to_pack_metadata(&row)
+    Ok(())
 }
 
-struct PgPackValues {
+pub(crate) struct PgPackValues {
     object_count: i32,
     size_bytes: i64,
     index: Vec<PgPackIndexValues>,
@@ -1788,7 +1847,7 @@ struct PgPackIndexValues {
     compressed_size: i64,
 }
 
-fn prepare_pack_values(
+pub(crate) fn prepare_pack_values(
     metadata: &PackMetadata,
     data_len: usize,
     index_rows: &[PackObjectIndex],
@@ -1849,12 +1908,12 @@ fn prepare_pack_values(
     })
 }
 
-struct PreparedImportedPack {
-    pack: ImportedPack,
-    values: PgPackValues,
+pub(crate) struct PreparedImportedPack {
+    pub(crate) pack: ImportedPack,
+    pub(crate) values: PgPackValues,
 }
 
-fn prepare_imported_pack_batch(
+pub(crate) fn prepare_imported_pack_batch(
     packs: Vec<ImportedPack>,
 ) -> Result<(Vec<PreparedImportedPack>, Vec<usize>)> {
     let mut checksum_indexes = HashMap::<Vec<u8>, usize>::with_capacity(packs.len());

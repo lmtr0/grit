@@ -4,20 +4,21 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use grit_lib::objects::{ObjectId, ObjectKind};
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx::{PgPool, Row};
 
 use crate::error::{Error, Result};
 use crate::external::ExternalByteStore;
 use crate::ids::{RepositoryId, TenantId};
 use crate::sqlx_postgres::{
-    lock_import_repository, write_imported_object_rows_in_transaction, ImportedObjectRow,
+    install_external_pack_in_transaction, lock_import_repository, prepare_imported_pack_batch,
+    prepare_pack_values, write_imported_object_rows_in_transaction, ImportedObjectRow,
     PgServerStorage,
 };
 use crate::storage::{
     BrowseIndex, CommitGraphStore, ConfigStore, ImportPublication, ImportPublicationResult,
-    ImportSession, ImportStateStore, IndexedCommit, IndexedTreeEntry, ObjectStore, PackMetadata,
-    PackObjectIndex, PackStore, RefStore, ReflogEntry, ReflogStore, StoredObject, StoredPack,
-    StoredRef,
+    ImportSession, ImportStateStore, ImportedPack, IndexedCommit, IndexedTreeEntry, ObjectStore,
+    PackMetadata, PackObjectIndex, PackStore, RefStore, ReflogEntry, ReflogStore, StoredObject,
+    StoredPack, StoredRef,
 };
 
 /// Configuration for a PostgreSQL-backed repository that externalizes immutable bytes.
@@ -602,6 +603,67 @@ impl<B> PackStore for PgExternalizedStorage<B>
 where
     B: ExternalByteStore,
 {
+    fn supports_native_pack_import(&self) -> bool {
+        self.options.write_packs_externally || self.sql.supports_native_pack_import()
+    }
+
+    async fn write_imported_packs(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        packs: Vec<ImportedPack>,
+    ) -> Result<Vec<PackMetadata>> {
+        if !self.options.write_packs_externally {
+            return self
+                .sql
+                .write_imported_packs(tenant, repository, packs)
+                .await;
+        }
+
+        let (prepared, result_indexes) = prepare_imported_pack_batch(packs)?;
+        let mut storage_keys = Vec::with_capacity(prepared.len());
+        for prepared_pack in &prepared {
+            let pack = &prepared_pack.pack;
+            let key = self.pack_key(
+                tenant,
+                repository,
+                &pack.metadata.pack_checksum,
+                validated_pack_algo_name(&pack.metadata, &pack.index),
+            );
+            self.bytes
+                .put_large_if_absent(&key, pack.data.as_slice())
+                .await?;
+            storage_keys.push(key);
+        }
+
+        // SQL is the visibility boundary. A later transaction failure may leave immutable,
+        // content-addressed bytes for the orphan sweeper, but cannot expose partial pack rows.
+        let mut tx = self.pool().begin().await?;
+        lock_import_repository(&mut tx, tenant, repository).await?;
+        let mut unique_metadata = Vec::with_capacity(prepared.len());
+        for (prepared_pack, storage_key) in prepared.iter().zip(&storage_keys) {
+            unique_metadata.push(
+                install_external_pack_in_transaction(
+                    &mut tx,
+                    tenant,
+                    repository,
+                    &prepared_pack.pack.metadata,
+                    &prepared_pack.pack.index,
+                    &prepared_pack.values,
+                    &self.options.backend_name,
+                    storage_key,
+                )
+                .await?,
+            );
+        }
+        tx.commit().await?;
+
+        Ok(result_indexes
+            .into_iter()
+            .map(|index| unique_metadata[index].clone())
+            .collect())
+    }
+
     async fn write_pack(
         &self,
         tenant: &TenantId,
@@ -612,23 +674,23 @@ where
             return self.sql.write_pack(tenant, repository, pack).await;
         }
 
+        let values = prepare_pack_values(&pack.metadata, pack.data.len(), &pack.index)?;
         let key = self.pack_key(
             tenant,
             repository,
             &pack.metadata.pack_checksum,
-            pack.index
-                .first()
-                .map(|entry| entry.oid.algo().name())
-                .unwrap_or("sha1"),
+            validated_pack_algo_name(&pack.metadata, &pack.index),
         );
         self.bytes.put_large_if_absent(&key, &pack.data).await?;
         let mut tx = self.pool().begin().await?;
         lock_import_repository(&mut tx, tenant, repository).await?;
-        let metadata = write_external_pack_metadata_in_transaction(
+        let metadata = install_external_pack_in_transaction(
             &mut tx,
             tenant,
             repository,
-            pack,
+            &pack.metadata,
+            &pack.index,
+            &values,
             &self.options.backend_name,
             &key,
         )
@@ -738,77 +800,17 @@ where
     }
 }
 
-async fn write_external_pack_metadata_in_transaction(
-    tx: &mut Transaction<'static, Postgres>,
-    tenant: &TenantId,
-    repository: &RepositoryId,
-    pack: &StoredPack,
-    backend_name: &str,
-    storage_key: &str,
-) -> Result<PackMetadata> {
-    lock_import_repository(tx, tenant, repository).await?;
-    let object_count = i32::try_from(pack.metadata.object_count)
-        .map_err(|_| Error::Backend("pack object count exceeds i32".to_owned()))?;
-    let size_bytes = i64::try_from(pack.metadata.size_bytes)
-        .map_err(|_| Error::Backend("pack size exceeds i64".to_owned()))?;
-    let pack_checksum = bytes_to_hex(&pack.metadata.pack_checksum);
-    let index_checksum = bytes_to_hex(&pack.metadata.index_checksum);
-    let row = sqlx::query(
-        "insert into grit_packs
-            (tenant_id, repository_id, pack_checksum, index_checksum, data,
-             storage_backend, storage_key, object_count, size_bytes)
-         values ($1, $2, $3, $4, null, $5, $6, $7, $8)
-         on conflict (tenant_id, repository_id, pack_checksum)
-         do update set pack_checksum = excluded.pack_checksum
-         returning pack_checksum, index_checksum, object_count, size_bytes, storage_order",
+fn validated_pack_algo_name(metadata: &PackMetadata, index: &[PackObjectIndex]) -> &'static str {
+    index.first().map_or_else(
+        || {
+            if metadata.pack_checksum.len() == 32 {
+                "sha256"
+            } else {
+                "sha1"
+            }
+        },
+        |entry| entry.oid.algo().name(),
     )
-    .bind(tenant.as_str())
-    .bind(repository.as_str())
-    .bind(&pack_checksum)
-    .bind(&index_checksum)
-    .bind(backend_name)
-    .bind(storage_key)
-    .bind(object_count)
-    .bind(size_bytes)
-    .fetch_one(&mut **tx)
-    .await?;
-
-    sqlx::query(
-        "delete from grit_pack_objects
-         where tenant_id = $1 and repository_id = $2 and pack_checksum = $3",
-    )
-    .bind(tenant.as_str())
-    .bind(repository.as_str())
-    .bind(&pack_checksum)
-    .execute(&mut **tx)
-    .await?;
-
-    for entry in &pack.index {
-        let offset = i64::try_from(entry.offset)
-            .map_err(|_| Error::Backend("pack object offset exceeds i64".to_owned()))?;
-        let size = i64::try_from(entry.size)
-            .map_err(|_| Error::Backend("pack object size exceeds i64".to_owned()))?;
-        let compressed_size = i64::try_from(entry.compressed_size)
-            .map_err(|_| Error::Backend("pack object compressed size exceeds i64".to_owned()))?;
-        sqlx::query(
-            "insert into grit_pack_objects
-                (tenant_id, repository_id, pack_checksum, oid, kind, offset, size,
-                 compressed_size)
-             values ($1, $2, $3, $4, $5, $6, $7, $8)",
-        )
-        .bind(tenant.as_str())
-        .bind(repository.as_str())
-        .bind(&pack_checksum)
-        .bind(entry.oid.to_hex())
-        .bind(kind_to_name(entry.kind))
-        .bind(offset)
-        .bind(size)
-        .bind(compressed_size)
-        .execute(&mut **tx)
-        .await?;
-    }
-
-    row_to_pack_metadata(&row)
 }
 
 fn stored_bytes_from_row(row: &sqlx::postgres::PgRow) -> Result<StoredBytes> {
@@ -816,26 +818,6 @@ fn stored_bytes_from_row(row: &sqlx::postgres::PgRow) -> Result<StoredBytes> {
         data: row.try_get("data")?,
         storage_backend: row.try_get("storage_backend")?,
         storage_key: row.try_get("storage_key")?,
-    })
-}
-
-fn row_to_pack_metadata(row: &sqlx::postgres::PgRow) -> Result<PackMetadata> {
-    let pack_checksum: String = row.try_get("pack_checksum")?;
-    let index_checksum: String = row.try_get("index_checksum")?;
-    let object_count: i32 = row.try_get("object_count")?;
-    let size_bytes: i64 = row.try_get("size_bytes")?;
-    let storage_order: i64 = row.try_get("storage_order")?;
-    if object_count < 0 || size_bytes < 0 || storage_order < 0 {
-        return Err(Error::Backend(
-            "pack metadata contains negative numeric values".to_owned(),
-        ));
-    }
-    Ok(PackMetadata {
-        pack_checksum: hex_to_bytes(&pack_checksum)?,
-        index_checksum: hex_to_bytes(&index_checksum)?,
-        object_count: object_count as u32,
-        size_bytes: size_bytes as u64,
-        storage_order: storage_order as u64,
     })
 }
 
@@ -862,15 +844,6 @@ fn scoped_key(
     }
 }
 
-fn kind_to_name(kind: ObjectKind) -> &'static str {
-    match kind {
-        ObjectKind::Blob => "blob",
-        ObjectKind::Tree => "tree",
-        ObjectKind::Commit => "commit",
-        ObjectKind::Tag => "tag",
-    }
-}
-
 fn name_to_kind(name: &str) -> Result<ObjectKind> {
     match name {
         "blob" => Ok(ObjectKind::Blob),
@@ -883,20 +856,4 @@ fn name_to_kind(name: &str) -> Result<ObjectKind> {
 
 fn bytes_to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn hex_to_bytes(hex: &str) -> Result<Vec<u8>> {
-    if !hex.len().is_multiple_of(2) {
-        return Err(Error::Backend("hex byte string has odd length".to_owned()));
-    }
-    let mut out = Vec::with_capacity(hex.len() / 2);
-    for chunk in hex.as_bytes().chunks(2) {
-        let text = std::str::from_utf8(chunk)
-            .map_err(|err| Error::Backend(format!("invalid hex byte utf8: {err}")))?;
-        out.push(
-            u8::from_str_radix(text, 16)
-                .map_err(|err| Error::Backend(format!("invalid hex byte: {err}")))?,
-        );
-    }
-    Ok(out)
 }
