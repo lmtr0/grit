@@ -36,6 +36,26 @@ pub const MIGRATIONS: &[&str] = &[
         add column if not exists deleted_at timestamptz",
     "alter table grit_repositories
         add column if not exists updated_at timestamptz not null default now()",
+    "create sequence if not exists grit_repository_pk_seq",
+    "alter table grit_repositories add column if not exists repository_pk bigint",
+    "alter sequence grit_repository_pk_seq
+        owned by grit_repositories.repository_pk",
+    "select setval(
+        'grit_repository_pk_seq',
+        greatest(
+            (select last_value from grit_repository_pk_seq),
+            coalesce((select max(repository_pk) from grit_repositories), 1)
+        ),
+        (select is_called from grit_repository_pk_seq)
+            or exists (select 1 from grit_repositories where repository_pk is not null)
+    )",
+    "alter table grit_repositories alter column repository_pk
+        set default nextval('grit_repository_pk_seq')",
+    "update grit_repositories set repository_pk = nextval('grit_repository_pk_seq')
+        where repository_pk is null",
+    "alter table grit_repositories alter column repository_pk set not null",
+    "create unique index if not exists grit_repositories_pk_idx
+        on grit_repositories (repository_pk)",
     "create table if not exists grit_objects (
         tenant_id text not null,
         repository_id text not null,
@@ -176,6 +196,56 @@ pub const MIGRATIONS: &[&str] = &[
         compressed_size bigint not null,
         primary key (tenant_id, repository_id, pack_checksum, offset)
     )",
+    "create or replace function grit_assign_repository_pk()
+     returns trigger language plpgsql as $$
+     begin
+       select repository_pk into new.repository_pk
+       from grit_repositories
+       where tenant_id = new.tenant_id and repository_id = new.repository_id;
+       if new.repository_pk is null then
+         raise exception 'repository %/% does not exist', new.tenant_id, new.repository_id
+           using errcode = 'foreign_key_violation';
+       end if;
+       return new;
+     end $$",
+    "do $$
+     declare child_table text;
+     begin
+       foreach child_table in array array[
+         'grit_objects', 'grit_refs', 'grit_reflog', 'grit_config',
+         'grit_tree_entries', 'grit_commits', 'grit_commit_parents',
+         'grit_import_state', 'grit_import_trusted_objects', 'grit_packs',
+         'grit_pack_objects', 'grit_external_orphan_candidates'
+       ] loop
+         execute format('alter table %I add column if not exists repository_pk bigint', child_table);
+         if not exists (
+           select 1 from pg_trigger
+           where tgrelid = to_regclass(child_table)
+             and tgname = 'grit_repository_pk_dual_write'
+             and not tgisinternal
+         ) then
+           execute format(
+             'create trigger grit_repository_pk_dual_write
+              before insert or update of tenant_id, repository_id, repository_pk on %I
+              for each row execute function grit_assign_repository_pk()',
+             child_table
+           );
+         end if;
+         execute format(
+           'update %I child set repository_pk = repository.repository_pk
+            from grit_repositories repository
+            where child.repository_pk is null
+              and child.tenant_id = repository.tenant_id
+              and child.repository_id = repository.repository_id',
+           child_table
+         );
+         execute format('alter table %I alter column repository_pk set not null', child_table);
+         execute format(
+           'create index if not exists %I on %I (repository_pk)',
+           child_table || '_repository_pk_idx', child_table
+         );
+       end loop;
+     end $$",
     "create index if not exists grit_repositories_listing_idx
         on grit_repositories (tenant_id, archived_at, repository_id)
         where deleted_at is null",
@@ -195,9 +265,45 @@ pub const MIGRATIONS: &[&str] = &[
         on grit_packs (tenant_id, repository_id, storage_order)",
 ];
 
+/// Stable numeric identity for one PostgreSQL repository row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RepositoryPk(i64);
+
+/// Error returned when a repository primary key is zero or negative.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("repository primary key must be positive")]
+pub struct InvalidRepositoryPk;
+
+impl RepositoryPk {
+    /// Return the positive database-assigned identifier.
+    #[must_use]
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+}
+
+impl TryFrom<i64> for RepositoryPk {
+    type Error = InvalidRepositoryPk;
+
+    fn try_from(value: i64) -> std::result::Result<Self, Self::Error> {
+        if value <= 0 {
+            return Err(InvalidRepositoryPk);
+        }
+        Ok(Self(value))
+    }
+}
+
+impl From<RepositoryPk> for i64 {
+    fn from(value: RepositoryPk) -> Self {
+        value.get()
+    }
+}
+
 /// Repository metadata stored by the SQL backend.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PgRepositoryRow {
+    /// Stable numeric repository identity used by additive child-table migrations.
+    pub repository_pk: RepositoryPk,
     /// Tenant that owns the repository row.
     pub tenant: TenantId,
     /// Repository identifier within the tenant.
@@ -264,7 +370,7 @@ impl PgServerStorage {
                 (tenant_id, repository_id, hash_algo, created_at, updated_at)
              values ($1, $2, $3, now(), now())
              on conflict (tenant_id, repository_id) do nothing
-             returning tenant_id, repository_id, hash_algo, created_at, updated_at,
+             returning repository_pk, tenant_id, repository_id, hash_algo, created_at, updated_at,
                        archived_at, deleted_at",
         )
         .bind(tenant.as_str())
@@ -295,7 +401,7 @@ impl PgServerStorage {
         repository: &RepositoryId,
     ) -> Result<Option<PgRepositoryRow>> {
         let row = sqlx::query(
-            "select tenant_id, repository_id, hash_algo, created_at, updated_at,
+            "select repository_pk, tenant_id, repository_id, hash_algo, created_at, updated_at,
                     archived_at, deleted_at
              from grit_repositories
              where tenant_id = $1 and repository_id = $2 and deleted_at is null",
@@ -315,7 +421,7 @@ impl PgServerStorage {
     /// algorithm metadata.
     pub async fn list_repositories(&self, tenant: &TenantId) -> Result<Vec<PgRepositoryRow>> {
         let rows = sqlx::query(
-            "select tenant_id, repository_id, hash_algo, created_at, updated_at,
+            "select repository_pk, tenant_id, repository_id, hash_algo, created_at, updated_at,
                     archived_at, deleted_at
              from grit_repositories
              where tenant_id = $1 and deleted_at is null
@@ -363,7 +469,7 @@ impl PgServerStorage {
             "update grit_repositories
              set archived_at = coalesce(archived_at, now()), updated_at = now()
              where tenant_id = $1 and repository_id = $2 and deleted_at is null
-             returning tenant_id, repository_id, hash_algo, created_at, updated_at,
+             returning repository_pk, tenant_id, repository_id, hash_algo, created_at, updated_at,
                        archived_at, deleted_at",
         )
         .bind(tenant.as_str())
@@ -728,12 +834,16 @@ fn row_to_ref(row: &sqlx::postgres::PgRow, refname: &str) -> Result<StoredRef> {
 }
 
 fn row_to_repository(row: &sqlx::postgres::PgRow) -> Result<PgRepositoryRow> {
+    let repository_pk: i64 = row.try_get("repository_pk")?;
+    let repository_pk =
+        RepositoryPk::try_from(repository_pk).map_err(|error| Error::Backend(error.to_string()))?;
     let tenant: String = row.try_get("tenant_id")?;
     let repository: String = row.try_get("repository_id")?;
     let hash_algo: String = row.try_get("hash_algo")?;
     let hash_algo = HashAlgo::from_name(&hash_algo)
         .ok_or_else(|| Error::Backend(format!("unknown hash algorithm '{hash_algo}'")))?;
     Ok(PgRepositoryRow {
+        repository_pk,
         tenant: TenantId::new(tenant)?,
         repository: RepositoryId::new(repository)?,
         hash_algo,
@@ -867,6 +977,26 @@ async fn rename_repository_in_transaction(
         )));
     }
 
+    let row = sqlx::query(
+        "update grit_repositories
+         set repository_id = $3, updated_at = now()
+         where tenant_id = $1 and repository_id = $2 and deleted_at is null
+         returning repository_pk, tenant_id, repository_id, hash_algo, created_at, updated_at,
+                   archived_at, deleted_at",
+    )
+    .bind(tenant.as_str())
+    .bind(repository.as_str())
+    .bind(new_repository.as_str())
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|error| {
+        if is_unique_violation(&error) {
+            Error::RepositoryAlreadyExists(repository_key(tenant, new_repository))
+        } else {
+            error.into()
+        }
+    })?;
+
     for table in [
         "grit_objects",
         "grit_refs",
@@ -893,26 +1023,6 @@ async fn rename_repository_in_transaction(
             .execute(&mut **tx)
             .await?;
     }
-
-    let row = sqlx::query(
-        "update grit_repositories
-         set repository_id = $3, updated_at = now()
-         where tenant_id = $1 and repository_id = $2 and deleted_at is null
-         returning tenant_id, repository_id, hash_algo, created_at, updated_at,
-                   archived_at, deleted_at",
-    )
-    .bind(tenant.as_str())
-    .bind(repository.as_str())
-    .bind(new_repository.as_str())
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(|error| {
-        if is_unique_violation(&error) {
-            Error::RepositoryAlreadyExists(repository_key(tenant, new_repository))
-        } else {
-            error.into()
-        }
-    })?;
     row_to_repository(&row)
 }
 
