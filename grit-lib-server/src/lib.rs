@@ -136,6 +136,12 @@ pub mod prelude {
         IncrementalPackWriter, PackObjectWriteReport, PackWriterError, PackWriterFailure,
         PackWriterReport, PackWriterState,
     };
+    #[cfg(feature = "sqlx-postgres")]
+    pub use crate::protocol::pg_pack_promotion::{
+        promote_pg_push_pack, PgPackPromotionControl, PgPackPromotionError, PgPackPromotionLimits,
+        PgPackPromotionObservation, PgPackPromotionReceipt, PgPackPromotionWork,
+        PgPackPromotionWorkLimit,
+    };
     pub use crate::protocol::push_fix_thin::{
         plan_fix_thin_pack, rewrite_fix_thin_pack, AuthorizedThinBase, AuthorizedThinBaseProvider,
         FixThinBase, FixThinControl, FixThinError, FixThinObservation, FixThinOptions, FixThinPlan,

@@ -10,6 +10,8 @@ pub mod negotiation;
 pub mod pack_entry_reuse;
 pub mod pack_stream;
 pub mod pack_writer;
+#[cfg(feature = "sqlx-postgres")]
+pub mod pg_pack_promotion;
 pub mod push_fix_thin;
 pub mod push_metrics;
 pub mod push_pack_validation;

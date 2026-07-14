@@ -11,6 +11,9 @@ use time::{Duration, OffsetDateTime};
 
 use crate::error::{Error, Result};
 use crate::ids::{RepositoryId, TenantId};
+use crate::protocol::pg_pack_promotion::{
+    PgPackPromotionInstallError, PgPackPromotionReceipt, PgPackPromotionStage,
+};
 use crate::storage::{
     BrowseIndex, CommitGraphStore, ConfigStore, ImportPublication, ImportPublicationResult,
     ImportSession, ImportStateStore, ImportedPack, IndexedCommit, IndexedTreeEntry,
@@ -50,6 +53,21 @@ pub const MIGRATIONS: &[&str] = &[
         add column if not exists history_generation bigint not null default 0",
     "alter table grit_repositories
         add column if not exists config_generation bigint not null default 0",
+    "alter table grit_repositories
+        add column if not exists push_generation bigint not null default 1",
+    "do $$ begin
+        if not exists (
+            select 1 from pg_constraint
+            where conrelid = 'grit_repositories'::regclass
+              and conname = 'grit_repositories_push_generation_positive'
+        ) then
+            alter table grit_repositories
+                add constraint grit_repositories_push_generation_positive
+                check (push_generation > 0) not valid;
+        end if;
+     end $$",
+    "alter table grit_repositories
+        validate constraint grit_repositories_push_generation_positive",
     "do $$ begin
         if not exists (
             select 1 from pg_constraint
@@ -766,6 +784,27 @@ pub const MIGRATIONS: &[&str] = &[
         size bigint not null,
         compressed_size bigint not null,
         primary key (tenant_id, repository_id, pack_checksum, offset)
+    )",
+    "create table if not exists grit_push_pack_receipts (
+        repository_pk bigint not null,
+        quarantine_id bytea not null,
+        quarantine_generation bigint not null,
+        repository_generation bigint not null,
+        prepared_fingerprint bytea not null,
+        pack_checksum bytea not null,
+        index_checksum bytea not null,
+        object_count bigint not null,
+        size_bytes bigint not null,
+        deduplicated boolean not null,
+        primary key (repository_pk, quarantine_id, quarantine_generation),
+        constraint grit_push_pack_receipts_repository_fk foreign key (repository_pk)
+            references grit_repositories (repository_pk) on delete cascade,
+        check (octet_length(quarantine_id) = 32),
+        check (quarantine_generation > 0 and repository_generation > 0),
+        check (octet_length(prepared_fingerprint) in (20, 32)),
+        check (octet_length(pack_checksum) = octet_length(prepared_fingerprint)),
+        check (octet_length(index_checksum) = octet_length(prepared_fingerprint)),
+        check (object_count >= 0 and size_bytes >= 0)
     )",
     "create or replace function grit_assign_repository_pk()
      returns trigger language plpgsql as $$
@@ -2083,6 +2122,42 @@ impl PgServerStorage {
     #[must_use]
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Read the repository generation used to bind prepared push snapshots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::RepositoryNotFound`] for a missing live repository, a backend error for
+    /// corrupt generation state, or propagates SQLx failures.
+    pub async fn push_repository_generation(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+    ) -> Result<u64> {
+        let generation: Option<i64> = sqlx::query_scalar(
+            "select push_generation from grit_repositories
+             where tenant_id = $1 and repository_id = $2 and deleted_at is null",
+        )
+        .bind(tenant.as_str())
+        .bind(repository.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        let generation = generation
+            .ok_or_else(|| Error::RepositoryNotFound(repository_key(tenant, repository)))?;
+        let generation = u64::try_from(generation)
+            .map_err(|_| Error::Backend("push generation is negative".to_owned()))?;
+        if generation == 0 {
+            return Err(Error::Backend("push generation is zero".to_owned()));
+        }
+        Ok(generation)
+    }
+
+    pub(crate) async fn install_promoted_push_pack(
+        &self,
+        stage: PgPackPromotionStage,
+    ) -> std::result::Result<PgPackPromotionReceipt, PgPackPromotionInstallError> {
+        install_promoted_push_pack(&self.pool, stage).await
     }
 
     /// Resolve the newest packed representation for each requested object in one set query.
@@ -5381,9 +5456,16 @@ impl PgServerStorage {
     ///
     /// Returns SQLx errors from migration statements.
     pub async fn migrate(&self) -> Result<()> {
+        const MIGRATION_LOCK_KEY: i64 = 0x4752_4954_4d49_4752;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("select pg_advisory_xact_lock($1)")
+            .bind(MIGRATION_LOCK_KEY)
+            .execute(&mut *tx)
+            .await?;
         for statement in MIGRATIONS {
-            sqlx::query(statement).execute(&self.pool).await?;
+            sqlx::query(statement).execute(&mut *tx).await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -9225,6 +9307,230 @@ async fn write_pack_in_transaction(
     .await
 }
 
+async fn install_promoted_push_pack(
+    pool: &PgPool,
+    stage: PgPackPromotionStage,
+) -> std::result::Result<PgPackPromotionReceipt, PgPackPromotionInstallError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|_| PgPackPromotionInstallError::Backend)?;
+    lock_import_repository(&mut tx, &stage.tenant, &stage.repository)
+        .await
+        .map_err(|_| PgPackPromotionInstallError::Backend)?;
+    let repository = sqlx::query(
+        "select repository_pk, hash_algo, push_generation from grit_repositories
+         where tenant_id = $1 and repository_id = $2 and deleted_at is null for update",
+    )
+    .bind(stage.tenant.as_str())
+    .bind(stage.repository.as_str())
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| PgPackPromotionInstallError::Backend)?
+    .ok_or(PgPackPromotionInstallError::StaleGeneration)?;
+    let repository_pk: i64 = repository
+        .try_get("repository_pk")
+        .map_err(|_| PgPackPromotionInstallError::Backend)?;
+    let hash_algo: String = repository
+        .try_get("hash_algo")
+        .map_err(|_| PgPackPromotionInstallError::Backend)?;
+    let generation: i64 = repository
+        .try_get("push_generation")
+        .map_err(|_| PgPackPromotionInstallError::Backend)?;
+    if u64::try_from(generation).ok() != Some(stage.repository_generation)
+        || hash_algo != hash_algo_name(stage.pack_checksum.algo())
+    {
+        return Err(PgPackPromotionInstallError::StaleGeneration);
+    }
+
+    let existing_receipt = sqlx::query(
+        "select repository_generation, prepared_fingerprint, pack_checksum, index_checksum,
+                object_count, size_bytes, deduplicated
+         from grit_push_pack_receipts
+         where repository_pk = $1 and quarantine_id = $2 and quarantine_generation = $3",
+    )
+    .bind(repository_pk)
+    .bind(stage.quarantine_id.as_bytes().as_slice())
+    .bind(
+        i64::try_from(stage.quarantine_generation)
+            .map_err(|_| PgPackPromotionInstallError::Backend)?,
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| PgPackPromotionInstallError::Backend)?;
+    let retry_deduplicated = if let Some(row) = existing_receipt {
+        let receipt_generation: i64 = row
+            .try_get("repository_generation")
+            .map_err(|_| PgPackPromotionInstallError::Backend)?;
+        let fingerprint: Vec<u8> = row
+            .try_get("prepared_fingerprint")
+            .map_err(|_| PgPackPromotionInstallError::Backend)?;
+        let pack_checksum: Vec<u8> = row
+            .try_get("pack_checksum")
+            .map_err(|_| PgPackPromotionInstallError::Backend)?;
+        let index_checksum: Vec<u8> = row
+            .try_get("index_checksum")
+            .map_err(|_| PgPackPromotionInstallError::Backend)?;
+        let object_count: i64 = row
+            .try_get("object_count")
+            .map_err(|_| PgPackPromotionInstallError::Backend)?;
+        let size_bytes: i64 = row
+            .try_get("size_bytes")
+            .map_err(|_| PgPackPromotionInstallError::Backend)?;
+        let exact = u64::try_from(receipt_generation).ok() == Some(stage.repository_generation)
+            && fingerprint == stage.prepared_fingerprint.as_bytes()
+            && pack_checksum == stage.pack_checksum.as_bytes()
+            && index_checksum == stage.index_checksum.as_bytes()
+            && u32::try_from(object_count).ok() == Some(stage.pack.metadata.object_count)
+            && u64::try_from(size_bytes).ok() == Some(stage.pack.metadata.size_bytes);
+        if !exact {
+            return Err(PgPackPromotionInstallError::Collision);
+        }
+        let deduplicated: bool = row
+            .try_get("deduplicated")
+            .map_err(|_| PgPackPromotionInstallError::Backend)?;
+        Some(deduplicated)
+    } else {
+        None
+    };
+
+    let existing_pack = sqlx::query(
+        "select index_checksum, data, storage_backend, storage_key, object_count, size_bytes
+         from grit_packs where repository_pk = $1 and pack_checksum_bytes = $2",
+    )
+    .bind(repository_pk)
+    .bind(stage.pack_checksum.as_bytes())
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| PgPackPromotionInstallError::Backend)?;
+    let pack_deduplicated = existing_pack.is_some();
+    if let Some(row) = existing_pack {
+        let index_checksum: String = row
+            .try_get("index_checksum")
+            .map_err(|_| PgPackPromotionInstallError::Backend)?;
+        let data: Option<Vec<u8>> = row
+            .try_get("data")
+            .map_err(|_| PgPackPromotionInstallError::Backend)?;
+        let backend: String = row
+            .try_get("storage_backend")
+            .map_err(|_| PgPackPromotionInstallError::Backend)?;
+        let storage_key: Option<String> = row
+            .try_get("storage_key")
+            .map_err(|_| PgPackPromotionInstallError::Backend)?;
+        let object_count: i32 = row
+            .try_get("object_count")
+            .map_err(|_| PgPackPromotionInstallError::Backend)?;
+        let size_bytes: i64 = row
+            .try_get("size_bytes")
+            .map_err(|_| PgPackPromotionInstallError::Backend)?;
+        if index_checksum != stage.index_checksum.to_hex()
+            || data.as_deref() != Some(stage.pack.data.as_slice())
+            || backend != "database"
+            || storage_key.is_some()
+            || u32::try_from(object_count).ok() != Some(stage.pack.metadata.object_count)
+            || u64::try_from(size_bytes).ok() != Some(stage.pack.metadata.size_bytes)
+        {
+            return Err(PgPackPromotionInstallError::Collision);
+        }
+        let rows = sqlx::query(
+            "select oid, kind, offset, size, compressed_size from grit_pack_objects
+             where repository_pk = $1 and pack_checksum_bytes = $2 order by offset limit $3",
+        )
+        .bind(repository_pk)
+        .bind(stage.pack_checksum.as_bytes())
+        .bind(i64::from(stage.pack.metadata.object_count) + 1)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|_| PgPackPromotionInstallError::Backend)?;
+        let mut existing_index = Vec::new();
+        existing_index
+            .try_reserve_exact(rows.len())
+            .map_err(|_| PgPackPromotionInstallError::Backend)?;
+        for row in rows {
+            existing_index.push(
+                row_to_pack_object_index(&row).map_err(|_| PgPackPromotionInstallError::Backend)?,
+            );
+        }
+        if existing_index != stage.pack.index {
+            return Err(PgPackPromotionInstallError::Collision);
+        }
+    } else {
+        let values = prepare_pack_values(
+            &stage.pack.metadata,
+            stage.pack.data.len(),
+            &stage.pack.index,
+        )
+        .map_err(|_| PgPackPromotionInstallError::Backend)?;
+        install_database_pack_in_transaction(
+            &mut tx,
+            &stage.tenant,
+            &stage.repository,
+            &stage.pack.metadata,
+            stage.pack.data.as_slice(),
+            &stage.pack.index,
+            &values,
+        )
+        .await
+        .map_err(|_| PgPackPromotionInstallError::Backend)?;
+    }
+
+    if retry_deduplicated.is_none() {
+        sqlx::query(
+            "insert into grit_push_pack_receipts
+            (repository_pk, quarantine_id, quarantine_generation, repository_generation,
+             prepared_fingerprint, pack_checksum, index_checksum, object_count, size_bytes,
+             deduplicated)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(repository_pk)
+        .bind(stage.quarantine_id.as_bytes().as_slice())
+        .bind(
+            i64::try_from(stage.quarantine_generation)
+                .map_err(|_| PgPackPromotionInstallError::Backend)?,
+        )
+        .bind(
+            i64::try_from(stage.repository_generation)
+                .map_err(|_| PgPackPromotionInstallError::Backend)?,
+        )
+        .bind(stage.prepared_fingerprint.as_bytes())
+        .bind(stage.pack_checksum.as_bytes())
+        .bind(stage.index_checksum.as_bytes())
+        .bind(i64::from(stage.pack.metadata.object_count))
+        .bind(
+            i64::try_from(stage.pack.metadata.size_bytes)
+                .map_err(|_| PgPackPromotionInstallError::Backend)?,
+        )
+        .bind(pack_deduplicated)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| PgPackPromotionInstallError::Backend)?;
+    }
+    let receipt_deduplicated = retry_deduplicated.unwrap_or(pack_deduplicated);
+    tx.commit()
+        .await
+        .map_err(|_| PgPackPromotionInstallError::Backend)?;
+    Ok(PgPackPromotionReceipt::new(
+        stage.tenant,
+        stage.repository,
+        stage.quarantine_id,
+        stage.quarantine_generation,
+        stage.repository_generation,
+        stage.pack_checksum,
+        stage.index_checksum,
+        stage.prepared_fingerprint,
+        stage.pack.metadata.object_count,
+        stage.pack.metadata.size_bytes,
+        receipt_deduplicated,
+    ))
+}
+
+fn hash_algo_name(hash_algo: HashAlgo) -> &'static str {
+    match hash_algo {
+        HashAlgo::Sha1 => "sha1",
+        HashAlgo::Sha256 => "sha256",
+    }
+}
+
 async fn install_database_pack_in_transaction(
     tx: &mut Transaction<'static, Postgres>,
     tenant: &TenantId,
@@ -9408,9 +9714,18 @@ pub(crate) fn prepare_pack_values(
     let size_bytes = i64::try_from(metadata.size_bytes)
         .map_err(|_| Error::Backend("pack size exceeds i64".to_owned()))?;
 
-    let mut seen_oids = HashSet::with_capacity(index_rows.len());
-    let mut seen_offsets = HashSet::with_capacity(index_rows.len());
-    let mut index = Vec::with_capacity(index_rows.len());
+    let mut seen_oids = HashSet::new();
+    seen_oids
+        .try_reserve(index_rows.len())
+        .map_err(|_| Error::Backend("cannot reserve pack OID validation set".to_owned()))?;
+    let mut seen_offsets = HashSet::new();
+    seen_offsets
+        .try_reserve(index_rows.len())
+        .map_err(|_| Error::Backend("cannot reserve pack offset validation set".to_owned()))?;
+    let mut index = Vec::new();
+    index
+        .try_reserve_exact(index_rows.len())
+        .map_err(|_| Error::Backend("cannot reserve prepared pack index".to_owned()))?;
     for entry in index_rows {
         if !seen_oids.insert(entry.oid) || !seen_offsets.insert(entry.offset) {
             return Err(Error::Protocol(
