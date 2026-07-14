@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use grit_lib::objects::{HashAlgo, ObjectId, ObjectKind};
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use time::OffsetDateTime;
 
 use crate::error::{Error, Result};
@@ -1682,13 +1682,10 @@ async fn write_pack_in_transaction(
     repository: &RepositoryId,
     pack: &StoredPack,
 ) -> Result<PackMetadata> {
-    lock_import_repository(tx, tenant, repository).await?;
-    let object_count = i32::try_from(pack.metadata.object_count)
-        .map_err(|_| Error::Backend("pack object count exceeds i32".to_owned()))?;
-    let size_bytes = i64::try_from(pack.metadata.size_bytes)
-        .map_err(|_| Error::Backend("pack size exceeds i64".to_owned()))?;
+    let values = prepare_pack_values(pack)?;
     let pack_checksum = bytes_to_hex(&pack.metadata.pack_checksum);
     let index_checksum = bytes_to_hex(&pack.metadata.index_checksum);
+    lock_import_repository(tx, tenant, repository).await?;
     let row = sqlx::query(
         "insert into grit_packs
             (tenant_id, repository_id, pack_checksum, index_checksum, data,
@@ -1703,8 +1700,8 @@ async fn write_pack_in_transaction(
     .bind(&pack_checksum)
     .bind(&index_checksum)
     .bind(&pack.data)
-    .bind(object_count)
-    .bind(size_bytes)
+    .bind(values.object_count)
+    .bind(values.size_bytes)
     .fetch_one(&mut **tx)
     .await?;
 
@@ -1718,32 +1715,105 @@ async fn write_pack_in_transaction(
     .execute(&mut **tx)
     .await?;
 
+    const POSTGRES_BIND_LIMIT: usize = 65_535;
+    const BINDS_PER_ROW: usize = 8;
+    for (entry_chunk, value_chunk) in pack
+        .index
+        .chunks(POSTGRES_BIND_LIMIT / BINDS_PER_ROW)
+        .zip(values.index.chunks(POSTGRES_BIND_LIMIT / BINDS_PER_ROW))
+    {
+        let mut query = QueryBuilder::<Postgres>::new(
+            "insert into grit_pack_objects
+                (tenant_id, repository_id, pack_checksum, oid, kind, offset, size,
+                 compressed_size) ",
+        );
+        query.push_values(
+            entry_chunk.iter().zip(value_chunk),
+            |mut row, (entry, value)| {
+                row.push_bind(tenant.as_str())
+                    .push_bind(repository.as_str())
+                    .push_bind(&pack_checksum)
+                    .push_bind(entry.oid.to_hex())
+                    .push_bind(kind_to_name(entry.kind))
+                    .push_bind(value.offset)
+                    .push_bind(value.size)
+                    .push_bind(value.compressed_size);
+            },
+        );
+        query.build().persistent(false).execute(&mut **tx).await?;
+    }
+
+    row_to_pack_metadata(&row)
+}
+
+struct PgPackValues {
+    object_count: i32,
+    size_bytes: i64,
+    index: Vec<PgPackIndexValues>,
+}
+
+struct PgPackIndexValues {
+    offset: i64,
+    size: i64,
+    compressed_size: i64,
+}
+
+fn prepare_pack_values(pack: &StoredPack) -> Result<PgPackValues> {
+    if usize::try_from(pack.metadata.object_count).ok() != Some(pack.index.len()) {
+        return Err(Error::Protocol(
+            "pack metadata object count does not match its index".to_owned(),
+        ));
+    }
+    if u64::try_from(pack.data.len()).ok() != Some(pack.metadata.size_bytes) {
+        return Err(Error::Protocol(
+            "pack metadata size does not match its bytes".to_owned(),
+        ));
+    }
+    let hash_bytes = pack.metadata.pack_checksum.len();
+    if !matches!(hash_bytes, 20 | 32)
+        || pack.metadata.index_checksum.len() != hash_bytes
+        || pack
+            .index
+            .iter()
+            .any(|entry| entry.oid.as_bytes().len() != hash_bytes)
+    {
+        return Err(Error::Protocol(
+            "pack metadata and index use incompatible object hash widths".to_owned(),
+        ));
+    }
+
+    let object_count = i32::try_from(pack.metadata.object_count)
+        .map_err(|_| Error::Backend("pack object count exceeds i32".to_owned()))?;
+    let size_bytes = i64::try_from(pack.metadata.size_bytes)
+        .map_err(|_| Error::Backend("pack size exceeds i64".to_owned()))?;
+
+    let mut seen_oids = HashSet::with_capacity(pack.index.len());
+    let mut seen_offsets = HashSet::with_capacity(pack.index.len());
+    let mut index = Vec::with_capacity(pack.index.len());
     for entry in &pack.index {
+        if !seen_oids.insert(entry.oid) || !seen_offsets.insert(entry.offset) {
+            return Err(Error::Protocol(
+                "pack index contains duplicate object ids or offsets".to_owned(),
+            ));
+        }
         let offset = i64::try_from(entry.offset)
             .map_err(|_| Error::Backend("pack object offset exceeds i64".to_owned()))?;
         let size = i64::try_from(entry.size)
             .map_err(|_| Error::Backend("pack object size exceeds i64".to_owned()))?;
         let compressed_size = i64::try_from(entry.compressed_size)
             .map_err(|_| Error::Backend("pack object compressed size exceeds i64".to_owned()))?;
-        sqlx::query(
-            "insert into grit_pack_objects
-                (tenant_id, repository_id, pack_checksum, oid, kind, offset, size,
-                 compressed_size)
-             values ($1, $2, $3, $4, $5, $6, $7, $8)",
-        )
-        .bind(tenant.as_str())
-        .bind(repository.as_str())
-        .bind(&pack_checksum)
-        .bind(entry.oid.to_hex())
-        .bind(kind_to_name(entry.kind))
-        .bind(offset)
-        .bind(size)
-        .bind(compressed_size)
-        .execute(&mut **tx)
-        .await?;
+        index.push(PgPackIndexValues {
+            offset,
+            size,
+            compressed_size,
+        });
     }
 
-    row_to_pack_metadata(&row)
+    Ok(PgPackValues {
+        object_count,
+        size_bytes,
+        index,
+    })
 }
 
 #[async_trait]
