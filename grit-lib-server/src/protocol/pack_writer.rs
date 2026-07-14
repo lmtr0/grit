@@ -7,6 +7,9 @@ use sha2::Sha256;
 
 use crate::packfile::{encode_pack_object_header, pack_type_code};
 use crate::protocol::clone_metrics::CloneLimits;
+use crate::protocol::pack_entry_reuse::{
+    encode_header_u64, encode_ofs_delta_distance, PackEntryPlan,
+};
 use crate::protocol::pack_stream::{
     CancellationGate, CancellationProbe, CancellationReport, PackAbortReason, PackChunkSink,
     PackSinkState, PackStreamError, PackStreamLimits, PackStreamReport,
@@ -56,6 +59,9 @@ pub enum PackWriterError {
     /// Zlib did not complete a valid stream.
     #[error("incremental pack compression failed")]
     Compression,
+    /// A recompression plan was executed without its decoded fallback object.
+    #[error("incremental pack recompression fallback object is missing")]
+    MissingFallback,
     /// Cancellation was observed at an explicit checkpoint.
     #[error("incremental pack cancelled")]
     Cancelled,
@@ -369,6 +375,141 @@ impl<'a, P: CancellationProbe> IncrementalPackWriter<'a, P> {
         }
     }
 
+    /// Return the absolute offset where the next PACK entry header will be written.
+    ///
+    /// Callers use this offset when proving that an OFS-delta base is earlier in the same output
+    /// pack. The value includes the 12-byte PACK header and every completely accepted entry byte.
+    #[must_use]
+    pub const fn next_entry_offset(&self) -> u64 {
+        self.output_bytes
+    }
+
+    /// Execute one validated compressed-entry plan or the existing recompression fallback.
+    ///
+    /// `fallback` is required only for [`PackEntryPlan::RecompressFallback`]. Reused entries emit a
+    /// fresh PACK entry header and stream retained zlib bytes in bounded chunks. OFS-delta distance
+    /// is recomputed from the writer's current output offset, never copied from the source pack.
+    ///
+    /// # Errors
+    ///
+    /// Aborts on invalid writer state/order, a missing fallback object, stale OFS placement,
+    /// allocation/accounting/limit failures, cancellation, or downstream failure.
+    pub async fn write_entry_plan(
+        &mut self,
+        plan: &PackEntryPlan,
+        fallback: Option<&StoredObject>,
+    ) -> Result<PackObjectWriteReport, PackWriterFailure> {
+        if matches!(plan, PackEntryPlan::RecompressFallback(_)) {
+            let Some(object) = fallback else {
+                return Err(self.abort_for(PackWriterError::MissingFallback).await);
+            };
+            return self.write_object(object).await;
+        }
+        if self.state != PackWriterState::Streaming {
+            return Err(self.failure(PackWriterError::InvalidState(self.state)));
+        }
+        if self.written_objects >= self.planned_objects {
+            return Err(self.abort_for(PackWriterError::TooManyObjects).await);
+        }
+        let next_written_objects = self
+            .written_objects
+            .checked_add(1)
+            .ok_or_else(|| self.failure(PackWriterError::ByteOverflow))?;
+        match self.write_reused_entry_inner(plan).await {
+            Ok(report) => {
+                self.written_objects = next_written_objects;
+                Ok(report)
+            }
+            Err(error) => Err(self.abort_for(error).await),
+        }
+    }
+
+    async fn write_reused_entry_inner(
+        &mut self,
+        plan: &PackEntryPlan,
+    ) -> Result<PackObjectWriteReport, PackWriterError> {
+        self.cancellation
+            .check_now()
+            .map_err(map_stream_writer_error)?;
+        let (kind, decoded_size, declared_size, type_code, base_bytes, compressed) = match plan {
+            PackEntryPlan::Direct(entry) => (
+                entry.kind,
+                entry.declared_size,
+                entry.declared_size,
+                pack_type_code(entry.kind),
+                Vec::new(),
+                entry.compressed.as_ref(),
+            ),
+            PackEntryPlan::RefDelta(entry) => {
+                let mut base_bytes = Vec::new();
+                base_bytes
+                    .try_reserve_exact(entry.base.as_bytes().len())
+                    .map_err(|_| PackWriterError::Allocation)?;
+                base_bytes.extend_from_slice(entry.base.as_bytes());
+                (
+                    entry.result_kind,
+                    entry.result_size,
+                    entry.declared_size,
+                    7,
+                    base_bytes,
+                    entry.compressed.as_ref(),
+                )
+            }
+            PackEntryPlan::OfsDelta(entry) => {
+                let distance = self
+                    .output_bytes
+                    .checked_sub(entry.base_output_offset)
+                    .filter(|distance| *distance > 0)
+                    .ok_or(PackWriterError::ByteOverflow)?;
+                let mut distance_bytes = Vec::new();
+                distance_bytes
+                    .try_reserve_exact(10)
+                    .map_err(|_| PackWriterError::Allocation)?;
+                encode_ofs_delta_distance(&mut distance_bytes, distance)?;
+                (
+                    entry.result_kind,
+                    entry.result_size,
+                    entry.declared_size,
+                    6,
+                    distance_bytes,
+                    entry.compressed.as_ref(),
+                )
+            }
+            PackEntryPlan::RecompressFallback(_) => {
+                return Err(PackWriterError::MissingFallback);
+            }
+        };
+        let mut header = Vec::new();
+        header
+            .try_reserve_exact(16)
+            .map_err(|_| PackWriterError::Allocation)?;
+        encode_header_u64(&mut header, type_code, declared_size)?;
+        self.write_hashed(&header).await?;
+        if !base_bytes.is_empty() {
+            self.write_hashed(&base_bytes).await?;
+        }
+        let mut compressed_bytes = 0_u64;
+        for chunk in compressed.chunks(self.stream_limits.max_chunk_bytes) {
+            self.cancellation
+                .check_now()
+                .map_err(map_stream_writer_error)?;
+            let length = u64::try_from(chunk.len()).map_err(|_| PackWriterError::ByteOverflow)?;
+            compressed_bytes = compressed_bytes
+                .checked_add(length)
+                .ok_or(PackWriterError::ByteOverflow)?;
+            self.write_compressed_hashed(chunk).await?;
+        }
+        self.decoded_bytes = self
+            .decoded_bytes
+            .checked_add(decoded_size)
+            .ok_or(PackWriterError::ByteOverflow)?;
+        Ok(PackObjectWriteReport {
+            kind,
+            decoded_bytes: decoded_size,
+            compressed_bytes,
+        })
+    }
+
     async fn write_object_inner(
         &mut self,
         object: &StoredObject,
@@ -573,6 +714,7 @@ fn abort_reason(error: PackWriterError) -> PackAbortReason {
         PackWriterError::Sink(_) => PackAbortReason::SinkFailure,
         PackWriterError::InvalidState(_)
         | PackWriterError::Allocation
-        | PackWriterError::Compression => PackAbortReason::EncodingFailure,
+        | PackWriterError::Compression
+        | PackWriterError::MissingFallback => PackAbortReason::EncodingFailure,
     }
 }

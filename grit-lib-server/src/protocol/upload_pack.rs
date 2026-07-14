@@ -1203,6 +1203,7 @@ fn finish_stream_writer_failure(recorder: &mut CloneMetricsRecorder, failure: &P
         | PackWriterError::ByteOverflow
         | PackWriterError::Allocation
         | PackWriterError::Compression
+        | PackWriterError::MissingFallback
         | PackWriterError::Sink(_) => CloneOutcome::ProtocolFailure,
     };
     let _ = recorder.finish(outcome);

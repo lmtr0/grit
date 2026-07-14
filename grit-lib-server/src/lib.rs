@@ -99,6 +99,12 @@ pub mod prelude {
         CloneObjectKindMetrics, CloneObjectMetrics, CloneOutcome, ClonePackMetrics, ClonePhase,
         ClonePhaseMetrics,
     };
+    pub use crate::protocol::pack_entry_reuse::{
+        PackDependencySet, PackEntryPlan, PackEntrySourceError, PackRecompressReason,
+        PackReuseCapabilities, ReusedDirectEntry, ReusedOfsDeltaEntry, ReusedRefDeltaEntry,
+        StoredPackEntryKind, ValidatedPackEntry, MAX_REUSED_DELTA_INSTRUCTION_BYTES,
+        MAX_REUSED_ENTRY_HEADER_BYTES,
+    };
     pub use crate::protocol::pack_stream::{
         BoundedVecPackSink, CancellationGate, CancellationProbe, CancellationReport, NeverCancel,
         PackAbortReason, PackCancellationToken, PackChunkSink, PackSinkOperation, PackSinkState,
