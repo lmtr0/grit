@@ -2265,6 +2265,53 @@ impl BrowseIndex for PgServerStorage {
     }
 }
 
+struct PgCommitRow<'a> {
+    commit: &'a IndexedCommit,
+    generation: i32,
+}
+
+fn prepare_commit_rows(commits: &[IndexedCommit]) -> Result<Vec<PgCommitRow<'_>>> {
+    commits
+        .iter()
+        .map(|commit| {
+            let generation = i32::try_from(commit.generation)
+                .map_err(|_| Error::Backend("commit generation exceeds i32".to_owned()))?;
+            if let Some(last_parent_order) = commit.parents.len().checked_sub(1) {
+                i32::try_from(last_parent_order)
+                    .map_err(|_| Error::Backend("parent order exceeds i32".to_owned()))?;
+            }
+            Ok(PgCommitRow { commit, generation })
+        })
+        .collect()
+}
+
+async fn insert_commit_parent_rows_in_transaction(
+    tx: &mut Transaction<'static, Postgres>,
+    tenant: &TenantId,
+    repository: &RepositoryId,
+    prepared: &[PgCommitRow<'_>],
+    parent_edges: &[(usize, usize, i32)],
+) -> Result<()> {
+    let mut query = QueryBuilder::<Postgres>::new(
+        "insert into grit_commit_parents
+            (tenant_id, repository_id, commit_oid, parent_oid, parent_order) ",
+    );
+    query.push_values(
+        parent_edges,
+        |mut values, &(commit_index, parent_index, parent_order)| {
+            let commit = prepared[commit_index].commit;
+            values
+                .push_bind(tenant.as_str())
+                .push_bind(repository.as_str())
+                .push_bind(commit.oid.to_hex())
+                .push_bind(commit.parents[parent_index].to_hex())
+                .push_bind(parent_order);
+        },
+    );
+    query.build().persistent(false).execute(&mut **tx).await?;
+    Ok(())
+}
+
 #[async_trait]
 impl CommitGraphStore for PgServerStorage {
     async fn upsert_commits(
@@ -2273,55 +2320,96 @@ impl CommitGraphStore for PgServerStorage {
         repository: &RepositoryId,
         commits: &[IndexedCommit],
     ) -> Result<()> {
+        const POSTGRES_BIND_LIMIT: usize = 65_535;
+        const COMMIT_BINDS_PER_ROW: usize = 6;
+        const PARENT_BINDS_PER_ROW: usize = 5;
+        const DELETE_FIXED_BINDS: usize = 2;
+
+        let prepared = prepare_commit_rows(commits)?;
+        let mut final_rows = HashMap::with_capacity(prepared.len());
+        for (index, row) in prepared.iter().enumerate() {
+            final_rows.insert(row.commit.oid, index);
+        }
+        let mut final_row_indexes = final_rows.into_values().collect::<Vec<_>>();
+        final_row_indexes.sort_unstable();
+
         let mut tx = self.pool.begin().await?;
         lock_import_repository(&mut tx, tenant, repository).await?;
-        for commit in commits {
-            let generation = i32::try_from(commit.generation)
-                .map_err(|_| Error::Backend("commit generation exceeds i32".to_owned()))?;
-            sqlx::query(
+        for indexes in final_row_indexes.chunks(POSTGRES_BIND_LIMIT / COMMIT_BINDS_PER_ROW) {
+            let mut query = QueryBuilder::<Postgres>::new(
                 "insert into grit_commits
-                    (tenant_id, repository_id, commit_oid, tree_oid, commit_time, generation)
-                 values ($1, $2, $3, $4, $5, $6)
-                 on conflict (tenant_id, repository_id, commit_oid)
-                 do update set tree_oid = excluded.tree_oid,
-                               commit_time = excluded.commit_time,
-                               generation = excluded.generation",
-            )
-            .bind(tenant.as_str())
-            .bind(repository.as_str())
-            .bind(commit.oid.to_hex())
-            .bind(commit.tree.to_hex())
-            .bind(commit.commit_time)
-            .bind(generation)
-            .execute(&mut *tx)
-            .await?;
+                    (tenant_id, repository_id, commit_oid, tree_oid, commit_time, generation) ",
+            );
+            query.push_values(indexes, |mut values, &index| {
+                let row = &prepared[index];
+                values
+                    .push_bind(tenant.as_str())
+                    .push_bind(repository.as_str())
+                    .push_bind(row.commit.oid.to_hex())
+                    .push_bind(row.commit.tree.to_hex())
+                    .push_bind(row.commit.commit_time)
+                    .push_bind(row.generation);
+            });
+            query.push(
+                " on conflict (tenant_id, repository_id, commit_oid)
+                  do update set tree_oid = excluded.tree_oid,
+                                commit_time = excluded.commit_time,
+                                generation = excluded.generation",
+            );
+            query.build().persistent(false).execute(&mut *tx).await?;
+        }
 
-            sqlx::query(
+        for indexes in final_row_indexes.chunks(POSTGRES_BIND_LIMIT - DELETE_FIXED_BINDS) {
+            let mut query = QueryBuilder::<Postgres>::new(
                 "delete from grit_commit_parents
-                 where tenant_id = $1 and repository_id = $2 and commit_oid = $3",
-            )
-            .bind(tenant.as_str())
-            .bind(repository.as_str())
-            .bind(commit.oid.to_hex())
-            .execute(&mut *tx)
-            .await?;
-
-            for (position, parent) in commit.parents.iter().enumerate() {
-                let parent_order = i32::try_from(position)
-                    .map_err(|_| Error::Backend("parent order exceeds i32".to_owned()))?;
-                sqlx::query(
-                    "insert into grit_commit_parents
-                        (tenant_id, repository_id, commit_oid, parent_oid, parent_order)
-                     values ($1, $2, $3, $4, $5)",
-                )
-                .bind(tenant.as_str())
-                .bind(repository.as_str())
-                .bind(commit.oid.to_hex())
-                .bind(parent.to_hex())
-                .bind(parent_order)
-                .execute(&mut *tx)
-                .await?;
+                 where tenant_id = ",
+            );
+            query
+                .push_bind(tenant.as_str())
+                .push(" and repository_id = ")
+                .push_bind(repository.as_str())
+                .push(" and commit_oid in (");
+            {
+                let mut separated = query.separated(", ");
+                for &index in indexes {
+                    separated.push_bind(prepared[index].commit.oid.to_hex());
+                }
             }
+            query.push(")");
+            query.build().persistent(false).execute(&mut *tx).await?;
+        }
+
+        let parent_rows_per_chunk = POSTGRES_BIND_LIMIT / PARENT_BINDS_PER_ROW;
+        let estimated_parent_edges = final_row_indexes.len().saturating_mul(2);
+        let mut parent_edges =
+            Vec::with_capacity(parent_rows_per_chunk.min(estimated_parent_edges));
+        for &commit_index in &final_row_indexes {
+            for (parent_index, _) in prepared[commit_index].commit.parents.iter().enumerate() {
+                let parent_order = i32::try_from(parent_index)
+                    .map_err(|_| Error::Backend("parent order exceeds i32".to_owned()))?;
+                parent_edges.push((commit_index, parent_index, parent_order));
+                if parent_edges.len() == parent_rows_per_chunk {
+                    insert_commit_parent_rows_in_transaction(
+                        &mut tx,
+                        tenant,
+                        repository,
+                        &prepared,
+                        &parent_edges,
+                    )
+                    .await?;
+                    parent_edges.clear();
+                }
+            }
+        }
+        if !parent_edges.is_empty() {
+            insert_commit_parent_rows_in_transaction(
+                &mut tx,
+                tenant,
+                repository,
+                &prepared,
+                &parent_edges,
+            )
+            .await?;
         }
         tx.commit().await?;
         Ok(())
