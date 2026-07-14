@@ -150,6 +150,12 @@ pub mod prelude {
         PgPackPromotionObservation, PgPackPromotionReceipt, PgPackPromotionWork,
         PgPackPromotionWorkLimit,
     };
+    pub use crate::protocol::push_admission::{
+        PushAdmissionCost, PushAdmissionError, PushAdmissionRejectReason, PushAdmissionRejection,
+        PushAdmissionRequest, PushAdmissionScheduler, PushAdmissionSnapshot, PushAdmissionTicket,
+        PushExecutionOutcome, PushExecutionPermit, PushExecutionPhase, PushQueueLimits,
+        PushQueueWorkBudget, PushQueueWorkLimit, PushScheduleDecision,
+    };
     pub use crate::protocol::push_atomic_publication::{
         publish_prepared_push, PromotionReceiptBinding, PushAtomicPublicationBackend,
         PushAtomicPublicationControl, PushAtomicPublicationError, PushAtomicPublicationLimits,

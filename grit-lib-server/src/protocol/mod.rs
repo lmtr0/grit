@@ -14,6 +14,7 @@ pub mod pack_stream;
 pub mod pack_writer;
 #[cfg(feature = "sqlx-postgres")]
 pub mod pg_pack_promotion;
+pub mod push_admission;
 pub mod push_atomic_publication;
 pub mod push_fix_thin;
 pub mod push_metrics;
