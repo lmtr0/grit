@@ -183,6 +183,131 @@ pub struct ImportReport {
     pub loose_objects: usize,
     /// Whether a requested full mirror included every compatible local pack and loose object.
     pub full_mirror_completed: bool,
+    /// Backend-neutral work counters collected during the import.
+    pub metrics: ImportMetrics,
+}
+
+/// Per-kind object counts and decoded payload bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImportObjectKindMetrics {
+    /// Commit objects decoded and their canonical payload bytes.
+    pub commits: ImportObjectMetrics,
+    /// Tree objects decoded and their canonical payload bytes.
+    pub trees: ImportObjectMetrics,
+    /// Blob objects decoded and their canonical payload bytes.
+    pub blobs: ImportObjectMetrics,
+    /// Tag objects decoded and their canonical payload bytes.
+    pub tags: ImportObjectMetrics,
+}
+
+impl ImportObjectKindMetrics {
+    fn record(&mut self, kind: ObjectKind, bytes: u64) {
+        let metric = match kind {
+            ObjectKind::Commit => &mut self.commits,
+            ObjectKind::Tree => &mut self.trees,
+            ObjectKind::Blob => &mut self.blobs,
+            ObjectKind::Tag => &mut self.tags,
+        };
+        metric.objects = metric.objects.saturating_add(1);
+        metric.bytes = metric.bytes.saturating_add(bytes);
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.commits.merge(&other.commits);
+        self.trees.merge(&other.trees);
+        self.blobs.merge(&other.blobs);
+        self.tags.merge(&other.tags);
+    }
+}
+
+/// Count and canonical payload bytes for one Git object kind.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImportObjectMetrics {
+    /// Number of objects decoded.
+    pub objects: u64,
+    /// Sum of decoded canonical object payload bytes.
+    pub bytes: u64,
+}
+
+impl ImportObjectMetrics {
+    fn merge(&mut self, other: &Self) {
+        self.objects = self.objects.saturating_add(other.objects);
+        self.bytes = self.bytes.saturating_add(other.bytes);
+    }
+}
+
+/// Source-side work performed by repository discovery and object decoding.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImportSourceMetrics {
+    /// Compatible local source packs inspected by the native-pack discovery path.
+    pub discovered_packs: u64,
+    /// Pack bytes loaded while inspecting compatible local source packs.
+    pub discovered_pack_bytes: u64,
+    /// Actual object decode work, including retained-pack validation and fallback reads.
+    pub decoded: ImportObjectKindMetrics,
+}
+
+/// Destination storage calls and durable row or byte volumes initiated by the importer.
+///
+/// These are application-level storage operations. A backend metrics adapter can compare them
+/// with SQL statement or external-service request counters to identify amplification below the
+/// [`crate::storage::ServerStorage`] boundary.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImportDestinationMetrics {
+    /// Calls that write one bounded loose-object batch.
+    pub loose_object_write_batches: u64,
+    /// Loose-object payload bytes submitted to destination storage.
+    pub loose_object_write_bytes: u64,
+    /// Calls that write a batch of retained packs and their indexes.
+    pub pack_write_batches: u64,
+    /// Retained pack bytes submitted to destination storage.
+    pub retained_pack_bytes: u64,
+    /// Object-to-pack index rows submitted with retained packs.
+    pub pack_index_rows: u64,
+    /// Calls that upsert direct tree-entry batches.
+    pub tree_upsert_batches: u64,
+    /// Direct tree-entry rows submitted to destination storage.
+    pub tree_rows: u64,
+    /// Calls that upsert commit graph batches.
+    pub commit_upsert_batches: u64,
+    /// Commit graph rows submitted to destination storage.
+    pub commit_rows: u64,
+    /// Guarded ref/config publication transactions completed by the importer.
+    pub publication_transactions: u64,
+    /// Trusted import completion markers successfully stored by the importer.
+    pub completion_markers: u64,
+}
+
+/// Stable source and destination counters for one import run.
+///
+/// Counters saturate at [`u64::MAX`] rather than wrapping.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImportMetrics {
+    /// Source discovery and decoding work.
+    pub source: ImportSourceMetrics,
+    /// Destination storage calls and durable volumes.
+    pub destination: ImportDestinationMetrics,
+}
+
+/// Stable phases emitted around the major import pipeline boundaries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImportPhase {
+    /// Discover refs, configuration, local packs, and pack metadata.
+    SourceDiscovery,
+    /// Open a fenced destination import session and load its trusted manifest.
+    DestinationPreparation,
+    /// Traverse reachable objects and prepare semantic indexes.
+    ObjectTraversal,
+    /// Validate and install eligible native packs plus loose fallback objects.
+    NativePackInstallation,
+    /// Resolve object sizes and write the direct-tree browse index.
+    BrowseIndex,
+    /// Compute and write commit graph generations.
+    CommitGraph,
+    /// Atomically publish configuration, refs, pruning, and trusted objects.
+    Publication,
+    /// Store the guarded trusted import completion marker after publication.
+    Completion,
 }
 
 /// Controls whether filesystem source packs may be retained directly during import.
@@ -499,6 +624,15 @@ pub struct ImportCheckpoint {
 /// Progress event emitted while importing a repository.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImportProgressEvent {
+    /// A stable import pipeline phase is about to begin.
+    PhaseStarted(ImportPhase),
+    /// A stable import pipeline phase completed with cumulative metrics at its boundary.
+    PhaseCompleted {
+        /// Phase that completed.
+        phase: ImportPhase,
+        /// Cumulative import counters after the phase completed.
+        metrics: ImportMetrics,
+    },
     /// A config entry was copied.
     ConfigEntry {
         /// Config key that was imported.
@@ -589,7 +723,9 @@ where
 /// closure without trusting objects written by the partial run. Ref updates and pruning are
 /// published only after object and query-index writes finish. Progress callbacks for final config,
 /// ref, prune, and completion events run after guarded publication but before the trusted
-/// completion marker; rejecting any such event leaves the import incomplete.
+/// completion marker; rejecting any such event leaves the import incomplete. The final
+/// `PhaseCompleted(Completion)` event is necessarily emitted after the marker is durable; if that
+/// callback rejects the event, the function returns its error but the import remains complete.
 ///
 /// [`NativePackImportMode::Reachable`] retains only self-contained local packs whose complete
 /// index belongs to the current closure or a previously completed trusted closure.
@@ -637,6 +773,8 @@ where
     S: ServerStorage,
     P: FnMut(ImportProgressEvent) -> Result<()>,
 {
+    let mut report = ImportReport::default();
+    start_import_phase(&mut progress, ImportPhase::SourceDiscovery)?;
     let execution = ValidatedImportExecutionOptions::from(&execution_options);
     let mut pool = BlockingPool::new(execution.decode_workers)?;
     let git_dir = source.git_dir.clone();
@@ -653,7 +791,16 @@ where
     let native_import_enabled = native_source_packs
         .as_ref()
         .is_some_and(|native| native.retention_enabled);
+    if let Some(native) = &native_source_packs {
+        report.metrics.source.discovered_packs = usize_to_u64(native.packs.len());
+        report.metrics.source.discovered_pack_bytes =
+            native.packs.iter().fold(0u64, |bytes, pack| {
+                bytes.saturating_add(pack.metadata.size_bytes)
+            });
+    }
+    complete_import_phase(&mut progress, ImportPhase::SourceDiscovery, &report)?;
 
+    start_import_phase(&mut progress, ImportPhase::DestinationPreparation)?;
     let session = destination
         .storage()
         .begin_import(destination.tenant(), destination.repository())
@@ -663,8 +810,9 @@ where
         .iter()
         .map(|(oid, _)| *oid)
         .collect::<HashSet<_>>();
-    let mut report = ImportReport::default();
+    complete_import_phase(&mut progress, ImportPhase::DestinationPreparation, &report)?;
 
+    start_import_phase(&mut progress, ImportPhase::ObjectTraversal)?;
     let mut seen = HashSet::new();
     let mut newly_trusted = Vec::new();
     let mut indexed_commits = HashMap::new();
@@ -744,6 +892,13 @@ where
             let stored = decoded.stored;
             let object_kind = decoded.object_kind;
             let object_size = decoded.object_size;
+            if stored.is_some() {
+                report
+                    .metrics
+                    .source
+                    .decoded
+                    .record(object_kind, object_size);
+            }
             newly_trusted.push((oid, object_kind));
 
             object_sizes.insert(oid, object_size);
@@ -841,6 +996,8 @@ where
         }
     }
     if native_import_enabled {
+        complete_import_phase(&mut progress, ImportPhase::ObjectTraversal, &report)?;
+        start_import_phase(&mut progress, ImportPhase::NativePackInstallation)?;
         let native_source_packs = native_source_packs.ok_or_else(|| {
             Error::Protocol("native import was enabled without source pack metadata".to_owned())
         })?;
@@ -861,6 +1018,7 @@ where
             &mut progress,
         )
         .await?;
+        complete_import_phase(&mut progress, ImportPhase::NativePackInstallation, &report)?;
     } else {
         flush_imported_objects(
             destination,
@@ -871,8 +1029,13 @@ where
             &mut progress,
         )
         .await?;
+        complete_import_phase(&mut progress, ImportPhase::ObjectTraversal, &report)?;
+        start_import_phase(&mut progress, ImportPhase::NativePackInstallation)?;
+        complete_import_phase(&mut progress, ImportPhase::NativePackInstallation, &report)?;
     }
     pool.shutdown()?;
+
+    start_import_phase(&mut progress, ImportPhase::BrowseIndex)?;
     resolve_pending_tree_sizes(destination, &mut tree_entries, pending_size_entries).await?;
 
     if !tree_entries.is_empty() {
@@ -884,12 +1047,24 @@ where
                 &tree_entries,
             )
             .await?;
+        report.metrics.destination.tree_upsert_batches = report
+            .metrics
+            .destination
+            .tree_upsert_batches
+            .saturating_add(1);
+        report.metrics.destination.tree_rows = report
+            .metrics
+            .destination
+            .tree_rows
+            .saturating_add(usize_to_u64(tree_entries.len()));
     }
     report.tree_entries = tree_entries.len();
     for (tree_oid, entries) in indexed_tree_batches {
         progress(ImportProgressEvent::TreeEntries { tree_oid, entries })?;
     }
+    complete_import_phase(&mut progress, ImportPhase::BrowseIndex, &report)?;
 
+    start_import_phase(&mut progress, ImportPhase::CommitGraph)?;
     let existing_commits = if indexed_commits.is_empty() {
         HashMap::new()
     } else {
@@ -913,9 +1088,21 @@ where
                 &indexed_commits,
             )
             .await?;
+        report.metrics.destination.commit_upsert_batches = report
+            .metrics
+            .destination
+            .commit_upsert_batches
+            .saturating_add(1);
+        report.metrics.destination.commit_rows = report
+            .metrics
+            .destination
+            .commit_rows
+            .saturating_add(usize_to_u64(indexed_commits.len()));
     }
     report.commit_graph_entries = indexed_commits.len();
+    complete_import_phase(&mut progress, ImportPhase::CommitGraph, &report)?;
 
+    start_import_phase(&mut progress, ImportPhase::Publication)?;
     let publication = ImportPublication {
         config_entries,
         refs: desired_refs,
@@ -931,6 +1118,11 @@ where
             &publication,
         )
         .await?;
+    report.metrics.destination.publication_transactions = report
+        .metrics
+        .destination
+        .publication_transactions
+        .saturating_add(1);
     report.config_entries = publication.config_entries.len();
     for (key, _) in &publication.config_entries {
         progress(ImportProgressEvent::ConfigEntry { key: key.clone() })?;
@@ -945,11 +1137,20 @@ where
         report.pruned_refs += 1;
         progress(ImportProgressEvent::PrunedRef { refname })?;
     }
+    complete_import_phase(&mut progress, ImportPhase::Publication, &report)?;
+
+    start_import_phase(&mut progress, ImportPhase::Completion)?;
     progress(ImportProgressEvent::Completed(report.clone()))?;
     destination
         .storage()
         .complete_import(destination.tenant(), destination.repository(), &session)
         .await?;
+    report.metrics.destination.completion_markers = report
+        .metrics
+        .destination
+        .completion_markers
+        .saturating_add(1);
+    complete_import_phase(&mut progress, ImportPhase::Completion, &report)?;
     Ok(report)
 }
 
@@ -1685,12 +1886,14 @@ where
         }
         let validated = pool
             .run_jobs(jobs, |(source_pack, pack_oids)| {
-                let valid = validate_native_pack_readability(&source_pack).is_ok();
-                Ok((source_pack, pack_oids, valid))
+                let validation = validate_native_pack_readability(&source_pack);
+                Ok((source_pack, pack_oids, validation))
             })
             .await?;
-        for (source_pack, pack_oids, valid) in validated {
-            if !valid {
+        for (source_pack, pack_oids, validation) in validated {
+            let (validation_metrics, validation_result) = validation;
+            report.metrics.source.decoded.merge(&validation_metrics);
+            if validation_result.is_err() {
                 all_candidates_installed = false;
                 continue;
             }
@@ -1710,6 +1913,12 @@ where
 
     report.native_packs = packs_to_install.len();
     if !packs_to_install.is_empty() {
+        let retained_pack_bytes = packs_to_install.iter().fold(0u64, |bytes, pack| {
+            bytes.saturating_add(pack.metadata.size_bytes)
+        });
+        let pack_index_rows = packs_to_install.iter().fold(0u64, |rows, pack| {
+            rows.saturating_add(usize_to_u64(pack.index.len()))
+        });
         destination
             .storage()
             .write_imported_packs(
@@ -1718,6 +1927,21 @@ where
                 packs_to_install,
             )
             .await?;
+        report.metrics.destination.pack_write_batches = report
+            .metrics
+            .destination
+            .pack_write_batches
+            .saturating_add(1);
+        report.metrics.destination.retained_pack_bytes = report
+            .metrics
+            .destination
+            .retained_pack_bytes
+            .saturating_add(retained_pack_bytes);
+        report.metrics.destination.pack_index_rows = report
+            .metrics
+            .destination
+            .pack_index_rows
+            .saturating_add(pack_index_rows);
     }
 
     for (oid, kind) in inputs.newly_trusted {
@@ -1756,6 +1980,11 @@ where
         .await?;
         for (oid, object) in fallback_objects {
             let object = object?;
+            report
+                .metrics
+                .source
+                .decoded
+                .record(object.kind, usize_to_u64(object.data.len()));
             let stored = StoredObject::new(object.kind, object.data);
             let payload_bytes = stored.data.len();
             let exceeds_byte_limit =
@@ -1831,6 +2060,11 @@ where
                         continue;
                     }
                 };
+                report
+                    .metrics
+                    .source
+                    .decoded
+                    .record(object.kind, usize_to_u64(object.data.len()));
                 let stored = StoredObject::new(object.kind, object.data);
                 let payload_bytes = stored.data.len();
                 if !mirror_batch.is_empty()
@@ -1861,22 +2095,33 @@ where
     Ok(())
 }
 
-fn validate_native_pack_readability(source: &NativeSourcePack) -> Result<()> {
+fn validate_native_pack_readability(
+    source: &NativeSourcePack,
+) -> (ImportObjectKindMetrics, Result<()>) {
+    let mut metrics = ImportObjectKindMetrics::default();
     for entry in &source.index.entries {
-        let oid = ObjectId::from_bytes(&entry.oid)?;
-        let expected = source.object_metadata.get(&oid).copied().ok_or_else(|| {
-            Error::Protocol("native pack object has no validated metadata".to_owned())
-        })?;
-        let object = pack::read_object_from_pack_bytes(&source.data, &source.index, &entry.oid)?;
-        let decoded_size = u64::try_from(object.data.len())
-            .map_err(|_| Error::Protocol("native pack object size exceeds u64".to_owned()))?;
-        if object.kind != expected.kind || decoded_size != expected.size {
-            return Err(Error::Protocol(format!(
-                "source pack metadata does not match verified object {oid}"
-            )));
+        let validation = (|| {
+            let oid = ObjectId::from_bytes(&entry.oid)?;
+            let expected = source.object_metadata.get(&oid).copied().ok_or_else(|| {
+                Error::Protocol("native pack object has no validated metadata".to_owned())
+            })?;
+            let object =
+                pack::read_object_from_pack_bytes(&source.data, &source.index, &entry.oid)?;
+            let decoded_size = u64::try_from(object.data.len())
+                .map_err(|_| Error::Protocol("native pack object size exceeds u64".to_owned()))?;
+            metrics.record(object.kind, decoded_size);
+            if object.kind != expected.kind || decoded_size != expected.size {
+                return Err(Error::Protocol(format!(
+                    "source pack metadata does not match verified object {oid}"
+                )));
+            }
+            Ok(())
+        })();
+        if let Err(error) = validation {
+            return (metrics, Err(error));
         }
     }
-    Ok(())
+    (metrics, Ok(()))
 }
 
 fn prepare_native_stored_pack(source: &NativeSourcePack) -> Result<ImportedPack> {
@@ -1941,6 +2186,9 @@ where
     if pending.is_empty() {
         return Ok(());
     }
+    let object_bytes = pending.iter().fold(0u64, |bytes, (_, object)| {
+        bytes.saturating_add(usize_to_u64(object.data.len()))
+    });
     report.loose_objects = report.loose_objects.saturating_add(pending.len());
     destination
         .storage()
@@ -1949,7 +2197,18 @@ where
             destination.repository(),
             std::mem::take(pending),
         )
-        .await
+        .await?;
+    report.metrics.destination.loose_object_write_batches = report
+        .metrics
+        .destination
+        .loose_object_write_batches
+        .saturating_add(1);
+    report.metrics.destination.loose_object_write_bytes = report
+        .metrics
+        .destination
+        .loose_object_write_bytes
+        .saturating_add(object_bytes);
+    Ok(())
 }
 
 fn compute_commit_generations(
@@ -2078,6 +2337,9 @@ where
         .iter()
         .map(|(oid, object)| (*oid, object.kind))
         .collect::<Vec<_>>();
+    let object_bytes = pending.iter().fold(0u64, |bytes, (_, object)| {
+        bytes.saturating_add(usize_to_u64(object.data.len()))
+    });
     destination
         .storage()
         .write_imported_objects(
@@ -2088,6 +2350,16 @@ where
         .await?;
     *pending_bytes = 0;
     report.loose_objects = report.loose_objects.saturating_add(events.len());
+    report.metrics.destination.loose_object_write_batches = report
+        .metrics
+        .destination
+        .loose_object_write_batches
+        .saturating_add(1);
+    report.metrics.destination.loose_object_write_bytes = report
+        .metrics
+        .destination
+        .loose_object_write_bytes
+        .saturating_add(object_bytes);
 
     for (oid, kind) in events {
         report.objects += 1;
@@ -2114,6 +2386,31 @@ fn maybe_checkpoint(
     };
     report.checkpoints.push(checkpoint.clone());
     progress(ImportProgressEvent::Checkpoint(checkpoint))
+}
+
+fn start_import_phase(
+    progress: &mut impl FnMut(ImportProgressEvent) -> Result<()>,
+    phase: ImportPhase,
+) -> Result<()> {
+    progress(ImportProgressEvent::PhaseStarted(phase))
+}
+
+fn complete_import_phase(
+    progress: &mut impl FnMut(ImportProgressEvent) -> Result<()>,
+    phase: ImportPhase,
+    report: &ImportReport,
+) -> Result<()> {
+    progress(ImportProgressEvent::PhaseCompleted {
+        phase,
+        metrics: report.metrics.clone(),
+    })
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    match u64::try_from(value) {
+        Ok(value) => value,
+        Err(_) => u64::MAX,
+    }
 }
 
 fn merge_parsed_tree(

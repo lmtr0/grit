@@ -47,8 +47,10 @@ pub mod prelude {
     pub use crate::ids::{RepositoryId, TenantId};
     pub use crate::import::{
         import_repository, import_repository_with_execution_options,
-        import_repository_with_options, ImportCheckpoint, ImportExecutionOptions, ImportOptions,
-        ImportProgressEvent, ImportReport, NativePackImportMode,
+        import_repository_with_options, ImportCheckpoint, ImportDestinationMetrics,
+        ImportExecutionOptions, ImportMetrics, ImportObjectKindMetrics, ImportObjectMetrics,
+        ImportOptions, ImportPhase, ImportProgressEvent, ImportReport, ImportSourceMetrics,
+        NativePackImportMode,
     };
     pub use crate::layered::LayeredCache;
     pub use crate::maintenance::{
