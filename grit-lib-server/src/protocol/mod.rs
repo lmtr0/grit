@@ -11,5 +11,6 @@ pub mod pack_stream;
 pub mod pack_writer;
 pub mod push_metrics;
 pub mod receive_pack;
+pub mod receive_pack_stream;
 pub mod upload_pack;
 pub mod upload_pack_wire;

@@ -144,6 +144,14 @@ pub mod prelude {
         ReceivePackCapability, ReceivePackCommand, ReceivePackRefAdvertisement, ReceivePackReport,
         ReceivePackRequest, ReceivePackService,
     };
+    pub use crate::protocol::receive_pack_stream::{
+        receive_pack_stream, validate_buffered_receive_pack, BoundedReceivePackCollector,
+        BufferedPackSource, PackChunkSource, PackChunkSourceError, PackSourceChunk,
+        ReceivePackAbortReason, ReceivePackChunkSink, ReceivePackChunkSinkError,
+        ReceivePackEnvelope, ReceivePackStreamControl, ReceivePackStreamError,
+        ReceivePackStreamObservation, ReceivePackStreamOptions, ReceivePackStreamReport,
+        MAX_RECEIVE_PACK_CHUNK_BYTES,
+    };
     pub use crate::protocol::upload_pack::{
         AdvertisedRef, FetchPackPlan, FetchPackResponse, GitProtocolVersion, RefAdvertisement,
         UploadPackCapability, UploadPackRequest, UploadPackResponseStreamFailure,
