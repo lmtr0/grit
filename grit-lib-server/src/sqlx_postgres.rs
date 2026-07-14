@@ -868,6 +868,12 @@ pub const MIGRATIONS: &[&str] = &[
         storage_version bytea,
         storage_checksum bytea,
         not_before timestamptz not null,
+        lease_token bytea,
+        lease_expires_at timestamptz,
+        lease_generation bigint not null default 0,
+        delete_state text not null default 'idle',
+        last_outcome text,
+        last_observed_at timestamptz,
         primary key (repository_pk, storage_backend, storage_key, quarantine_id,
             quarantine_generation),
         constraint grit_external_pack_promotion_orphans_repository_fk foreign key (repository_pk)
@@ -882,8 +888,50 @@ pub const MIGRATIONS: &[&str] = &[
         check ((storage_version is null) = (storage_checksum is null)),
         check (storage_version is null or octet_length(storage_version) between 1 and 4096),
         check (storage_checksum is null
-            or octet_length(storage_checksum) = octet_length(pack_checksum))
+            or octet_length(storage_checksum) = octet_length(pack_checksum)),
+        check ((lease_token is null) = (lease_expires_at is null)),
+        check (lease_token is null or octet_length(lease_token) = 32),
+        check (lease_generation >= 0),
+        check (delete_state in ('idle', 'deleting'))
     )",
+    "alter table grit_external_pack_promotion_orphans
+        add column if not exists lease_token bytea",
+    "alter table grit_external_pack_promotion_orphans
+        add column if not exists lease_expires_at timestamptz",
+    "alter table grit_external_pack_promotion_orphans
+        add column if not exists lease_generation bigint not null default 0",
+    "alter table grit_external_pack_promotion_orphans
+        add column if not exists delete_state text not null default 'idle'",
+    "alter table grit_external_pack_promotion_orphans
+        add column if not exists last_outcome text",
+    "alter table grit_external_pack_promotion_orphans
+        add column if not exists last_observed_at timestamptz",
+    "do $$ begin
+        if not exists (
+            select 1 from pg_constraint
+            where conrelid = 'grit_external_pack_promotion_orphans'::regclass
+              and conname = 'grit_external_pack_promotion_orphans_lease_shape'
+        ) then
+            alter table grit_external_pack_promotion_orphans
+                add constraint grit_external_pack_promotion_orphans_lease_shape check (
+                    (lease_token is null) = (lease_expires_at is null)
+                    and (lease_token is null or octet_length(lease_token) = 32));
+        end if;
+    end $$",
+    "do $$ begin
+        if not exists (
+            select 1 from pg_constraint
+            where conrelid = 'grit_external_pack_promotion_orphans'::regclass
+              and conname = 'grit_external_pack_promotion_orphans_delete_state'
+        ) then
+            alter table grit_external_pack_promotion_orphans
+                add constraint grit_external_pack_promotion_orphans_delete_state check (
+                    lease_generation >= 0 and delete_state in ('idle', 'deleting'));
+        end if;
+    end $$",
+    "create index if not exists grit_external_pack_promotion_orphans_sweep_v2_idx
+        on grit_external_pack_promotion_orphans
+            (not_before, lease_expires_at, delete_state)",
     "create or replace function grit_assign_repository_pk()
      returns trigger language plpgsql as $$
      begin
@@ -8915,6 +8963,27 @@ pub(crate) async fn lock_import_repository(
     Ok(())
 }
 
+/// Serialize external-key deletion against promotion registration and publication.
+///
+/// `backend_name` and `storage_key` form the provider-global lock identity. Callers must first
+/// acquire their repository lock so every promotion and sweep uses one fixed lock order.
+///
+/// # Errors
+///
+/// Returns SQL errors while acquiring the transaction-scoped advisory lock.
+pub(crate) async fn lock_external_storage_key(
+    tx: &mut Transaction<'static, Postgres>,
+    backend_name: &str,
+    storage_key: &str,
+) -> Result<()> {
+    sqlx::query("select pg_advisory_xact_lock(hashtext($1), hashtext($2))")
+        .bind(backend_name)
+        .bind(storage_key)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 fn stale_import_session(
     tenant: &TenantId,
     repository: &RepositoryId,
@@ -9430,6 +9499,31 @@ async fn install_promoted_push_pack(
     lock_import_repository(&mut tx, &stage.tenant, &stage.repository)
         .await
         .map_err(|_| PgPackPromotionInstallError::Backend)?;
+    if let PgPackPromotionStorage::External {
+        backend_name,
+        storage_key,
+        ..
+    } = &stage.storage
+    {
+        lock_external_storage_key(&mut tx, backend_name, storage_key)
+            .await
+            .map_err(|_| PgPackPromotionInstallError::Backend)?;
+        let deleting: bool = sqlx::query_scalar(
+            "select exists (
+                select 1 from grit_external_pack_promotion_orphans
+                where storage_backend = $1 and storage_key = $2
+                  and delete_state = 'deleting'
+            )",
+        )
+        .bind(backend_name)
+        .bind(storage_key)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| PgPackPromotionInstallError::Backend)?;
+        if deleting {
+            return Err(PgPackPromotionInstallError::Collision);
+        }
+    }
     let repository = sqlx::query(
         "select repository_pk, hash_algo, push_generation from grit_repositories
          where tenant_id = $1 and repository_id = $2 and deleted_at is null for update",
@@ -9677,7 +9771,8 @@ async fn install_promoted_push_pack(
              where repository_pk = $1 and storage_backend = $2 and storage_key = $3
                and quarantine_id = $4 and quarantine_generation = $5
                and prepared_fingerprint = $6 and pack_checksum = $7 and size_bytes = $8
-               and storage_version = $9 and storage_checksum = $10",
+               and storage_version = $9 and storage_checksum = $10
+               and lease_token is null",
         )
         .bind(repository_pk)
         .bind(backend_name)
@@ -9750,6 +9845,23 @@ async fn register_external_promotion_orphan(
     lock_import_repository(&mut tx, tenant, repository)
         .await
         .map_err(|_| PgPackPromotionInstallError::Backend)?;
+    lock_external_storage_key(&mut tx, backend_name, storage_key)
+        .await
+        .map_err(|_| PgPackPromotionInstallError::Backend)?;
+    let deleting: bool = sqlx::query_scalar(
+        "select exists (
+            select 1 from grit_external_pack_promotion_orphans
+            where storage_backend = $1 and storage_key = $2 and delete_state = 'deleting'
+        )",
+    )
+    .bind(backend_name)
+    .bind(storage_key)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|_| PgPackPromotionInstallError::Backend)?;
+    if deleting {
+        return Err(PgPackPromotionInstallError::Collision);
+    }
     let repository_pk: Option<i64> = sqlx::query_scalar(
         "select repository_pk from grit_repositories
          where tenant_id = $1 and repository_id = $2 and deleted_at is null",
@@ -9781,6 +9893,8 @@ async fn register_external_promotion_orphan(
                     = excluded.prepared_fingerprint
            and grit_external_pack_promotion_orphans.pack_checksum = excluded.pack_checksum
            and grit_external_pack_promotion_orphans.size_bytes = excluded.size_bytes
+           and grit_external_pack_promotion_orphans.lease_token is null
+           and grit_external_pack_promotion_orphans.delete_state = 'idle'
            and (excluded.storage_version is null
                 or grit_external_pack_promotion_orphans.storage_version is null
                 or (grit_external_pack_promotion_orphans.storage_version

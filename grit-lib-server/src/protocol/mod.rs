@@ -21,6 +21,7 @@ pub mod push_pack_validation;
 pub mod push_parallel_validation;
 pub mod push_prepared;
 pub mod push_quarantine;
+pub mod push_quarantine_orphan_sweeper;
 pub mod receive_pack;
 pub mod receive_pack_stream;
 pub mod upload_pack;

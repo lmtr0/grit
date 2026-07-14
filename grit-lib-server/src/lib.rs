@@ -205,6 +205,15 @@ pub mod prelude {
         QuarantinePromotion, QuarantinePromotionId, QuarantineReceivePackSink, QuarantineScope,
         QuarantineScratch, QuarantineSnapshot, QuarantineState,
     };
+    pub use crate::protocol::push_quarantine_orphan_sweeper::{
+        sweep_push_orphans, NoPushQuarantineOrphans, PushExternalDeleteAuthorization,
+        PushExternalDeleteResult, PushExternalOrphanCandidate, PushExternalOrphanDelete,
+        PushExternalOrphanMetadata, PushExternalOrphanObject, PushExternalOrphanOutcome,
+        PushOrphanBackendError, PushOrphanLease, PushOrphanSweepControl, PushOrphanSweepError,
+        PushOrphanSweepLimits, PushOrphanSweepObservation, PushOrphanSweepReport,
+        PushOrphanSweepWork, PushOrphanSweepWorkLimit, PushOrphanWorkerToken,
+        PushQuarantineCleanupResult, PushQuarantineOrphanCandidate, PushQuarantineOrphanCleanup,
+    };
     pub use crate::protocol::receive_pack::{
         AllowAllPushPolicy, ProtectedRefPolicy, PushCommandKind, PushCommandStatus, PushPlan,
         PushPolicy, PushPolicyContext, QuarantinedObject, ReceivePackAdvertisedRef,
