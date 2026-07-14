@@ -17,6 +17,14 @@ use crate::storage::{
     PackMetadata, PackObjectIndex, PackStore, RefStore, ReflogEntry, ReflogStore, StoredObject,
     StoredPack, StoredRef,
 };
+use crate::tree_block::{
+    decode_tree_block, encode_tree_block, tree_block_prefix_range, TreeBlockEntry, TreeBlockError,
+    TREE_BLOCK_FORMAT_VERSION,
+};
+
+const POSTGRES_BIND_LIMIT: usize = 65_535;
+const TREE_BLOCK_BINDS_PER_ROW: usize = 5;
+const MAX_TREE_BLOCKS_PER_BATCH: usize = POSTGRES_BIND_LIMIT / TREE_BLOCK_BINDS_PER_ROW;
 
 /// SQL migration statements for the initial server storage schema.
 pub const MIGRATIONS: &[&str] = &[
@@ -418,6 +426,158 @@ pub struct PgRepositoryRow {
     pub deleted_at: Option<OffsetDateTime>,
 }
 
+/// Compact-tree read behavior selected for one repository cohort.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TreeBlockReadMode {
+    /// Read only the legacy row-oriented browse index.
+    LegacyOnly,
+    /// Prefer a valid compact block and fall back to legacy rows when it is absent or invalid.
+    PreferBlock,
+    /// Read both representations and report the first typed difference before serving rows.
+    Compare,
+}
+
+/// Explicit compact-tree rollout policy supplied by the repository cohort selector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TreeBlockReadPolicy {
+    /// Representation selection and comparison behavior.
+    pub mode: TreeBlockReadMode,
+    /// Largest encoded block that may be fetched and decoded for one request.
+    pub max_block_bytes: usize,
+    /// Largest number of legacy rows that may be fetched for one direct tree.
+    pub max_legacy_rows: usize,
+}
+
+impl TreeBlockReadPolicy {
+    /// Construct a policy with explicit byte and row limits.
+    ///
+    /// The caller is responsible for selecting the repository cohort; storage keeps no implicit
+    /// feature flag or process-global rollout state.
+    #[must_use]
+    pub const fn new(
+        mode: TreeBlockReadMode,
+        max_block_bytes: usize,
+        max_legacy_rows: usize,
+    ) -> Self {
+        Self {
+            mode,
+            max_block_bytes,
+            max_legacy_rows,
+        }
+    }
+}
+
+/// Durable representation that supplied a compact-tree read result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TreeBlockReadSource {
+    /// Result came from the compact immutable block.
+    CompactBlock,
+    /// Result came from legacy direct-entry rows.
+    LegacyRows,
+}
+
+/// Reason a compact block could not be used and legacy rows were selected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TreeBlockReadIssue {
+    /// No compact block has been persisted for the tree.
+    Missing,
+    /// Encoded bytes exceeded the caller's request limit.
+    BlockTooLarge {
+        /// Stored encoded byte length.
+        actual: usize,
+        /// Caller-supplied maximum encoded byte length.
+        limit: usize,
+    },
+    /// Stored format metadata disagreed with the supported codec or decoded payload.
+    InvalidMetadata {
+        /// Format version stored beside the payload.
+        format_version: i16,
+        /// Entry count stored beside the payload.
+        entry_count: i64,
+    },
+    /// Strict decoding rejected the stored payload.
+    InvalidPayload(TreeBlockError),
+}
+
+/// First difference between compact and legacy direct-tree representations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeBlockMismatch {
+    /// Zero-based sorted entry index where the representations first differ.
+    pub index: usize,
+    /// Compact entry at the differing index, or `None` when compact data ended first.
+    pub compact: Option<TreeBlockEntry>,
+    /// Legacy entry at the differing index, or `None` when legacy data ended first.
+    pub legacy: Option<TreeBlockEntry>,
+}
+
+/// Result of a policy-controlled compact-tree read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeBlockReadOutcome {
+    /// Sorted direct entries whose names begin with the requested raw prefix.
+    pub entries: Vec<TreeBlockEntry>,
+    /// Durable representation selected for the returned entries.
+    pub source: TreeBlockReadSource,
+    /// Compact-block fallback reason, when the block was unavailable or invalid.
+    pub issue: Option<TreeBlockReadIssue>,
+    /// First comparison difference in [`TreeBlockReadMode::Compare`].
+    pub mismatch: Option<TreeBlockMismatch>,
+}
+
+/// Stable key used to resume a compact-tree backfill after one processed tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeBlockBackfillCursor {
+    /// Numeric repository identity.
+    pub repository_pk: RepositoryPk,
+    /// Last processed tree object identifier.
+    pub tree_oid: ObjectId,
+}
+
+/// Explicit bounds and key range for one resumable compact-tree backfill call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeBlockBackfillOptions {
+    /// Exclusive cursor from the previous call, or `None` to begin at the first key.
+    pub start_after: Option<TreeBlockBackfillCursor>,
+    /// Inclusive final key for an operator-selected repository/tree cohort.
+    pub end_at: Option<TreeBlockBackfillCursor>,
+    /// Maximum candidate trees examined by this call.
+    pub max_trees: usize,
+    /// Maximum legacy direct-entry rows transferred by this call.
+    pub max_rows: usize,
+    /// Maximum estimated legacy row bytes transferred by this call.
+    pub max_legacy_bytes: usize,
+    /// Maximum encoded bytes accepted for any one generated block.
+    pub max_block_bytes: usize,
+}
+
+/// One tree skipped because its legacy rows or encoded block exceeded call bounds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OversizedTreeBlock {
+    /// Tree key that was deliberately skipped.
+    pub cursor: TreeBlockBackfillCursor,
+    /// Number of legacy direct-entry rows reported by PostgreSQL.
+    pub rows: u64,
+    /// Estimated bytes of names, object IDs, modes, and sizes in those rows.
+    pub estimated_bytes: u64,
+}
+
+/// Progress returned from one bounded, idempotent compact-tree backfill call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeBlockBackfillReport {
+    /// Cursor to supply as [`TreeBlockBackfillOptions::start_after`] on the next call.
+    pub next_cursor: Option<TreeBlockBackfillCursor>,
+    /// Number of compact blocks inserted or replaced.
+    pub blocks_written: usize,
+    /// Number of legacy rows encoded into block candidates accepted by the per-tree bounds.
+    pub rows_encoded: usize,
+    /// Total encoded bytes written.
+    pub bytes_written: usize,
+    /// Trees skipped because one tree could not fit within the explicit per-tree limits.
+    pub oversized: Vec<OversizedTreeBlock>,
+    /// Whether no later candidate exists in the requested key range.
+    pub exhausted: bool,
+}
+
 /// SQLx-backed repository storage using PostgreSQL-compatible SQL.
 #[derive(Clone)]
 pub struct PgServerStorage {
@@ -447,6 +607,451 @@ impl PgServerStorage {
             sqlx::query(statement).execute(&self.pool).await?;
         }
         Ok(())
+    }
+
+    /// Encode and idempotently persist one compact direct-tree block.
+    ///
+    /// This additive write does not remove or update legacy `grit_tree_entries`; callers may keep
+    /// dual-writing those rows for rollback during rollout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::RepositoryNotFound`] when the repository is absent, [`Error::Backend`]
+    /// when the tree or entry object IDs disagree with its hash algorithm, codec errors, or SQLx
+    /// errors from PostgreSQL.
+    pub async fn upsert_tree_block(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        tree_oid: &ObjectId,
+        entries: &[TreeBlockEntry],
+    ) -> Result<()> {
+        let row = self.require_repository(tenant, repository).await?;
+        validate_tree_oid(row.hash_algo, tree_oid)?;
+        let encoded = encode_tree_block(row.hash_algo, entries)
+            .map_err(|error| Error::Backend(error.to_string()))?;
+        let entry_count = i64::try_from(entries.len())
+            .map_err(|_| Error::Backend("tree block entry count exceeds i64".to_owned()))?;
+        let mut tx = self.pool.begin().await?;
+        lock_import_repository(&mut tx, tenant, repository).await?;
+        sqlx::query(
+            "insert into grit_tree_blocks
+                (repository_pk, tree_oid, format_version, entry_count, data)
+             values ($1, $2, $3, $4, $5)
+             on conflict (repository_pk, tree_oid)
+             do update set format_version = excluded.format_version,
+                           entry_count = excluded.entry_count,
+                           data = excluded.data
+             where grit_tree_blocks.format_version is distinct from excluded.format_version
+                or grit_tree_blocks.entry_count is distinct from excluded.entry_count
+                or grit_tree_blocks.data is distinct from excluded.data",
+        )
+        .bind(row.repository_pk.get())
+        .bind(tree_oid.as_bytes())
+        .bind(i16::from(TREE_BLOCK_FORMAT_VERSION))
+        .bind(entry_count)
+        .bind(encoded)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Read direct-tree entries using an explicit repository rollout policy.
+    ///
+    /// `prefix` is matched against raw direct-child name bytes. Compact reads perform one block
+    /// query and binary-search the decoded sorted block. Missing, oversized, or invalid blocks
+    /// fall back to bounded legacy rows. Compare mode reads both complete representations,
+    /// reports the first typed mismatch, and serves the legacy result when they diverge.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::RepositoryNotFound`] when the repository is absent, [`Error::Backend`]
+    /// for an invalid policy, hash-algorithm mismatch, or legacy tree exceeding its row bound, and
+    /// SQLx errors from PostgreSQL.
+    pub async fn read_tree_block_entries(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        tree_oid: &ObjectId,
+        prefix: &[u8],
+        policy: TreeBlockReadPolicy,
+    ) -> Result<TreeBlockReadOutcome> {
+        validate_tree_block_read_policy(policy)?;
+        let repository_row = self.require_repository(tenant, repository).await?;
+        validate_tree_oid(repository_row.hash_algo, tree_oid)?;
+
+        if policy.mode == TreeBlockReadMode::LegacyOnly {
+            let legacy = self
+                .load_legacy_tree_entries(
+                    repository_row.repository_pk,
+                    tree_oid,
+                    repository_row.hash_algo,
+                    policy.max_legacy_rows,
+                )
+                .await?;
+            return Ok(TreeBlockReadOutcome {
+                entries: select_tree_block_prefix(&legacy, prefix),
+                source: TreeBlockReadSource::LegacyRows,
+                issue: None,
+                mismatch: None,
+            });
+        }
+
+        let block = self
+            .load_tree_block(
+                repository_row.repository_pk,
+                tree_oid,
+                repository_row.hash_algo,
+                policy.max_block_bytes,
+            )
+            .await?;
+        let compact = match block {
+            Ok(entries) => entries,
+            Err(issue) => {
+                let legacy = self
+                    .load_legacy_tree_entries(
+                        repository_row.repository_pk,
+                        tree_oid,
+                        repository_row.hash_algo,
+                        policy.max_legacy_rows,
+                    )
+                    .await?;
+                return Ok(TreeBlockReadOutcome {
+                    entries: select_tree_block_prefix(&legacy, prefix),
+                    source: TreeBlockReadSource::LegacyRows,
+                    issue: Some(issue),
+                    mismatch: None,
+                });
+            }
+        };
+
+        if policy.mode == TreeBlockReadMode::Compare {
+            let legacy = self
+                .load_legacy_tree_entries(
+                    repository_row.repository_pk,
+                    tree_oid,
+                    repository_row.hash_algo,
+                    policy.max_legacy_rows,
+                )
+                .await?;
+            let mismatch = first_tree_block_mismatch(&compact, &legacy);
+            if mismatch.is_some() {
+                return Ok(TreeBlockReadOutcome {
+                    entries: select_tree_block_prefix(&legacy, prefix),
+                    source: TreeBlockReadSource::LegacyRows,
+                    issue: None,
+                    mismatch,
+                });
+            }
+        }
+
+        Ok(TreeBlockReadOutcome {
+            entries: select_tree_block_prefix(&compact, prefix),
+            source: TreeBlockReadSource::CompactBlock,
+            issue: None,
+            mismatch: None,
+        })
+    }
+
+    /// Backfill a bounded key range of compact tree blocks from legacy direct-entry rows.
+    ///
+    /// Candidate keys are ordered by `(repository_pk, tree_oid)` and fetched with keyset
+    /// pagination. Legacy entries for all accepted keys are fetched in one bounded query, then
+    /// blocks are installed in one idempotent set-based upsert. A tree larger than the explicit
+    /// bounds is reported and its cursor advances so an operator can handle it separately.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Backend`] for zero/overflowing limits, invalid stored repository/hash/OID
+    /// metadata, or encoded blocks exceeding internal format limits, and SQLx errors from
+    /// PostgreSQL. No implicit clock, environment, or global rollout state is consulted.
+    pub async fn backfill_tree_blocks(
+        &self,
+        options: &TreeBlockBackfillOptions,
+    ) -> Result<TreeBlockBackfillReport> {
+        validate_tree_block_backfill_options(options)?;
+        let candidate_limit = options
+            .max_trees
+            .checked_add(1)
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or_else(|| Error::Backend("tree-block candidate limit exceeds i64".to_owned()))?;
+        let start_pk = options
+            .start_after
+            .as_ref()
+            .map(|cursor| cursor.repository_pk.get());
+        let start_oid = options
+            .start_after
+            .as_ref()
+            .map(|cursor| cursor.tree_oid.as_bytes().to_vec());
+        let end_pk = options
+            .end_at
+            .as_ref()
+            .map(|cursor| cursor.repository_pk.get());
+        let end_oid = options
+            .end_at
+            .as_ref()
+            .map(|cursor| cursor.tree_oid.as_bytes().to_vec());
+        let rows = sqlx::query(
+            "select repository.repository_pk, repository.hash_algo, entry.tree_oid_bytes,
+                    count(*) as entry_count,
+                    coalesce(sum(octet_length(entry.path) + octet_length(entry.oid_bytes)
+                                 + octet_length(entry.tree_oid_bytes) + 20), 0)
+                        as estimated_bytes
+             from grit_tree_entries entry
+             join grit_repositories repository
+               on repository.repository_pk = entry.repository_pk
+             where repository.deleted_at is null
+               and ($1::bigint is null
+                    or (repository.repository_pk, entry.tree_oid_bytes) > ($1, $2::bytea))
+               and ($3::bigint is null
+                    or (repository.repository_pk, entry.tree_oid_bytes) <= ($3, $4::bytea))
+             group by repository.repository_pk, repository.hash_algo, entry.tree_oid_bytes
+             order by repository.repository_pk, entry.tree_oid_bytes
+             limit $5",
+        )
+        .bind(start_pk)
+        .bind(start_oid)
+        .bind(end_pk)
+        .bind(end_oid)
+        .bind(candidate_limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let has_more_candidates = rows.len() > options.max_trees;
+        let candidates = rows
+            .iter()
+            .take(options.max_trees)
+            .map(tree_block_candidate_from_row)
+            .collect::<Result<Vec<_>>>()?;
+        let mut selected = Vec::new();
+        let mut oversized = Vec::new();
+        let mut selected_rows = 0usize;
+        let mut selected_bytes = 0usize;
+        let mut next_cursor = options.start_after.clone();
+        let mut stopped_for_budget = false;
+        for candidate in candidates {
+            let cursor = candidate.cursor();
+            if candidate.entry_count > options.max_rows
+                || candidate.estimated_bytes > options.max_legacy_bytes
+            {
+                oversized.push(oversized_tree_block(&candidate)?);
+                next_cursor = Some(cursor);
+                continue;
+            }
+            let Some(next_rows) = selected_rows.checked_add(candidate.entry_count) else {
+                return Err(Error::Backend("tree-block row budget overflow".to_owned()));
+            };
+            let Some(next_bytes) = selected_bytes.checked_add(candidate.estimated_bytes) else {
+                return Err(Error::Backend("tree-block byte budget overflow".to_owned()));
+            };
+            if next_rows > options.max_rows || next_bytes > options.max_legacy_bytes {
+                stopped_for_budget = true;
+                break;
+            }
+            selected_rows = next_rows;
+            selected_bytes = next_bytes;
+            next_cursor = Some(cursor);
+            selected.push(candidate);
+        }
+
+        let legacy_rows = self.load_backfill_tree_entries(&selected).await?;
+        let mut encoded_blocks = Vec::with_capacity(selected.len());
+        let mut rows_encoded = 0usize;
+        for candidate in &selected {
+            let entries = legacy_rows
+                .get(&(candidate.repository_pk, candidate.tree_oid))
+                .cloned()
+                .unwrap_or_default();
+            if entries.len() != candidate.entry_count {
+                return Err(Error::Backend(
+                    "legacy tree changed while compact block was being backfilled".to_owned(),
+                ));
+            }
+            let encoded = encode_tree_block(candidate.hash_algo, &entries)
+                .map_err(|error| Error::Backend(error.to_string()))?;
+            if encoded.len() > options.max_block_bytes {
+                oversized.push(oversized_tree_block(candidate)?);
+                continue;
+            }
+            rows_encoded = rows_encoded.checked_add(entries.len()).ok_or_else(|| {
+                Error::Backend("tree-block encoded row count overflow".to_owned())
+            })?;
+            encoded_blocks.push((candidate, encoded));
+        }
+        let write_stats = self
+            .verify_and_upsert_tree_blocks(&selected, &legacy_rows, &encoded_blocks)
+            .await?;
+        Ok(TreeBlockBackfillReport {
+            next_cursor,
+            blocks_written: write_stats.blocks,
+            rows_encoded,
+            bytes_written: write_stats.bytes,
+            oversized,
+            exhausted: !has_more_candidates && !stopped_for_budget,
+        })
+    }
+
+    async fn require_repository(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+    ) -> Result<PgRepositoryRow> {
+        self.read_repository(tenant, repository)
+            .await?
+            .ok_or_else(|| Error::RepositoryNotFound(format!("{tenant}/{repository}")))
+    }
+
+    async fn load_tree_block(
+        &self,
+        repository_pk: RepositoryPk,
+        tree_oid: &ObjectId,
+        hash_algo: HashAlgo,
+        max_block_bytes: usize,
+    ) -> Result<std::result::Result<Vec<TreeBlockEntry>, TreeBlockReadIssue>> {
+        let max_bytes = i64::try_from(max_block_bytes)
+            .map_err(|_| Error::Backend("tree-block byte limit exceeds i64".to_owned()))?;
+        let row = sqlx::query(
+            "select format_version, entry_count, octet_length(data) as data_len,
+                    case when octet_length(data) <= $3 then data else null end as bounded_data
+             from grit_tree_blocks
+             where repository_pk = $1 and tree_oid = $2",
+        )
+        .bind(repository_pk.get())
+        .bind(tree_oid.as_bytes())
+        .bind(max_bytes)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(Err(TreeBlockReadIssue::Missing));
+        };
+        let format_version: i16 = row.try_get("format_version")?;
+        let entry_count: i64 = row.try_get("entry_count")?;
+        let data_len: i32 = row.try_get("data_len")?;
+        if data_len < 0 {
+            return Ok(Err(TreeBlockReadIssue::InvalidMetadata {
+                format_version,
+                entry_count,
+            }));
+        }
+        let data_len = usize::try_from(data_len)
+            .map_err(|_| Error::Backend("tree-block byte length is negative".to_owned()))?;
+        if data_len > max_block_bytes {
+            return Ok(Err(TreeBlockReadIssue::BlockTooLarge {
+                actual: data_len,
+                limit: max_block_bytes,
+            }));
+        }
+        let data: Option<Vec<u8>> = row.try_get("bounded_data")?;
+        if format_version != i16::from(TREE_BLOCK_FORMAT_VERSION) || entry_count < 0 {
+            return Ok(Err(TreeBlockReadIssue::InvalidMetadata {
+                format_version,
+                entry_count,
+            }));
+        }
+        let Some(data) = data else {
+            return Ok(Err(TreeBlockReadIssue::InvalidMetadata {
+                format_version,
+                entry_count,
+            }));
+        };
+        let entries = match decode_tree_block(hash_algo, &data) {
+            Ok(entries) => entries,
+            Err(error) => return Ok(Err(TreeBlockReadIssue::InvalidPayload(error))),
+        };
+        if i64::try_from(entries.len()).ok() != Some(entry_count) {
+            return Ok(Err(TreeBlockReadIssue::InvalidMetadata {
+                format_version,
+                entry_count,
+            }));
+        }
+        Ok(Ok(entries))
+    }
+
+    async fn load_legacy_tree_entries(
+        &self,
+        repository_pk: RepositoryPk,
+        tree_oid: &ObjectId,
+        hash_algo: HashAlgo,
+        max_rows: usize,
+    ) -> Result<Vec<TreeBlockEntry>> {
+        let limit = max_rows
+            .checked_add(1)
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or_else(|| Error::Backend("legacy tree row limit exceeds i64".to_owned()))?;
+        let rows = sqlx::query(
+            "select path, mode, oid_bytes, size
+             from grit_tree_entries
+             where repository_pk = $1 and tree_oid_bytes = $2
+             order by path collate \"C\"
+             limit $3",
+        )
+        .bind(repository_pk.get())
+        .bind(tree_oid.as_bytes())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        if rows.len() > max_rows {
+            return Err(Error::Backend(format!(
+                "legacy tree {} exceeds the configured {max_rows}-row read bound",
+                tree_oid.to_hex()
+            )));
+        }
+        rows.iter()
+            .map(|row| legacy_tree_entry_from_row(row, hash_algo))
+            .collect()
+    }
+
+    async fn load_backfill_tree_entries(
+        &self,
+        candidates: &[PgTreeBlockCandidate],
+    ) -> Result<HashMap<(RepositoryPk, ObjectId), Vec<TreeBlockEntry>>> {
+        if candidates.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut query =
+            QueryBuilder::<Postgres>::new("with selected(repository_pk, tree_oid) as (");
+        query.push_values(candidates, |mut row, candidate| {
+            row.push_bind(candidate.repository_pk.get())
+                .push_bind(candidate.tree_oid.as_bytes());
+        });
+        query.push(
+            ") select entry.repository_pk, entry.tree_oid_bytes, entry.path, entry.mode,
+                      entry.oid_bytes, entry.size
+               from grit_tree_entries entry
+               join selected on selected.repository_pk = entry.repository_pk
+                            and selected.tree_oid = entry.tree_oid_bytes
+               order by entry.repository_pk, entry.tree_oid_bytes, entry.path collate \"C\"",
+        );
+        let rows = query
+            .build()
+            .persistent(false)
+            .fetch_all(&self.pool)
+            .await?;
+        collect_backfill_tree_entries(&rows, candidates)
+    }
+
+    async fn verify_and_upsert_tree_blocks(
+        &self,
+        selected: &[PgTreeBlockCandidate],
+        source_entries: &HashMap<(RepositoryPk, ObjectId), Vec<TreeBlockEntry>>,
+        encoded_blocks: &[(&PgTreeBlockCandidate, Vec<u8>)],
+    ) -> Result<PgTreeBlockWriteStats> {
+        if encoded_blocks.is_empty() {
+            return Ok(PgTreeBlockWriteStats::default());
+        }
+        let mut tx = self.pool.begin().await?;
+        lock_tree_block_backfill_repositories(&mut tx, selected).await?;
+        let current_entries = load_backfill_tree_entries_in_transaction(&mut tx, selected).await?;
+        if &current_entries != source_entries {
+            return Err(Error::Backend(
+                "legacy trees changed while compact blocks were being encoded".to_owned(),
+            ));
+        }
+        let write_stats =
+            upsert_encoded_tree_blocks_in_transaction(&mut tx, encoded_blocks).await?;
+        tx.commit().await?;
+        Ok(write_stats)
     }
 
     /// Create a repository metadata row for a tenant-scoped repository.
@@ -2604,6 +3209,321 @@ impl ConfigStore for PgServerStorage {
             .map(|row| Ok((row.try_get("key")?, row.try_get("value")?)))
             .collect()
     }
+}
+
+#[derive(Clone, Debug)]
+struct PgTreeBlockCandidate {
+    repository_pk: RepositoryPk,
+    tree_oid: ObjectId,
+    hash_algo: HashAlgo,
+    entry_count: usize,
+    estimated_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PgTreeBlockWriteStats {
+    blocks: usize,
+    bytes: usize,
+}
+
+impl PgTreeBlockCandidate {
+    fn cursor(&self) -> TreeBlockBackfillCursor {
+        TreeBlockBackfillCursor {
+            repository_pk: self.repository_pk,
+            tree_oid: self.tree_oid,
+        }
+    }
+}
+
+fn oversized_tree_block(candidate: &PgTreeBlockCandidate) -> Result<OversizedTreeBlock> {
+    Ok(OversizedTreeBlock {
+        cursor: candidate.cursor(),
+        rows: u64::try_from(candidate.entry_count)
+            .map_err(|_| Error::Backend("oversized tree row count exceeds u64".to_owned()))?,
+        estimated_bytes: u64::try_from(candidate.estimated_bytes).map_err(|_| {
+            Error::Backend("oversized tree estimated byte count exceeds u64".to_owned())
+        })?,
+    })
+}
+
+fn validate_tree_oid(hash_algo: HashAlgo, tree_oid: &ObjectId) -> Result<()> {
+    if tree_oid.algo() == hash_algo {
+        return Ok(());
+    }
+    Err(Error::Backend(format!(
+        "tree object ID does not match repository hash algorithm {}",
+        hash_algo.name()
+    )))
+}
+
+fn validate_tree_block_read_policy(policy: TreeBlockReadPolicy) -> Result<()> {
+    if policy.max_block_bytes == 0 || policy.max_legacy_rows == 0 {
+        return Err(Error::Backend(
+            "tree-block read byte and row limits must be positive".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_tree_block_backfill_options(options: &TreeBlockBackfillOptions) -> Result<()> {
+    if options.max_trees == 0
+        || options.max_rows == 0
+        || options.max_legacy_bytes == 0
+        || options.max_block_bytes == 0
+    {
+        return Err(Error::Backend(
+            "tree-block backfill tree, row, and byte limits must be positive".to_owned(),
+        ));
+    }
+    if options.max_trees > MAX_TREE_BLOCKS_PER_BATCH {
+        return Err(Error::Backend(format!(
+            "tree-block backfill tree limit exceeds the PostgreSQL batch maximum of {MAX_TREE_BLOCKS_PER_BATCH}"
+        )));
+    }
+    if options
+        .start_after
+        .as_ref()
+        .zip(options.end_at.as_ref())
+        .is_some_and(|(start, end)| compare_tree_block_cursors(start, end).is_ge())
+    {
+        return Err(Error::Backend(
+            "tree-block backfill end cursor must follow its start cursor".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn compare_tree_block_cursors(
+    left: &TreeBlockBackfillCursor,
+    right: &TreeBlockBackfillCursor,
+) -> std::cmp::Ordering {
+    left.repository_pk
+        .cmp(&right.repository_pk)
+        .then_with(|| left.tree_oid.as_bytes().cmp(right.tree_oid.as_bytes()))
+}
+
+fn select_tree_block_prefix(entries: &[TreeBlockEntry], prefix: &[u8]) -> Vec<TreeBlockEntry> {
+    entries[tree_block_prefix_range(entries, prefix)].to_vec()
+}
+
+fn first_tree_block_mismatch(
+    compact: &[TreeBlockEntry],
+    legacy: &[TreeBlockEntry],
+) -> Option<TreeBlockMismatch> {
+    let shared = compact.len().min(legacy.len());
+    let index = (0..shared)
+        .find(|&index| compact.get(index) != legacy.get(index))
+        .or_else(|| (compact.len() != legacy.len()).then_some(shared))?;
+    Some(TreeBlockMismatch {
+        index,
+        compact: compact.get(index).cloned(),
+        legacy: legacy.get(index).cloned(),
+    })
+}
+
+fn tree_block_candidate_from_row(row: &sqlx::postgres::PgRow) -> Result<PgTreeBlockCandidate> {
+    let repository_pk: i64 = row.try_get("repository_pk")?;
+    let repository_pk =
+        RepositoryPk::try_from(repository_pk).map_err(|error| Error::Backend(error.to_string()))?;
+    let hash_algo_name: String = row.try_get("hash_algo")?;
+    let hash_algo = HashAlgo::from_name(&hash_algo_name).ok_or_else(|| {
+        Error::Backend(format!(
+            "unknown repository hash algorithm '{hash_algo_name}'"
+        ))
+    })?;
+    let tree_oid_bytes: Vec<u8> = row.try_get("tree_oid_bytes")?;
+    let tree_oid = ObjectId::from_bytes(&tree_oid_bytes)?;
+    validate_tree_oid(hash_algo, &tree_oid)?;
+    let entry_count: i64 = row.try_get("entry_count")?;
+    let estimated_bytes: i64 = row.try_get("estimated_bytes")?;
+    if entry_count < 0 || estimated_bytes < 0 {
+        return Err(Error::Backend(
+            "tree-block candidate has negative aggregate metadata".to_owned(),
+        ));
+    }
+    Ok(PgTreeBlockCandidate {
+        repository_pk,
+        tree_oid,
+        hash_algo,
+        entry_count: usize::try_from(entry_count)
+            .map_err(|_| Error::Backend("tree entry count exceeds usize".to_owned()))?,
+        estimated_bytes: usize::try_from(estimated_bytes)
+            .map_err(|_| Error::Backend("tree entry bytes exceed usize".to_owned()))?,
+    })
+}
+
+fn legacy_tree_entry_from_row(
+    row: &sqlx::postgres::PgRow,
+    hash_algo: HashAlgo,
+) -> Result<TreeBlockEntry> {
+    let path: String = row.try_get("path")?;
+    let mode: i32 = row.try_get("mode")?;
+    let oid_bytes: Vec<u8> = row.try_get("oid_bytes")?;
+    let size: Option<i64> = row.try_get("size")?;
+    if mode < 0 || size.is_some_and(|value| value < 0) {
+        return Err(Error::Backend(
+            "legacy tree entry has negative mode or size".to_owned(),
+        ));
+    }
+    let mode = u32::try_from(mode)
+        .map_err(|_| Error::Backend("legacy tree entry mode exceeds u32".to_owned()))?;
+    let size = size
+        .map(u64::try_from)
+        .transpose()
+        .map_err(|_| Error::Backend("legacy tree entry size exceeds u64".to_owned()))?;
+    let oid = ObjectId::from_bytes(&oid_bytes)?;
+    if oid.algo() != hash_algo {
+        return Err(Error::Backend(format!(
+            "tree entry object ID does not match repository hash algorithm {}",
+            hash_algo.name()
+        )));
+    }
+    Ok(TreeBlockEntry {
+        name: path.into_bytes(),
+        mode,
+        oid,
+        size,
+    })
+}
+
+fn collect_backfill_tree_entries(
+    rows: &[sqlx::postgres::PgRow],
+    candidates: &[PgTreeBlockCandidate],
+) -> Result<HashMap<(RepositoryPk, ObjectId), Vec<TreeBlockEntry>>> {
+    let algorithms = candidates
+        .iter()
+        .map(|candidate| {
+            (
+                (candidate.repository_pk, candidate.tree_oid),
+                candidate.hash_algo,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut grouped = HashMap::<(RepositoryPk, ObjectId), Vec<TreeBlockEntry>>::new();
+    for row in rows {
+        let repository_pk: i64 = row.try_get("repository_pk")?;
+        let repository_pk = RepositoryPk::try_from(repository_pk)
+            .map_err(|error| Error::Backend(error.to_string()))?;
+        let tree_oid_bytes: Vec<u8> = row.try_get("tree_oid_bytes")?;
+        let tree_oid = ObjectId::from_bytes(&tree_oid_bytes)?;
+        let key = (repository_pk, tree_oid);
+        let hash_algo = algorithms.get(&key).copied().ok_or_else(|| {
+            Error::Backend("PostgreSQL returned an unselected legacy tree".to_owned())
+        })?;
+        grouped
+            .entry(key)
+            .or_default()
+            .push(legacy_tree_entry_from_row(row, hash_algo)?);
+    }
+    Ok(grouped)
+}
+
+async fn lock_tree_block_backfill_repositories(
+    tx: &mut Transaction<'static, Postgres>,
+    candidates: &[PgTreeBlockCandidate],
+) -> Result<()> {
+    let mut repository_pks = candidates
+        .iter()
+        .map(|candidate| candidate.repository_pk)
+        .collect::<Vec<_>>();
+    repository_pks.sort_unstable();
+    repository_pks.dedup();
+    if repository_pks.is_empty() {
+        return Ok(());
+    }
+    let mut query = QueryBuilder::<Postgres>::new(
+        "select repository_pk from grit_repositories where deleted_at is null and repository_pk in (",
+    );
+    let mut separated = query.separated(", ");
+    for repository_pk in &repository_pks {
+        separated.push_bind(repository_pk.get());
+    }
+    separated.push_unseparated(") order by repository_pk for share");
+    let rows = query.build().persistent(false).fetch_all(&mut **tx).await?;
+    if rows.len() != repository_pks.len() {
+        return Err(Error::Backend(
+            "repository changed while compact trees were being backfilled".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn load_backfill_tree_entries_in_transaction(
+    tx: &mut Transaction<'static, Postgres>,
+    candidates: &[PgTreeBlockCandidate],
+) -> Result<HashMap<(RepositoryPk, ObjectId), Vec<TreeBlockEntry>>> {
+    if candidates.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut query = QueryBuilder::<Postgres>::new("with selected(repository_pk, tree_oid) as (");
+    query.push_values(candidates, |mut row, candidate| {
+        row.push_bind(candidate.repository_pk.get())
+            .push_bind(candidate.tree_oid.as_bytes());
+    });
+    query.push(
+        ") select entry.repository_pk, entry.tree_oid_bytes, entry.path, entry.mode,
+                  entry.oid_bytes, entry.size
+           from grit_tree_entries entry
+           join selected on selected.repository_pk = entry.repository_pk
+                        and selected.tree_oid = entry.tree_oid_bytes
+           order by entry.repository_pk, entry.tree_oid_bytes, entry.path collate \"C\"",
+    );
+    let rows = query.build().persistent(false).fetch_all(&mut **tx).await?;
+    collect_backfill_tree_entries(&rows, candidates)
+}
+
+async fn upsert_encoded_tree_blocks_in_transaction(
+    tx: &mut Transaction<'static, Postgres>,
+    encoded_blocks: &[(&PgTreeBlockCandidate, Vec<u8>)],
+) -> Result<PgTreeBlockWriteStats> {
+    if encoded_blocks.is_empty() {
+        return Ok(PgTreeBlockWriteStats::default());
+    }
+    let values = encoded_blocks
+        .iter()
+        .map(|(candidate, encoded)| {
+            i64::try_from(candidate.entry_count)
+                .map(|entry_count| (*candidate, encoded, entry_count))
+                .map_err(|_| Error::Backend("tree-block entry count exceeds i64".to_owned()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut query = QueryBuilder::<Postgres>::new(
+        "insert into grit_tree_blocks
+            (repository_pk, tree_oid, format_version, entry_count, data) ",
+    );
+    query.push_values(values, |mut row, (candidate, encoded, entry_count)| {
+        row.push_bind(candidate.repository_pk.get())
+            .push_bind(candidate.tree_oid.as_bytes())
+            .push_bind(i16::from(TREE_BLOCK_FORMAT_VERSION))
+            .push_bind(entry_count)
+            .push_bind(encoded.as_slice());
+    });
+    query.push(
+        " on conflict (repository_pk, tree_oid)
+          do update set format_version = excluded.format_version,
+                        entry_count = excluded.entry_count,
+                        data = excluded.data
+          where grit_tree_blocks.format_version is distinct from excluded.format_version
+             or grit_tree_blocks.entry_count is distinct from excluded.entry_count
+             or grit_tree_blocks.data is distinct from excluded.data
+          returning octet_length(data) as data_len",
+    );
+    let rows = query.build().persistent(false).fetch_all(&mut **tx).await?;
+    rows.iter()
+        .try_fold(PgTreeBlockWriteStats::default(), |mut stats, row| {
+            let data_len: i32 = row.try_get("data_len")?;
+            let data_len = usize::try_from(data_len).map_err(|_| {
+                Error::Backend("written tree-block byte count is negative".to_owned())
+            })?;
+            stats.blocks = stats
+                .blocks
+                .checked_add(1)
+                .ok_or_else(|| Error::Backend("written tree-block count overflow".to_owned()))?;
+            stats.bytes = stats.bytes.checked_add(data_len).ok_or_else(|| {
+                Error::Backend("written tree-block byte count overflow".to_owned())
+            })?;
+            Ok(stats)
+        })
 }
 
 #[async_trait]

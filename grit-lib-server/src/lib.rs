@@ -89,8 +89,8 @@ pub mod prelude {
         StoredObject, StoredPack, StoredRef,
     };
     pub use crate::tree_block::{
-        decode_tree_block, encode_tree_block, TreeBlockEntry, TreeBlockError,
-        TREE_BLOCK_FORMAT_VERSION,
+        decode_tree_block, encode_tree_block, find_tree_block_entry, tree_block_prefix_range,
+        TreeBlockEntry, TreeBlockError, TREE_BLOCK_FORMAT_VERSION,
     };
     pub use crate::views::{
         BlobContentDelivery, BlobContentView, BlobDownloadOptions, BlobDownloadView,

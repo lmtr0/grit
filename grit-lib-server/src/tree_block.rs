@@ -12,6 +12,7 @@
 //! strictly bytewise-sorted partition of the trailing arena.
 
 use grit_lib::objects::{HashAlgo, ObjectId};
+use std::ops::Range;
 
 const MAGIC: &[u8; 4] = b"GRTB";
 const HEADER_LEN: usize = 16;
@@ -278,6 +279,35 @@ pub fn decode_tree_block(
         return Err(TreeBlockError::InvalidNameArena);
     }
     Ok(entries)
+}
+
+/// Find one direct child by its exact raw name in a decoded, sorted tree block.
+///
+/// `entries` must be the output of [`decode_tree_block`] or otherwise be strictly sorted by
+/// [`TreeBlockEntry::name`]. `name` is the raw direct-child name without a slash.
+#[must_use]
+pub fn find_tree_block_entry<'a>(
+    entries: &'a [TreeBlockEntry],
+    name: &[u8],
+) -> Option<&'a TreeBlockEntry> {
+    entries
+        .binary_search_by(|entry| entry.name.as_slice().cmp(name))
+        .ok()
+        .and_then(|index| entries.get(index))
+}
+
+/// Return the contiguous index range whose raw names begin with `prefix`.
+///
+/// `entries` must be the output of [`decode_tree_block`] or otherwise be strictly sorted by
+/// [`TreeBlockEntry::name`]. The two partition points keep lookup logarithmic and avoid scanning
+/// entries outside the matching range. An empty prefix selects all entries.
+#[must_use]
+pub fn tree_block_prefix_range(entries: &[TreeBlockEntry], prefix: &[u8]) -> Range<usize> {
+    let start = entries.partition_point(|entry| entry.name.as_slice() < prefix);
+    let end = entries.partition_point(|entry| {
+        entry.name.as_slice() < prefix || entry.name.as_slice().starts_with(prefix)
+    });
+    start..end
 }
 
 fn validate_name(name: &[u8]) -> Result<(), TreeBlockError> {
