@@ -342,7 +342,7 @@ pub const MIGRATIONS: &[&str] = &[
         check (length(idempotency_key) between 1 and 256),
         check (source_external_id is null or length(source_external_id) between 1 and 1024),
         check (hash_algo in ('sha1', 'sha256')),
-        check (phase between 1 and 4),
+        constraint grit_migration_phase_range check (phase between 1 and 5),
         check (state between 1 and 3),
         check (fencing_token >= 0),
         check (attempt_count >= 0),
@@ -350,7 +350,6 @@ pub const MIGRATIONS: &[&str] = &[
         check (claimed_by is null or length(claimed_by) between 1 and 256),
         check (claimed_by is null or lease_expires_at > updated_at),
         check (state = 1 or claimed_by is null),
-        check (phase < 4 or claimed_by is null),
         check (claimed_by is null or fencing_token > 0),
         check ((state = 1 and terminal_reason is null)
             or (state in (2, 3) and terminal_reason is not null
@@ -366,6 +365,181 @@ pub const MIGRATIONS: &[&str] = &[
             and completed_packs >= 0 and completed_bytes >= 0),
         check (updated_at >= created_at)
     )",
+    "alter table grit_migration_sessions
+        add column if not exists source_snapshot_ref_generation bigint",
+    "alter table grit_migration_sessions
+        add column if not exists source_snapshot_history_generation bigint",
+    "alter table grit_migration_sessions
+        add column if not exists source_snapshot_config_generation bigint",
+    "alter table grit_migration_sessions
+        add column if not exists source_snapshot_external_token text",
+    "alter table grit_migration_sessions
+        add column if not exists applied_ref_generation bigint",
+    "alter table grit_migration_sessions
+        add column if not exists applied_ref_name text",
+    "alter table grit_migration_sessions
+        add column if not exists applied_history_generation bigint",
+    "alter table grit_migration_sessions
+        add column if not exists applied_config_generation bigint",
+    "alter table grit_migration_sessions
+        add column if not exists applied_config_key text",
+    "alter table grit_migration_sessions
+        add column if not exists applied_external_token text",
+    "do $$ begin
+        if not exists (
+            select 1 from pg_constraint
+            where conrelid = 'grit_migration_sessions'::regclass
+              and conname = 'grit_migration_journal_cursor_shape'
+        ) then
+            alter table grit_migration_sessions
+                add constraint grit_migration_journal_cursor_shape check (
+                    (applied_ref_name is null or
+                        (applied_ref_generation is not null
+                         and length(applied_ref_name) between 1 and 1024))
+                    and (applied_config_key is null or
+                        (applied_config_generation is not null
+                         and length(applied_config_key) between 1 and 1024))
+                ) not valid;
+        end if;
+     end $$",
+    "alter table grit_migration_sessions
+        validate constraint grit_migration_journal_cursor_shape",
+    "alter table grit_migration_sessions drop constraint if exists grit_migration_sessions_phase_check",
+    "alter table grit_migration_sessions drop constraint if exists grit_migration_phase_range",
+    "alter table grit_migration_sessions add constraint grit_migration_phase_range
+        check (phase between 1 and 5)",
+    "do $$ declare constraint_row record; begin
+        for constraint_row in
+            select conname from pg_constraint
+            where conrelid = 'grit_migration_sessions'::regclass
+              and pg_get_constraintdef(oid) like '%phase < 4%claimed_by%'
+        loop
+            execute format('alter table grit_migration_sessions drop constraint %I',
+                constraint_row.conname);
+        end loop;
+     end $$",
+    "create table if not exists grit_ref_change_journal (
+        repository_pk bigint not null,
+        generation bigint not null,
+        refname text not null,
+        old_target_oid text,
+        old_symbolic_target text,
+        new_target_oid text,
+        new_symbolic_target text,
+        primary key (repository_pk, generation, refname),
+        constraint grit_ref_change_journal_repository_fk foreign key (repository_pk)
+            references grit_repositories (repository_pk) on delete cascade,
+        check (generation > 0),
+        check ((old_target_oid is null) or (old_symbolic_target is null)),
+        check ((new_target_oid is null) or (new_symbolic_target is null))
+    )",
+    "create table if not exists grit_config_change_journal (
+        repository_pk bigint not null,
+        generation bigint not null,
+        key text not null,
+        old_value text,
+        new_value text,
+        primary key (repository_pk, generation, key),
+        constraint grit_config_change_journal_repository_fk foreign key (repository_pk)
+            references grit_repositories (repository_pk) on delete cascade,
+        check (generation > 0),
+        check (old_value is not null or new_value is not null)
+    )",
+    "do $$ begin
+        if not exists (
+            select 1 from pg_constraint
+            where conrelid = 'grit_ref_change_journal'::regclass
+              and conname = 'grit_ref_change_journal_repository_fk'
+        ) then
+            alter table grit_ref_change_journal
+                add constraint grit_ref_change_journal_repository_fk
+                foreign key (repository_pk) references grit_repositories (repository_pk)
+                on delete cascade not valid;
+        end if;
+     end $$",
+    "alter table grit_ref_change_journal
+        validate constraint grit_ref_change_journal_repository_fk",
+    "do $$ begin
+        if not exists (
+            select 1 from pg_constraint
+            where conrelid = 'grit_config_change_journal'::regclass
+              and conname = 'grit_config_change_journal_repository_fk'
+        ) then
+            alter table grit_config_change_journal
+                add constraint grit_config_change_journal_repository_fk
+                foreign key (repository_pk) references grit_repositories (repository_pk)
+                on delete cascade not valid;
+        end if;
+     end $$",
+    "alter table grit_config_change_journal
+        validate constraint grit_config_change_journal_repository_fk",
+    "create or replace function grit_journal_ref_change() returns trigger language plpgsql as $$
+        declare repo_pk bigint; next_generation bigint; changed_tenant text; changed_repository text;
+            changed_ref text; old_oid text; old_symbolic text; new_oid text; new_symbolic text;
+        begin
+            if tg_op = 'UPDATE'
+                and old.refname is not distinct from new.refname
+                and old.target_oid is not distinct from new.target_oid
+                and old.symbolic_target is not distinct from new.symbolic_target then
+                return new;
+            end if;
+            if tg_op <> 'INSERT' then
+                changed_tenant := old.tenant_id; changed_repository := old.repository_id;
+                changed_ref := old.refname; old_oid := old.target_oid;
+                old_symbolic := old.symbolic_target;
+            end if;
+            if tg_op <> 'DELETE' then
+                changed_tenant := new.tenant_id; changed_repository := new.repository_id;
+                changed_ref := new.refname; new_oid := new.target_oid;
+                new_symbolic := new.symbolic_target;
+            end if;
+            select repository_pk, ref_generation + 1 into strict repo_pk, next_generation
+            from grit_repositories
+            where tenant_id = changed_tenant and repository_id = changed_repository
+              and deleted_at is null;
+            insert into grit_ref_change_journal
+                (repository_pk, generation, refname, old_target_oid, old_symbolic_target,
+                 new_target_oid, new_symbolic_target)
+            values (repo_pk, next_generation, changed_ref,
+                old_oid, old_symbolic, new_oid, new_symbolic)
+            on conflict (repository_pk, generation, refname) do update
+            set new_target_oid = excluded.new_target_oid,
+                new_symbolic_target = excluded.new_symbolic_target;
+            if tg_op = 'DELETE' then return old; else return new; end if;
+        end $$",
+    "drop trigger if exists grit_ref_change_journal_trigger on grit_refs",
+    "create trigger grit_ref_change_journal_trigger after insert or update or delete on grit_refs
+        for each row execute function grit_journal_ref_change()",
+    "create or replace function grit_journal_config_change() returns trigger language plpgsql as $$
+        declare repo_pk bigint; next_generation bigint; changed_tenant text; changed_repository text;
+            changed_key text; previous_value text; replacement_value text;
+        begin
+            if tg_op = 'UPDATE' and old.key is not distinct from new.key
+                and old.value is not distinct from new.value then
+                return new;
+            end if;
+            if tg_op <> 'INSERT' then
+                changed_tenant := old.tenant_id; changed_repository := old.repository_id;
+                changed_key := old.key; previous_value := old.value;
+            end if;
+            if tg_op <> 'DELETE' then
+                changed_tenant := new.tenant_id; changed_repository := new.repository_id;
+                changed_key := new.key; replacement_value := new.value;
+            end if;
+            select repository_pk, config_generation + 1 into strict repo_pk, next_generation
+            from grit_repositories
+            where tenant_id = changed_tenant and repository_id = changed_repository
+              and deleted_at is null;
+            insert into grit_config_change_journal
+                (repository_pk, generation, key, old_value, new_value)
+            values (repo_pk, next_generation, changed_key, previous_value, replacement_value)
+            on conflict (repository_pk, generation, key) do update
+            set new_value = excluded.new_value;
+            if tg_op = 'DELETE' then return old; else return new; end if;
+        end $$",
+    "drop trigger if exists grit_config_change_journal_trigger on grit_config",
+    "create trigger grit_config_change_journal_trigger after insert or update or delete on grit_config
+        for each row execute function grit_journal_config_change()",
     "alter sequence grit_migration_session_id_seq
         owned by grit_migration_sessions.migration_id",
     "create index if not exists grit_migration_sessions_claim_idx
@@ -722,6 +896,8 @@ pub enum PgMigrationPhase {
     BulkTransfer,
     /// The resumable initial migration finished successfully.
     InitialCopyComplete,
+    /// Apply bounded changes observed after the immutable initial snapshot.
+    CatchUp,
 }
 
 impl PgMigrationPhase {
@@ -731,6 +907,7 @@ impl PgMigrationPhase {
             Self::Snapshot => 2,
             Self::BulkTransfer => 3,
             Self::InitialCopyComplete => 4,
+            Self::CatchUp => 5,
         }
     }
 
@@ -740,6 +917,7 @@ impl PgMigrationPhase {
             2 => Ok(Self::Snapshot),
             3 => Ok(Self::BulkTransfer),
             4 => Ok(Self::InitialCopyComplete),
+            5 => Ok(Self::CatchUp),
             _ => Err(Error::Backend(format!(
                 "invalid migration phase code {code}"
             ))),
@@ -787,6 +965,157 @@ pub enum PgMigrationSource {
     /// A caller-defined external source descriptor.
     External(String),
 }
+
+/// Immutable or applied source position for incremental catch-up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PgMigrationSourceToken {
+    /// Generation tuple read from a PostgreSQL source repository.
+    Postgres {
+        /// Ref generation at this source position.
+        ref_generation: u64,
+        /// Commit-history generation at this source position.
+        history_generation: u64,
+        /// Config generation at this source position.
+        config_generation: u64,
+    },
+    /// Opaque stable position supplied by an external source adapter.
+    External(String),
+}
+
+/// Position within one generation-keyed migration journal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgMigrationJournalCursor {
+    /// Generation containing the last applied journal row.
+    pub generation: u64,
+    /// Bytewise-ordered ref name or config key of the last applied row.
+    pub key: String,
+}
+
+/// One metadata or immutable-payload prerequisite in a bounded catch-up batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PgMigrationCatchUpOperation {
+    /// Copy the object identified by `oid` through an existing object-transfer API.
+    Object { oid: ObjectId },
+    /// Copy the pack identified by `checksum` through an existing pack-transfer API.
+    Pack { checksum: ObjectId },
+    /// Apply a source ref transition with an expected-old compare-and-swap guard.
+    Ref {
+        /// Source ref generation containing the transition.
+        generation: u64,
+        /// Full ref name.
+        name: String,
+        /// Value expected at the destination before applying the transition.
+        expected: Option<StoredRef>,
+        /// Source value after the transition, or `None` for deletion.
+        value: Option<StoredRef>,
+    },
+    /// Apply a config transition with an expected-old compare-and-swap guard.
+    Config {
+        /// Source config generation containing the transition.
+        generation: u64,
+        /// Repository-local config key.
+        key: String,
+        /// Value expected at the destination before applying the transition.
+        expected: Option<String>,
+        /// Source value after the transition, or `None` for deletion.
+        value: Option<String>,
+    },
+}
+
+/// Typed source lag remaining after a catch-up plan.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PgMigrationCatchUpLag {
+    /// Remaining ref generations.
+    pub ref_generations: u64,
+    /// Remaining commit-history generations.
+    pub history_generations: u64,
+    /// Remaining config generations.
+    pub config_generations: u64,
+    /// Whether more bounded operations are already known to remain.
+    pub more_operations: bool,
+}
+
+/// Caller policy for deciding whether another catch-up pass is required.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PgMigrationCatchUpPolicy {
+    /// Largest acceptable remaining ref-generation lag.
+    pub max_ref_generations: u64,
+    /// Largest acceptable remaining commit-history-generation lag.
+    pub max_history_generations: u64,
+    /// Largest acceptable remaining config-generation lag.
+    pub max_config_generations: u64,
+}
+
+impl PgMigrationCatchUpLag {
+    /// Return whether this lag is within `policy` and no known operations remain.
+    #[must_use]
+    pub const fn is_within(self, policy: PgMigrationCatchUpPolicy) -> bool {
+        !self.more_operations
+            && self.ref_generations <= policy.max_ref_generations
+            && self.history_generations <= policy.max_history_generations
+            && self.config_generations <= policy.max_config_generations
+    }
+}
+
+/// Explicit bounds and observation time for one catch-up planning call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PgMigrationCatchUpOptions {
+    /// Maximum operations returned, in `1..=`[`MAX_MIGRATION_CATCH_UP_BATCH`].
+    pub max_operations: usize,
+    /// Caller-observed time used to validate the migration lease.
+    pub observed_at: OffsetDateTime,
+}
+
+/// Bounded read-only plan for one incremental catch-up pass.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgMigrationCatchUpBatch {
+    /// Migration session that produced this batch.
+    pub migration_id: u64,
+    /// Fencing token that must still own the session when applying.
+    pub fencing_token: u64,
+    /// Durable source position before this batch.
+    pub from: PgMigrationSourceToken,
+    /// Ref-journal position paired with `from`, when its generation is only partly applied.
+    pub from_ref_cursor: Option<PgMigrationJournalCursor>,
+    /// Config-journal position paired with `from`, when its generation is only partly applied.
+    pub from_config_cursor: Option<PgMigrationJournalCursor>,
+    /// Source position safely reached after all operations are applied.
+    pub apply_through: PgMigrationSourceToken,
+    /// Ref-journal position after applying this batch, if a generation remains partial.
+    pub apply_through_ref_cursor: Option<PgMigrationJournalCursor>,
+    /// Config-journal position after applying this batch, if a generation remains partial.
+    pub apply_through_config_cursor: Option<PgMigrationJournalCursor>,
+    /// Source position observed after planning.
+    pub source_observed: PgMigrationSourceToken,
+    /// Bounded operations without whole object or pack payloads.
+    pub operations: Vec<PgMigrationCatchUpOperation>,
+    /// Typed lag remaining after `apply_through`.
+    pub remaining_lag: PgMigrationCatchUpLag,
+}
+
+/// Outcome of atomically applying and checkpointing a catch-up batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PgMigrationCatchUpApplyResult {
+    /// Metadata changes and the batch checkpoint were committed.
+    Applied,
+    /// The read-only plan contained no durable operations, so nothing was written.
+    NoChanges,
+    /// A newer worker owns the session or its lease expired.
+    ClaimLost,
+    /// Destination state disagreed with an expected-old ref or config value.
+    Diverged {
+        /// Ref name or config key that diverged.
+        key: String,
+    },
+    /// An object or pack prerequisite has not yet been copied to the destination.
+    MissingPrerequisite {
+        /// Missing object ID or pack checksum.
+        oid: ObjectId,
+    },
+}
+
+/// Maximum operations returned by one catch-up planning call.
+pub const MAX_MIGRATION_CATCH_UP_BATCH: usize = 512;
 
 /// Cursor after the last fully durable object in bytewise object-ID order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -866,6 +1195,14 @@ pub struct PgMigrationSession {
     pub attempt_count: u32,
     /// Latest trusted checkpoint.
     pub checkpoint: PgMigrationCheckpoint,
+    /// Immutable source position captured before incremental catch-up.
+    pub source_snapshot: Option<PgMigrationSourceToken>,
+    /// Last source position atomically applied to the destination.
+    pub last_applied: Option<PgMigrationSourceToken>,
+    /// Partial ref-journal position associated with `last_applied`.
+    pub last_applied_ref_cursor: Option<PgMigrationJournalCursor>,
+    /// Partial config-journal position associated with `last_applied`.
+    pub last_applied_config_cursor: Option<PgMigrationJournalCursor>,
     /// Failure or cancellation reason for a terminal session.
     pub terminal_reason: Option<String>,
     /// Caller-supplied creation timestamp.
@@ -1364,8 +1701,8 @@ impl PgServerStorage {
     /// Claim a bounded oldest-first batch of active migration sessions.
     ///
     /// PostgreSQL skips rows locked by other workers. Expired leases may be reclaimed, and every
-    /// claim receives a fresh database fencing token. Initial-copy-complete and terminal sessions
-    /// are never selected.
+    /// claim receives a fresh database fencing token. Failed and cancelled sessions are never
+    /// selected; phase four is deliberately reclaimable for the explicit catch-up transition.
     ///
     /// # Errors
     ///
@@ -1380,7 +1717,7 @@ impl PgServerStorage {
         let rows = sqlx::query(
             "with candidates as (
                  select migration_id from grit_migration_sessions
-                 where state = 1 and phase < 4
+                 where state = 1 and phase <= 5
                    and updated_at <= $2
                    and (claimed_by is null or lease_expires_at <= $2)
                    and attempt_count < 2147483647
@@ -1565,7 +1902,7 @@ impl PgServerStorage {
              set state = $5, terminal_reason = $6, claimed_by = null,
                  lease_expires_at = null, updated_at = $4
              where migration_id = $1 and claimed_by = $2 and fencing_token = $3
-               and state = 1 and phase < 4 and lease_expires_at > $4 and updated_at <= $4",
+               and state = 1 and lease_expires_at > $4 and updated_at <= $4",
         )
         .bind(migration_id)
         .bind(&claim.worker_id)
@@ -1595,12 +1932,597 @@ impl PgServerStorage {
         let Some(row) = row else {
             return Ok(PgMigrationClaimResult::ClaimLost);
         };
-        let phase = PgMigrationPhase::from_code(row.try_get("phase")?)?;
         let state = PgMigrationState::from_code(row.try_get("state")?)?;
-        if state != PgMigrationState::Active || phase == PgMigrationPhase::InitialCopyComplete {
+        if state != PgMigrationState::Active {
             return Ok(PgMigrationClaimResult::Terminal);
         }
         Ok(PgMigrationClaimResult::ClaimLost)
+    }
+
+    /// Advance an initial-copy-complete session into incremental catch-up exactly once.
+    ///
+    /// `snapshot` is immutable after this transition and is also installed as the initial
+    /// last-applied source position. Phase four must be reclaimed before making this call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Backend`] for a mismatched token, phase, claim, or timestamp, and
+    /// propagates SQLx failures.
+    pub async fn begin_migration_catch_up(
+        &self,
+        claim: &PgMigrationClaim,
+        snapshot: &PgMigrationSourceToken,
+        observed_at: OffsetDateTime,
+    ) -> Result<PgMigrationClaimResult> {
+        validate_migration_claim(claim, observed_at)?;
+        if claim.session.phase != PgMigrationPhase::InitialCopyComplete {
+            return Err(Error::Backend(
+                "catch-up can begin only after the initial copy completes".to_owned(),
+            ));
+        }
+        validate_migration_source_token(&claim.session.source, snapshot)?;
+        let migration_id = positive_u64_to_i64(claim.session.migration_id, "migration id")?;
+        let fencing_token = positive_u64_to_i64(claim.fencing_token, "migration fencing token")?;
+        let token = migration_token_columns(snapshot)?;
+        let rows = sqlx::query(
+            "update grit_migration_sessions
+             set phase = 5,
+                 source_snapshot_ref_generation = $5,
+                 source_snapshot_history_generation = $6,
+                 source_snapshot_config_generation = $7,
+                 source_snapshot_external_token = $8,
+                 applied_ref_generation = $5, applied_history_generation = $6,
+                 applied_config_generation = $7, applied_external_token = $8,
+                 applied_ref_name = null, applied_config_key = null,
+                 updated_at = $4
+             where migration_id = $1 and claimed_by = $2 and fencing_token = $3
+               and state = 1 and phase = 4 and lease_expires_at > $4 and updated_at <= $4
+               and source_snapshot_ref_generation is null
+               and source_snapshot_history_generation is null
+               and source_snapshot_config_generation is null
+               and source_snapshot_external_token is null
+               and applied_ref_generation is null
+               and applied_history_generation is null
+               and applied_config_generation is null
+               and applied_external_token is null",
+        )
+        .bind(migration_id)
+        .bind(&claim.worker_id)
+        .bind(fencing_token)
+        .bind(observed_at)
+        .bind(token.ref_generation)
+        .bind(token.history_generation)
+        .bind(token.config_generation)
+        .bind(token.external)
+        .execute(&self.pool)
+        .await?;
+        self.migration_mutation_result(migration_id, rows.rows_affected())
+            .await
+    }
+
+    /// Plan a bounded read-only incremental catch-up batch for a PostgreSQL source.
+    ///
+    /// Object and pack operations contain identifiers only. Ref and config operations come from
+    /// generation-keyed journals and include expected-old values for divergence detection. An
+    /// empty result performs no durable write.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Backend`] for invalid bounds, stale claims, external sources, or corrupt
+    /// journal rows, and propagates SQLx failures.
+    pub async fn plan_migration_catch_up(
+        &self,
+        claim: &PgMigrationClaim,
+        options: PgMigrationCatchUpOptions,
+    ) -> Result<PgMigrationCatchUpBatch> {
+        validate_migration_claim(claim, options.observed_at)?;
+        if options.max_operations == 0 || options.max_operations > MAX_MIGRATION_CATCH_UP_BATCH {
+            return Err(Error::Backend(format!(
+                "catch-up batch size must be between 1 and {MAX_MIGRATION_CATCH_UP_BATCH}"
+            )));
+        }
+        let migration_id = positive_u64_to_i64(claim.session.migration_id, "migration id")?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("set transaction isolation level repeatable read, read only")
+            .execute(&mut *tx)
+            .await?;
+        let row = sqlx::query(
+            "select * from grit_migration_sessions
+             where migration_id = $1 and claimed_by = $2 and fencing_token = $3
+               and state = 1 and phase = 5 and lease_expires_at > $4 and updated_at <= $4",
+        )
+        .bind(migration_id)
+        .bind(&claim.worker_id)
+        .bind(positive_u64_to_i64(
+            claim.fencing_token,
+            "migration fencing token",
+        )?)
+        .bind(options.observed_at)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| Error::Backend("migration catch-up claim was lost".to_owned()))?;
+        let session = row_to_migration_session(&row)?;
+        let PgMigrationSource::Repository(source_repository) = session.source else {
+            return Err(Error::Backend(
+                "external catch-up requires an external source adapter".to_owned(),
+            ));
+        };
+        let from = session.last_applied.clone().ok_or_else(|| {
+            Error::Backend("migration catch-up has no applied source token".to_owned())
+        })?;
+        let (from_refs, from_history, from_config) = postgres_token_generations(&from)?;
+        let source_row = sqlx::query(
+            "select ref_generation, history_generation, config_generation
+             from grit_repositories where repository_pk = $1 and deleted_at is null",
+        )
+        .bind(source_repository.get())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| Error::Backend("migration source repository no longer exists".to_owned()))?;
+        let observed_refs = nonnegative_i64_to_u64(
+            source_row.try_get("ref_generation")?,
+            "source ref generation",
+        )?;
+        let observed_history = nonnegative_i64_to_u64(
+            source_row.try_get("history_generation")?,
+            "source history generation",
+        )?;
+        let observed_config = nonnegative_i64_to_u64(
+            source_row.try_get("config_generation")?,
+            "source config generation",
+        )?;
+        if observed_refs < from_refs
+            || observed_history < from_history
+            || observed_config < from_config
+        {
+            return Err(Error::Backend(
+                "migration source generations regressed".to_owned(),
+            ));
+        }
+        let source_observed = PgMigrationSourceToken::Postgres {
+            ref_generation: observed_refs,
+            history_generation: observed_history,
+            config_generation: observed_config,
+        };
+        let mut operations = Vec::new();
+        let mut more = false;
+        let mut through = (from_refs, from_history, from_config);
+        let from_ref_cursor = session.last_applied_ref_cursor.clone();
+        let from_config_cursor = session.last_applied_config_cursor.clone();
+        let mut through_ref_cursor = from_ref_cursor.clone();
+        let mut through_config_cursor = from_config_cursor.clone();
+
+        let mut remaining = options.max_operations;
+        let object_rows = sqlx::query(
+            "select source.oid_bytes from grit_objects source
+             left join grit_objects destination
+               on destination.repository_pk = $2 and destination.oid_bytes = source.oid_bytes
+             where source.repository_pk = $1 and destination.repository_pk is null
+             order by source.oid_bytes limit $3",
+        )
+        .bind(source_repository.get())
+        .bind(session.destination_repository.get())
+        .bind(
+            i64::try_from(remaining.saturating_add(1))
+                .map_err(|_| Error::Backend("catch-up bound exceeds i64".to_owned()))?,
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        more |= object_rows.len() > remaining;
+        for row in object_rows.iter().take(remaining) {
+            operations.push(PgMigrationCatchUpOperation::Object {
+                oid: ObjectId::from_bytes(&row.try_get::<Vec<u8>, _>("oid_bytes")?)?,
+            });
+        }
+        remaining = options.max_operations - operations.len();
+        if remaining > 0 {
+            let pack_rows = sqlx::query(
+                "select source.pack_checksum_bytes from grit_packs source
+                 left join grit_packs destination on destination.repository_pk = $2
+                   and destination.pack_checksum_bytes = source.pack_checksum_bytes
+                 where source.repository_pk = $1 and destination.repository_pk is null
+                 order by source.pack_checksum_bytes limit $3",
+            )
+            .bind(source_repository.get())
+            .bind(session.destination_repository.get())
+            .bind(
+                i64::try_from(remaining.saturating_add(1))
+                    .map_err(|_| Error::Backend("catch-up bound exceeds i64".to_owned()))?,
+            )
+            .fetch_all(&mut *tx)
+            .await?;
+            more |= pack_rows.len() > remaining;
+            for row in pack_rows.iter().take(remaining) {
+                operations.push(PgMigrationCatchUpOperation::Pack {
+                    checksum: ObjectId::from_bytes(
+                        &row.try_get::<Vec<u8>, _>("pack_checksum_bytes")?,
+                    )?,
+                });
+            }
+            remaining = options.max_operations - operations.len();
+        }
+
+        if remaining > 0 {
+            let ref_limit = remaining;
+            let ref_rows = sqlx::query(
+                "select generation, refname, old_target_oid, old_symbolic_target,
+                        new_target_oid, new_symbolic_target
+                 from grit_ref_change_journal
+                 where repository_pk = $1 and generation <= $3
+                   and (generation > $2 or (generation = $2 and $4::text is not null
+                       and refname collate \"C\" > $4 collate \"C\"))
+                 order by generation, refname collate \"C\" limit $5",
+            )
+            .bind(source_repository.get())
+            .bind(
+                i64::try_from(from_refs)
+                    .map_err(|_| Error::Backend("source ref token exceeds i64".to_owned()))?,
+            )
+            .bind(
+                i64::try_from(observed_refs)
+                    .map_err(|_| Error::Backend("source ref generation exceeds i64".to_owned()))?,
+            )
+            .bind(from_ref_cursor.as_ref().map(|cursor| cursor.key.as_str()))
+            .bind(
+                i64::try_from(remaining.saturating_add(1))
+                    .map_err(|_| Error::Backend("catch-up bound exceeds i64".to_owned()))?,
+            )
+            .fetch_all(&mut *tx)
+            .await?;
+            more |= ref_rows.len() > ref_limit;
+            for row in ref_rows.iter().take(ref_limit) {
+                let generation =
+                    nonnegative_i64_to_u64(row.try_get("generation")?, "journal ref generation")?;
+                through.0 = generation;
+                operations.push(PgMigrationCatchUpOperation::Ref {
+                    generation,
+                    name: row.try_get("refname")?,
+                    expected: journal_ref_value(row, "old_target_oid", "old_symbolic_target")?,
+                    value: journal_ref_value(row, "new_target_oid", "new_symbolic_target")?,
+                });
+            }
+            remaining = options.max_operations - operations.len();
+            if ref_rows.len() <= ref_limit {
+                through.0 = observed_refs;
+                through_ref_cursor = None;
+            } else if let Some(PgMigrationCatchUpOperation::Ref {
+                generation, name, ..
+            }) = operations.last()
+            {
+                through_ref_cursor = Some(PgMigrationJournalCursor {
+                    generation: *generation,
+                    key: name.clone(),
+                });
+            }
+        }
+
+        if remaining > 0 {
+            let config_limit = remaining;
+            let config_rows = sqlx::query(
+                "select generation, key, old_value, new_value from grit_config_change_journal
+                 where repository_pk = $1 and generation <= $3
+                   and (generation > $2 or (generation = $2 and $4::text is not null
+                       and key collate \"C\" > $4 collate \"C\"))
+                 order by generation, key collate \"C\" limit $5",
+            )
+            .bind(source_repository.get())
+            .bind(
+                i64::try_from(from_config)
+                    .map_err(|_| Error::Backend("source config token exceeds i64".to_owned()))?,
+            )
+            .bind(
+                i64::try_from(observed_config).map_err(|_| {
+                    Error::Backend("source config generation exceeds i64".to_owned())
+                })?,
+            )
+            .bind(
+                from_config_cursor
+                    .as_ref()
+                    .map(|cursor| cursor.key.as_str()),
+            )
+            .bind(
+                i64::try_from(remaining.saturating_add(1))
+                    .map_err(|_| Error::Backend("catch-up bound exceeds i64".to_owned()))?,
+            )
+            .fetch_all(&mut *tx)
+            .await?;
+            more |= config_rows.len() > config_limit;
+            for row in config_rows.iter().take(config_limit) {
+                let generation = nonnegative_i64_to_u64(
+                    row.try_get("generation")?,
+                    "journal config generation",
+                )?;
+                through.2 = generation;
+                operations.push(PgMigrationCatchUpOperation::Config {
+                    generation,
+                    key: row.try_get("key")?,
+                    expected: row.try_get("old_value")?,
+                    value: row.try_get("new_value")?,
+                });
+            }
+            if config_rows.len() <= config_limit {
+                through.2 = observed_config;
+                through_config_cursor = None;
+            } else if let Some(PgMigrationCatchUpOperation::Config {
+                generation, key, ..
+            }) = operations.last()
+            {
+                through_config_cursor = Some(PgMigrationJournalCursor {
+                    generation: *generation,
+                    key: key.clone(),
+                });
+            }
+        }
+        let apply_through = PgMigrationSourceToken::Postgres {
+            ref_generation: through.0,
+            history_generation: through.1,
+            config_generation: through.2,
+        };
+        more |= operations.len() == options.max_operations;
+        let batch = PgMigrationCatchUpBatch {
+            migration_id: session.migration_id,
+            fencing_token: session.fencing_token,
+            from,
+            from_ref_cursor,
+            from_config_cursor,
+            apply_through,
+            apply_through_ref_cursor: through_ref_cursor,
+            apply_through_config_cursor: through_config_cursor,
+            source_observed,
+            operations,
+            remaining_lag: PgMigrationCatchUpLag {
+                ref_generations: observed_refs.saturating_sub(through.0),
+                history_generations: observed_history.saturating_sub(through.1),
+                config_generations: observed_config.saturating_sub(through.2),
+                more_operations: more,
+            },
+        };
+        tx.commit().await?;
+        Ok(batch)
+    }
+
+    /// Atomically apply metadata deltas and checkpoint a previously planned catch-up batch.
+    ///
+    /// Object and pack payloads must already exist at the destination. Ref and config changes use
+    /// expected-old compare-and-swap checks. Session ownership, fencing token, phase, lease, and
+    /// prior source token are locked and validated in the same transaction as the checkpoint.
+    /// Empty batches return [`PgMigrationCatchUpApplyResult::NoChanges`] without writing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Backend`] for malformed batches or timestamps, and propagates SQLx
+    /// failures. Destination divergence and missing payloads are typed outcomes.
+    pub async fn apply_migration_catch_up(
+        &self,
+        claim: &PgMigrationClaim,
+        batch: &PgMigrationCatchUpBatch,
+        observed_at: OffsetDateTime,
+    ) -> Result<PgMigrationCatchUpApplyResult> {
+        validate_migration_claim(claim, observed_at)?;
+        if batch.migration_id != claim.session.migration_id
+            || batch.fencing_token != claim.fencing_token
+        {
+            return Err(Error::Backend(
+                "catch-up batch does not belong to the migration claim".to_owned(),
+            ));
+        }
+        if batch.operations.is_empty() {
+            return Ok(PgMigrationCatchUpApplyResult::NoChanges);
+        }
+        let migration_id = positive_u64_to_i64(batch.migration_id, "migration id")?;
+        let fencing_token = positive_u64_to_i64(batch.fencing_token, "migration fencing token")?;
+        let destination_repository_pk: Option<i64> = sqlx::query_scalar(
+            "select destination_repository_pk from grit_migration_sessions
+             where migration_id = $1",
+        )
+        .bind(migration_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(destination_repository_pk) = destination_repository_pk else {
+            return Ok(PgMigrationCatchUpApplyResult::ClaimLost);
+        };
+        let destination = sqlx::query(
+            "select tenant_id, repository_id from grit_repositories
+             where repository_pk = $1 and deleted_at is null",
+        )
+        .bind(destination_repository_pk)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(destination) = destination else {
+            return Ok(PgMigrationCatchUpApplyResult::ClaimLost);
+        };
+        let tenant = TenantId::new(destination.try_get::<String, _>("tenant_id")?)?;
+        let repository = RepositoryId::new(destination.try_get::<String, _>("repository_id")?)?;
+        let mut tx = self.pool.begin().await?;
+        match lock_import_repository(&mut tx, &tenant, &repository).await {
+            Ok(()) => {}
+            Err(Error::RepositoryNotFound(_)) => {
+                tx.rollback().await?;
+                return Ok(PgMigrationCatchUpApplyResult::ClaimLost);
+            }
+            Err(error) => return Err(error),
+        }
+        let locked_repository_pk: Option<i64> = sqlx::query_scalar(
+            "select repository_pk from grit_repositories
+             where tenant_id = $1 and repository_id = $2 and deleted_at is null",
+        )
+        .bind(tenant.as_str())
+        .bind(repository.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if locked_repository_pk != Some(destination_repository_pk) {
+            tx.rollback().await?;
+            return Ok(PgMigrationCatchUpApplyResult::ClaimLost);
+        }
+        let session_row = sqlx::query(
+            "select * from grit_migration_sessions
+             where migration_id = $1 and claimed_by = $2 and fencing_token = $3
+               and state = 1 and phase = 5 and lease_expires_at > $4 and updated_at <= $4
+             for update",
+        )
+        .bind(migration_id)
+        .bind(&claim.worker_id)
+        .bind(fencing_token)
+        .bind(observed_at)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(session_row) = session_row else {
+            tx.rollback().await?;
+            return Ok(PgMigrationCatchUpApplyResult::ClaimLost);
+        };
+        let session = row_to_migration_session(&session_row)?;
+        if session.last_applied.as_ref() != Some(&batch.from)
+            || session.last_applied_ref_cursor != batch.from_ref_cursor
+            || session.last_applied_config_cursor != batch.from_config_cursor
+        {
+            tx.rollback().await?;
+            return Ok(PgMigrationCatchUpApplyResult::ClaimLost);
+        }
+        validate_migration_catch_up_batch(batch, &session)?;
+        if session.destination_repository.get() != destination_repository_pk {
+            tx.rollback().await?;
+            return Ok(PgMigrationCatchUpApplyResult::ClaimLost);
+        }
+        let mut refs_changed = false;
+        let mut config_changed = false;
+        for operation in &batch.operations {
+            match operation {
+                PgMigrationCatchUpOperation::Object { oid } => {
+                    let exists = sqlx::query_scalar::<_, bool>(
+                        "select exists(select 1 from grit_objects
+                         where repository_pk = $1 and oid_bytes = $2)",
+                    )
+                    .bind(session.destination_repository.get())
+                    .bind(oid.as_bytes())
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if !exists {
+                        tx.rollback().await?;
+                        return Ok(PgMigrationCatchUpApplyResult::MissingPrerequisite {
+                            oid: *oid,
+                        });
+                    }
+                }
+                PgMigrationCatchUpOperation::Pack { checksum } => {
+                    let exists = sqlx::query_scalar::<_, bool>(
+                        "select exists(select 1 from grit_packs
+                         where repository_pk = $1 and pack_checksum_bytes = $2)",
+                    )
+                    .bind(session.destination_repository.get())
+                    .bind(checksum.as_bytes())
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if !exists {
+                        tx.rollback().await?;
+                        return Ok(PgMigrationCatchUpApplyResult::MissingPrerequisite {
+                            oid: *checksum,
+                        });
+                    }
+                }
+                PgMigrationCatchUpOperation::Ref {
+                    name,
+                    expected,
+                    value,
+                    ..
+                } => {
+                    let current = read_ref_for_update(&mut tx, &tenant, &repository, name).await?;
+                    if current != *expected {
+                        tx.rollback().await?;
+                        return Ok(PgMigrationCatchUpApplyResult::Diverged { key: name.clone() });
+                    }
+                    write_catch_up_ref(
+                        &mut tx,
+                        &tenant,
+                        &repository,
+                        name,
+                        value.as_ref(),
+                        observed_at,
+                    )
+                    .await?;
+                    refs_changed |= current != *value;
+                }
+                PgMigrationCatchUpOperation::Config {
+                    key,
+                    expected,
+                    value,
+                    ..
+                } => {
+                    let current = sqlx::query_scalar::<_, String>(
+                        "select value from grit_config
+                         where tenant_id = $1 and repository_id = $2 and key = $3 for update",
+                    )
+                    .bind(tenant.as_str())
+                    .bind(repository.as_str())
+                    .bind(key)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    if current != *expected {
+                        tx.rollback().await?;
+                        return Ok(PgMigrationCatchUpApplyResult::Diverged { key: key.clone() });
+                    }
+                    write_catch_up_config(&mut tx, &tenant, &repository, key, value.as_deref())
+                        .await?;
+                    config_changed |= current != *value;
+                }
+            }
+        }
+        if refs_changed {
+            bump_repository_generation_at(
+                &mut tx,
+                &tenant,
+                &repository,
+                PgRepositoryGeneration::Refs,
+                observed_at,
+            )
+            .await?;
+        }
+        if config_changed {
+            bump_repository_generation_at(
+                &mut tx,
+                &tenant,
+                &repository,
+                PgRepositoryGeneration::Config,
+                observed_at,
+            )
+            .await?;
+        }
+        let token = migration_token_columns(&batch.apply_through)?;
+        let rows = sqlx::query(
+            "update grit_migration_sessions
+             set applied_ref_generation = $5, applied_history_generation = $6,
+                 applied_config_generation = $7, applied_external_token = $8,
+                 applied_ref_name = $9, applied_config_key = $10, updated_at = $4
+             where migration_id = $1 and claimed_by = $2 and fencing_token = $3
+               and state = 1 and phase = 5 and lease_expires_at > $4 and updated_at <= $4",
+        )
+        .bind(migration_id)
+        .bind(&claim.worker_id)
+        .bind(fencing_token)
+        .bind(observed_at)
+        .bind(token.ref_generation)
+        .bind(token.history_generation)
+        .bind(token.config_generation)
+        .bind(token.external)
+        .bind(
+            batch
+                .apply_through_ref_cursor
+                .as_ref()
+                .map(|cursor| cursor.key.as_str()),
+        )
+        .bind(
+            batch
+                .apply_through_config_cursor
+                .as_ref()
+                .map(|cursor| cursor.key.as_str()),
+        )
+        .execute(&mut *tx)
+        .await?;
+        if rows.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(PgMigrationCatchUpApplyResult::ClaimLost);
+        }
+        tx.commit().await?;
+        Ok(PgMigrationCatchUpApplyResult::Applied)
     }
 
     /// Claim a bounded oldest-first batch of durable cache invalidation events.
@@ -3522,6 +4444,357 @@ enum PgMigrationFinish<'a> {
     Cancel(&'a str),
 }
 
+struct PgMigrationTokenColumns {
+    ref_generation: Option<i64>,
+    history_generation: Option<i64>,
+    config_generation: Option<i64>,
+    external: Option<String>,
+}
+
+fn migration_token_columns(token: &PgMigrationSourceToken) -> Result<PgMigrationTokenColumns> {
+    match token {
+        PgMigrationSourceToken::Postgres {
+            ref_generation,
+            history_generation,
+            config_generation,
+        } => {
+            Ok(PgMigrationTokenColumns {
+                ref_generation: Some(i64::try_from(*ref_generation).map_err(|_| {
+                    Error::Backend("migration ref generation exceeds i64".to_owned())
+                })?),
+                history_generation: Some(i64::try_from(*history_generation).map_err(|_| {
+                    Error::Backend("migration history generation exceeds i64".to_owned())
+                })?),
+                config_generation: Some(i64::try_from(*config_generation).map_err(|_| {
+                    Error::Backend("migration config generation exceeds i64".to_owned())
+                })?),
+                external: None,
+            })
+        }
+        PgMigrationSourceToken::External(token) => {
+            if token.trim().is_empty() || token.len() > 1_024 {
+                return Err(Error::Backend(
+                    "external migration token must contain 1 to 1024 bytes".to_owned(),
+                ));
+            }
+            Ok(PgMigrationTokenColumns {
+                ref_generation: None,
+                history_generation: None,
+                config_generation: None,
+                external: Some(token.clone()),
+            })
+        }
+    }
+}
+
+fn validate_migration_source_token(
+    source: &PgMigrationSource,
+    token: &PgMigrationSourceToken,
+) -> Result<()> {
+    match (source, token) {
+        (PgMigrationSource::Repository(_), PgMigrationSourceToken::Postgres { .. }) => {
+            let _ = migration_token_columns(token)?;
+            Ok(())
+        }
+        (PgMigrationSource::External(_), PgMigrationSourceToken::External(_)) => {
+            let _ = migration_token_columns(token)?;
+            Ok(())
+        }
+        _ => Err(Error::Backend(
+            "migration source token has the wrong source kind".to_owned(),
+        )),
+    }
+}
+
+fn postgres_token_generations(token: &PgMigrationSourceToken) -> Result<(u64, u64, u64)> {
+    match token {
+        PgMigrationSourceToken::Postgres {
+            ref_generation,
+            history_generation,
+            config_generation,
+        } => Ok((*ref_generation, *history_generation, *config_generation)),
+        PgMigrationSourceToken::External(_) => Err(Error::Backend(
+            "PostgreSQL catch-up received an external source token".to_owned(),
+        )),
+    }
+}
+
+fn migration_journal_cursor(generation: u64, key: String) -> Result<PgMigrationJournalCursor> {
+    if key.trim().is_empty() || key.len() > 1_024 {
+        return Err(Error::Backend(
+            "migration journal cursor key must contain 1 to 1024 bytes".to_owned(),
+        ));
+    }
+    Ok(PgMigrationJournalCursor { generation, key })
+}
+
+fn validate_migration_catch_up_batch(
+    batch: &PgMigrationCatchUpBatch,
+    session: &PgMigrationSession,
+) -> Result<()> {
+    if batch.operations.len() > MAX_MIGRATION_CATCH_UP_BATCH {
+        return Err(Error::Backend(
+            "migration catch-up batch exceeds the operation limit".to_owned(),
+        ));
+    }
+    validate_migration_source_token(&session.source, &batch.from)?;
+    validate_migration_source_token(&session.source, &batch.apply_through)?;
+    validate_migration_source_token(&session.source, &batch.source_observed)?;
+    let from = postgres_token_generations(&batch.from)?;
+    let through = postgres_token_generations(&batch.apply_through)?;
+    let observed = postgres_token_generations(&batch.source_observed)?;
+    let valid_cursor = |cursor: &Option<PgMigrationJournalCursor>, generation| {
+        cursor.as_ref().is_none_or(|cursor| {
+            cursor.generation == generation
+                && !cursor.key.trim().is_empty()
+                && cursor.key.len() <= 1_024
+        })
+    };
+    if from.0 > through.0
+        || from.1 > through.1
+        || from.2 > through.2
+        || through.0 > observed.0
+        || through.1 > observed.1
+        || through.2 > observed.2
+        || !valid_cursor(&batch.from_ref_cursor, from.0)
+        || !valid_cursor(&batch.from_config_cursor, from.2)
+        || !valid_cursor(&batch.apply_through_ref_cursor, through.0)
+        || !valid_cursor(&batch.apply_through_config_cursor, through.2)
+    {
+        return Err(Error::Backend(
+            "migration catch-up token order is invalid".to_owned(),
+        ));
+    }
+    let valid_ref = |value: &Option<StoredRef>| match value {
+        Some(StoredRef::Direct(oid)) => oid.algo() == session.hash_algo,
+        Some(StoredRef::Symbolic(target)) => !target.trim().is_empty(),
+        None => true,
+    };
+    for operation in &batch.operations {
+        match operation {
+            PgMigrationCatchUpOperation::Object { oid }
+            | PgMigrationCatchUpOperation::Pack { checksum: oid } => {
+                if oid.algo() != session.hash_algo {
+                    return Err(Error::Backend(
+                        "migration catch-up identifier has the wrong hash algorithm".to_owned(),
+                    ));
+                }
+            }
+            PgMigrationCatchUpOperation::Ref {
+                generation,
+                name,
+                expected,
+                value,
+            } => {
+                if *generation < from.0
+                    || *generation > through.0
+                    || (*generation == from.0
+                        && batch
+                            .from_ref_cursor
+                            .as_ref()
+                            .is_none_or(|cursor| name.as_bytes() <= cursor.key.as_bytes()))
+                    || (*generation == through.0
+                        && batch
+                            .apply_through_ref_cursor
+                            .as_ref()
+                            .is_some_and(|cursor| name.as_bytes() > cursor.key.as_bytes()))
+                    || name.trim().is_empty()
+                    || !valid_ref(expected)
+                    || !valid_ref(value)
+                {
+                    return Err(Error::Backend(
+                        "migration catch-up ref operation is invalid".to_owned(),
+                    ));
+                }
+            }
+            PgMigrationCatchUpOperation::Config {
+                generation, key, ..
+            } => {
+                if *generation < from.2
+                    || *generation > through.2
+                    || (*generation == from.2
+                        && batch
+                            .from_config_cursor
+                            .as_ref()
+                            .is_none_or(|cursor| key.as_bytes() <= cursor.key.as_bytes()))
+                    || (*generation == through.2
+                        && batch
+                            .apply_through_config_cursor
+                            .as_ref()
+                            .is_some_and(|cursor| key.as_bytes() > cursor.key.as_bytes()))
+                    || key.trim().is_empty()
+                {
+                    return Err(Error::Backend(
+                        "migration catch-up config operation is invalid".to_owned(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn journal_ref_value(
+    row: &sqlx::postgres::PgRow,
+    oid_column: &str,
+    symbolic_column: &str,
+) -> Result<Option<StoredRef>> {
+    match (
+        row.try_get::<Option<String>, _>(oid_column)?,
+        row.try_get::<Option<String>, _>(symbolic_column)?,
+    ) {
+        (Some(oid), None) => Ok(Some(StoredRef::Direct(ObjectId::from_hex(&oid)?))),
+        (None, Some(target)) => Ok(Some(StoredRef::Symbolic(target))),
+        (None, None) => Ok(None),
+        _ => Err(Error::Backend(
+            "migration ref journal value has conflicting targets".to_owned(),
+        )),
+    }
+}
+
+async fn read_ref_for_update(
+    tx: &mut Transaction<'static, Postgres>,
+    tenant: &TenantId,
+    repository: &RepositoryId,
+    refname: &str,
+) -> Result<Option<StoredRef>> {
+    let row = sqlx::query(
+        "select target_oid, symbolic_target from grit_refs
+         where tenant_id = $1 and repository_id = $2 and refname = $3 for update",
+    )
+    .bind(tenant.as_str())
+    .bind(repository.as_str())
+    .bind(refname)
+    .fetch_optional(&mut **tx)
+    .await?;
+    row.as_ref().map(|row| row_to_ref(row, refname)).transpose()
+}
+
+async fn write_catch_up_ref(
+    tx: &mut Transaction<'static, Postgres>,
+    tenant: &TenantId,
+    repository: &RepositoryId,
+    refname: &str,
+    value: Option<&StoredRef>,
+    observed_at: OffsetDateTime,
+) -> Result<()> {
+    match value {
+        Some(value) => {
+            let (target_oid, symbolic_target) = ref_columns(value);
+            sqlx::query(
+                "insert into grit_refs
+                    (tenant_id, repository_id, refname, target_oid, symbolic_target, updated_at)
+                 values ($1, $2, $3, $4, $5, $6)
+                 on conflict (tenant_id, repository_id, refname) do update
+                 set target_oid = excluded.target_oid,
+                     symbolic_target = excluded.symbolic_target,
+                     updated_at = excluded.updated_at",
+            )
+            .bind(tenant.as_str())
+            .bind(repository.as_str())
+            .bind(refname)
+            .bind(target_oid)
+            .bind(symbolic_target)
+            .bind(observed_at)
+            .execute(&mut **tx)
+            .await?;
+        }
+        None => {
+            sqlx::query(
+                "delete from grit_refs
+                 where tenant_id = $1 and repository_id = $2 and refname = $3",
+            )
+            .bind(tenant.as_str())
+            .bind(repository.as_str())
+            .bind(refname)
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn write_catch_up_config(
+    tx: &mut Transaction<'static, Postgres>,
+    tenant: &TenantId,
+    repository: &RepositoryId,
+    key: &str,
+    value: Option<&str>,
+) -> Result<()> {
+    match value {
+        Some(value) => {
+            sqlx::query(
+                "insert into grit_config (tenant_id, repository_id, key, value)
+                 values ($1, $2, $3, $4)
+                 on conflict (tenant_id, repository_id, key) do update
+                 set value = excluded.value",
+            )
+            .bind(tenant.as_str())
+            .bind(repository.as_str())
+            .bind(key)
+            .bind(value)
+            .execute(&mut **tx)
+            .await?;
+        }
+        None => {
+            sqlx::query(
+                "delete from grit_config
+                 where tenant_id = $1 and repository_id = $2 and key = $3",
+            )
+            .bind(tenant.as_str())
+            .bind(repository.as_str())
+            .bind(key)
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+enum PgRepositoryGeneration {
+    Refs,
+    Config,
+}
+
+async fn bump_repository_generation_at(
+    tx: &mut Transaction<'static, Postgres>,
+    tenant: &TenantId,
+    repository: &RepositoryId,
+    kind: PgRepositoryGeneration,
+    observed_at: OffsetDateTime,
+) -> Result<()> {
+    let row = match kind {
+        PgRepositoryGeneration::Refs => sqlx::query(
+            "update grit_repositories set ref_generation = ref_generation + 1, updated_at = $3
+             where tenant_id = $1 and repository_id = $2 and deleted_at is null
+             returning repository_pk, ref_generation as generation",
+        ),
+        PgRepositoryGeneration::Config => sqlx::query(
+            "update grit_repositories set config_generation = config_generation + 1, updated_at = $3
+             where tenant_id = $1 and repository_id = $2 and deleted_at is null
+             returning repository_pk, config_generation as generation",
+        ),
+    }
+    .bind(tenant.as_str())
+    .bind(repository.as_str())
+    .bind(observed_at)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| Error::RepositoryNotFound(repository_key(tenant, repository)))?;
+    let repository_pk = RepositoryPk::try_from(row.try_get::<i64, _>("repository_pk")?)
+        .map_err(|error| Error::Backend(error.to_string()))?;
+    let generation = nonnegative_i64_to_u64(row.try_get("generation")?, "repository generation")?;
+    let event = match kind {
+        PgRepositoryGeneration::Refs => {
+            PgCacheInvalidationKind::RefGenerationAdvanced { generation }
+        }
+        PgRepositoryGeneration::Config => {
+            PgCacheInvalidationKind::ConfigGenerationAdvanced { generation }
+        }
+    };
+    enqueue_cache_invalidation_in_transaction(tx, repository_pk, tenant, repository, &event).await
+}
+
 fn validate_migration_create_options(options: &PgMigrationCreateOptions) -> Result<()> {
     if options.idempotency_key.trim().is_empty() || options.idempotency_key.len() > 256 {
         return Err(Error::Backend(
@@ -3569,7 +4842,6 @@ fn validate_migration_claim(claim: &PgMigrationClaim, observed_at: OffsetDateTim
         ));
     }
     if claim.session.state != PgMigrationState::Active
-        || claim.session.phase == PgMigrationPhase::InitialCopyComplete
         || claim.session.fencing_token != claim.fencing_token
         || claim.session.claimed_by.as_deref() != Some(claim.worker_id.as_str())
         || claim.session.lease_expires_at != Some(claim.lease_expires_at)
@@ -3675,6 +4947,62 @@ fn migration_claim_from_session(session: PgMigrationSession) -> Result<PgMigrati
     })
 }
 
+fn migration_tokens_from_row(
+    row: &sqlx::postgres::PgRow,
+    source: &PgMigrationSource,
+) -> Result<(
+    Option<PgMigrationSourceToken>,
+    Option<PgMigrationSourceToken>,
+)> {
+    let snapshot_generations = (
+        row.try_get::<Option<i64>, _>("source_snapshot_ref_generation")?,
+        row.try_get::<Option<i64>, _>("source_snapshot_history_generation")?,
+        row.try_get::<Option<i64>, _>("source_snapshot_config_generation")?,
+    );
+    let applied_generations = (
+        row.try_get::<Option<i64>, _>("applied_ref_generation")?,
+        row.try_get::<Option<i64>, _>("applied_history_generation")?,
+        row.try_get::<Option<i64>, _>("applied_config_generation")?,
+    );
+    let snapshot_external: Option<String> = row.try_get("source_snapshot_external_token")?;
+    let applied_external: Option<String> = row.try_get("applied_external_token")?;
+    let postgres_token = |values: (Option<i64>, Option<i64>, Option<i64>)| match values {
+        (None, None, None) => Ok(None),
+        (Some(refs), Some(history), Some(config)) => Ok(Some(PgMigrationSourceToken::Postgres {
+            ref_generation: nonnegative_i64_to_u64(refs, "migration token ref generation")?,
+            history_generation: nonnegative_i64_to_u64(
+                history,
+                "migration token history generation",
+            )?,
+            config_generation: nonnegative_i64_to_u64(config, "migration token config generation")?,
+        })),
+        _ => Err(Error::Backend(
+            "stored migration PostgreSQL token is incomplete".to_owned(),
+        )),
+    };
+    match source {
+        PgMigrationSource::Repository(_)
+            if snapshot_external.is_none() && applied_external.is_none() =>
+        {
+            Ok((
+                postgres_token(snapshot_generations)?,
+                postgres_token(applied_generations)?,
+            ))
+        }
+        PgMigrationSource::External(_)
+            if snapshot_generations == (None, None, None)
+                && applied_generations == (None, None, None) =>
+        {
+            let snapshot = snapshot_external.map(PgMigrationSourceToken::External);
+            let applied = applied_external.map(PgMigrationSourceToken::External);
+            Ok((snapshot, applied))
+        }
+        _ => Err(Error::Backend(
+            "stored migration token does not match its source identity".to_owned(),
+        )),
+    }
+}
+
 fn row_to_migration_session(row: &sqlx::postgres::PgRow) -> Result<PgMigrationSession> {
     let migration_id = nonnegative_i64_to_u64(row.try_get("migration_id")?, "migration id")?;
     if migration_id == 0 {
@@ -3695,6 +5023,29 @@ fn row_to_migration_session(row: &sqlx::postgres::PgRow) -> Result<PgMigrationSe
             return Err(Error::Backend(
                 "invalid migration source identity".to_owned(),
             ))
+        }
+    };
+    let (source_snapshot, last_applied) = migration_tokens_from_row(row, &source)?;
+    let applied_ref_name: Option<String> = row.try_get("applied_ref_name")?;
+    let applied_config_key: Option<String> = row.try_get("applied_config_key")?;
+    let (last_applied_ref_cursor, last_applied_config_cursor) = match &last_applied {
+        Some(PgMigrationSourceToken::Postgres {
+            ref_generation,
+            config_generation,
+            ..
+        }) => (
+            applied_ref_name
+                .map(|key| migration_journal_cursor(*ref_generation, key))
+                .transpose()?,
+            applied_config_key
+                .map(|key| migration_journal_cursor(*config_generation, key))
+                .transpose()?,
+        ),
+        _ if applied_ref_name.is_none() && applied_config_key.is_none() => (None, None),
+        _ => {
+            return Err(Error::Backend(
+                "stored migration journal cursor has no PostgreSQL token".to_owned(),
+            ));
         }
     };
     let hash_algo_name: String = row.try_get("hash_algo")?;
@@ -3820,13 +5171,16 @@ fn row_to_migration_session(row: &sqlx::postgres::PgRow) -> Result<PgMigrationSe
                 "completed migration bytes",
             )?,
         },
+        source_snapshot,
+        last_applied,
+        last_applied_ref_cursor,
+        last_applied_config_cursor,
         terminal_reason,
         created_at,
         updated_at,
     };
     if session.claimed_by.is_some()
         && (session.state != PgMigrationState::Active
-            || session.phase == PgMigrationPhase::InitialCopyComplete
             || session.fencing_token == 0
             || session.attempt_count == 0
             || session

@@ -88,15 +88,18 @@ pub mod prelude {
     pub use crate::sqlx_postgres::{
         PgCacheInvalidationEvent, PgCacheInvalidationKind, PgCacheOutboxClaim,
         PgCacheOutboxClaimOptions, PgCacheOutboxClaimResult, PgCommitHistoryCursor,
-        PgCommitHistoryOptions, PgCommitHistoryPage, PgMigrationCheckpoint, PgMigrationClaim,
-        PgMigrationClaimOptions, PgMigrationClaimResult, PgMigrationCreateOptions,
-        PgMigrationObjectCursor, PgMigrationPackCursor, PgMigrationPhase, PgMigrationRefCursor,
-        PgMigrationSession, PgMigrationSource, PgMigrationState, PgMigrationTreeCursor,
+        PgCommitHistoryOptions, PgCommitHistoryPage, PgMigrationCatchUpApplyResult,
+        PgMigrationCatchUpBatch, PgMigrationCatchUpLag, PgMigrationCatchUpOperation,
+        PgMigrationCatchUpOptions, PgMigrationCatchUpPolicy, PgMigrationCheckpoint,
+        PgMigrationClaim, PgMigrationClaimOptions, PgMigrationClaimResult,
+        PgMigrationCreateOptions, PgMigrationJournalCursor, PgMigrationObjectCursor,
+        PgMigrationPackCursor, PgMigrationPhase, PgMigrationRefCursor, PgMigrationSession,
+        PgMigrationSource, PgMigrationSourceToken, PgMigrationState, PgMigrationTreeCursor,
         PgRepositoryRow, PgRepositorySummary, PgRepositorySummaryInstall,
         PgRepositorySummaryOptions, PgRepositorySummaryRead, PgServerStorage,
         PgServerStorageTransaction, PgSummaryBranch, PgSummaryCommit, RepositoryPk,
         MAX_CACHE_OUTBOX_CLAIM_BATCH, MAX_COMMIT_HISTORY_PAGE_SIZE,
-        MAX_COMMIT_HISTORY_PARENT_EDGES, MAX_MIGRATION_CLAIM_BATCH,
+        MAX_COMMIT_HISTORY_PARENT_EDGES, MAX_MIGRATION_CATCH_UP_BATCH, MAX_MIGRATION_CLAIM_BATCH,
     };
     pub use crate::storage::{
         BrowseIndex, CommitGraphStore, ConfigStore, ImportPublication, ImportPublicationResult,
