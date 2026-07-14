@@ -180,6 +180,14 @@ pub mod prelude {
         PushPackValidationWorkLimit, PushStructuralMetadata, PushStructuralObject,
         PushValidationSummary, ValidatedPushPack,
     };
+    pub use crate::protocol::push_parallel_validation::{
+        validate_index_parallel, ParallelValidationByteCost, ParallelValidationCost,
+        ParallelValidationDependency, ParallelValidationError, ParallelValidationExecutor,
+        ParallelValidationExecutorError, ParallelValidationLimits, ParallelValidationReport,
+        ParallelValidationRetainedBase, ParallelValidationTask, ParallelValidationTaskFailure,
+        ParallelValidationTaskOutput, ParallelValidationTaskResult, ParallelValidationWork,
+        ParallelValidationWorkLimit,
+    };
     pub use crate::protocol::push_prepared::{
         prepare_validated_push, AuthorizedExistingObjectLinks, AuthorizedExistingObjectMetadata,
         AuthorizedPushMetadataError, AuthorizedPushMetadataProvider, AuthorizedTreeLink,

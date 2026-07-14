@@ -18,6 +18,7 @@ pub mod push_atomic_publication;
 pub mod push_fix_thin;
 pub mod push_metrics;
 pub mod push_pack_validation;
+pub mod push_parallel_validation;
 pub mod push_prepared;
 pub mod push_quarantine;
 pub mod receive_pack;
