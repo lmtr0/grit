@@ -146,6 +146,16 @@ pub mod prelude {
         PushPackValidationWorkLimit, PushStructuralMetadata, PushStructuralObject,
         PushValidationSummary, ValidatedPushPack,
     };
+    pub use crate::protocol::push_prepared::{
+        prepare_validated_push, AuthorizedExistingObjectLinks, AuthorizedExistingObjectMetadata,
+        AuthorizedPushMetadataError, AuthorizedPushMetadataProvider, AuthorizedTreeLink,
+        PreparedAncestryContext, PreparedCapabilitySummary, PreparedCommandGroup,
+        PreparedGitlinkPolicy, PreparedPush, PreparedPushAuditSummary, PreparedPushCommand,
+        PreparedPushControl, PreparedPushError, PreparedPushObservation, PreparedPushOptionSummary,
+        PreparedPushOptions, PreparedPushRejectionReason, PreparedPushWork, PreparedPushWorkLimit,
+        PreparedQuarantineBinding, PreparedRefPrecondition, PreparedStructuralMetadata,
+        PreparedStructuralObject, PreparedTreeEntry, PushRepositorySnapshot, PushSnapshotRef,
+    };
     pub use crate::protocol::push_quarantine::{
         MemoryPackQuarantine, MemoryQuarantineLimits, PackQuarantine, QuarantineDiscard,
         QuarantineDiscardReport, QuarantineError, QuarantineFence, QuarantineId,

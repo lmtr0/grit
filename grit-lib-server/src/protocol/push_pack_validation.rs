@@ -141,15 +141,47 @@ pub struct PushValidationSummary {
 #[derive(Clone, Debug)]
 pub struct ValidatedPushPack {
     /// Ordered entry index.
-    pub index: Vec<PushPackIndexRow>,
+    pub(crate) index: Vec<PushPackIndexRow>,
     /// Parsed non-blob structural objects.
-    pub structural_objects: Vec<PushStructuralObject>,
+    pub(crate) structural_objects: Vec<PushStructuralObject>,
     /// Non-sensitive audit/policy counts.
-    pub summary: PushValidationSummary,
+    pub(crate) summary: PushValidationSummary,
     /// Index and dependency evidence stored in the quarantine manifest.
-    pub attestation: QuarantineIndexAttestation,
+    pub(crate) attestation: QuarantineIndexAttestation,
     /// Fence after the attestation upgrade.
-    pub fence: QuarantineFence,
+    pub(crate) fence: QuarantineFence,
+}
+
+impl ValidatedPushPack {
+    /// Borrow the ordered validated index.
+    #[must_use]
+    pub fn index(&self) -> &[PushPackIndexRow] {
+        &self.index
+    }
+
+    /// Borrow parsed non-blob structural metadata.
+    #[must_use]
+    pub fn structural_objects(&self) -> &[PushStructuralObject] {
+        &self.structural_objects
+    }
+
+    /// Return the non-sensitive validation summary.
+    #[must_use]
+    pub const fn summary(&self) -> PushValidationSummary {
+        self.summary
+    }
+
+    /// Return the immutable index attestation.
+    #[must_use]
+    pub const fn attestation(&self) -> QuarantineIndexAttestation {
+        self.attestation
+    }
+
+    /// Return the post-attestation quarantine fence.
+    #[must_use]
+    pub const fn fence(&self) -> QuarantineFence {
+        self.fence
+    }
 }
 
 /// Explicit validation work checkpoint.
