@@ -30,6 +30,8 @@ pub mod s3_byte_store;
 pub mod sqlx_postgres;
 pub mod storage;
 pub mod tree_block;
+#[cfg(feature = "sqlx-postgres")]
+pub mod tree_path;
 pub mod views;
 
 /// Commonly used server-layer types.
@@ -99,6 +101,12 @@ pub mod prelude {
     pub use crate::tree_block::{
         decode_tree_block, encode_tree_block, find_tree_block_entry, tree_block_prefix_range,
         TreeBlockEntry, TreeBlockError, TREE_BLOCK_FORMAT_VERSION,
+    };
+    #[cfg(feature = "sqlx-postgres")]
+    pub use crate::tree_path::{
+        resolve_tree_path, DecodedTreeBlockCache, InvalidTreeBlockCacheLimits,
+        InvalidTreePathComponent, ResolvedTreePath, TreeBlockCacheInsert, TreeBlockCacheLimits,
+        TreeBlockLoader, TreePathComponent, TreePathLimits, TreePathResolveError,
     };
     pub use crate::views::{
         BlobContentDelivery, BlobContentView, BlobDownloadOptions, BlobDownloadView,
