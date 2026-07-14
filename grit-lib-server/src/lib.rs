@@ -106,6 +106,12 @@ pub mod prelude {
         GeneratedDeltaPlan, MAX_DELTA_CANDIDATE_COMPARISONS, MAX_DELTA_DEPTH,
         MAX_DELTA_RETAINED_BASE_BYTES, MAX_DELTA_WINDOW, MAX_GENERATED_DELTA_INSTRUCTION_BYTES,
     };
+    pub use crate::protocol::negotiation::{
+        negotiate_bounded, NegotiationCommit, NegotiationCommitParent, NegotiationError,
+        NegotiationLimitKind, NegotiationLimits, NegotiationMetadataSource, NegotiationPlan,
+        NegotiationSpillFactory, NegotiationSpillRole, NegotiationSpillSet, NegotiationTree,
+        NegotiationTreeEntry, NegotiationWorkBudget, NegotiationWorkLimit, StableObjectOrdinal,
+    };
     pub use crate::protocol::pack_entry_reuse::{
         PackDependencySet, PackEntryPlan, PackEntrySourceError, PackRecompressReason,
         PackReuseCapabilities, ReusedDirectEntry, ReusedOfsDeltaEntry, ReusedRefDeltaEntry,
