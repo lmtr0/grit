@@ -516,6 +516,12 @@ impl CanonicalCloneSingleflight {
         &self.state
     }
 
+    /// Return the latest successfully applied observation time, if any.
+    #[must_use]
+    pub const fn last_observed_at(&self) -> Option<OffsetDateTime> {
+        self.last_observed_at
+    }
+
     fn validate_observed_at(&self, observed_at: OffsetDateTime) -> Result<(), CanonicalCloneError> {
         if self
             .last_observed_at

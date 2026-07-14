@@ -87,6 +87,12 @@ pub mod prelude {
         CanonicalCloneStoreCas, CanonicalCloneToken, CanonicalCloneVerification, ClonePackPurpose,
         MAX_CANONICAL_CLONE_WANTS,
     };
+    pub use crate::protocol::canonical_clone_serve::{
+        lookup_canonical_clone, serve_canonical_clone, CanonicalCloneByteSource,
+        CanonicalCloneDataError, CanonicalCloneLookup, CanonicalCloneLookupError,
+        CanonicalCloneServeError, CanonicalCloneServeOptions, CanonicalCloneServeReport,
+        DEFAULT_CANONICAL_CLONE_RANGE_BYTES,
+    };
     pub use crate::protocol::clone_metrics::{
         CloneBackendKind, CloneBackendMetrics, CloneCacheMetrics, CloneCancellationMetrics,
         CloneLimitError, CloneLimits, CloneMemoryMetrics, CloneMetricsRecorder, CloneMetricsReport,
