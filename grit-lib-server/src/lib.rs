@@ -83,6 +83,11 @@ pub mod prelude {
         CloneObjectKindMetrics, CloneObjectMetrics, CloneOutcome, ClonePackMetrics, ClonePhase,
         ClonePhaseMetrics,
     };
+    pub use crate::protocol::pack_stream::{
+        BoundedVecPackSink, CancellationGate, CancellationProbe, CancellationReport, NeverCancel,
+        PackAbortReason, PackCancellationToken, PackChunkSink, PackSinkOperation, PackSinkState,
+        PackStreamError, PackStreamLimits, PackStreamReport,
+    };
     pub use crate::protocol::receive_pack::{
         AllowAllPushPolicy, ProtectedRefPolicy, PushCommandKind, PushCommandStatus, PushPlan,
         PushPolicy, PushPolicyContext, QuarantinedObject, ReceivePackAdvertisedRef,
