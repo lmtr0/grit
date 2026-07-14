@@ -342,7 +342,7 @@ pub const MIGRATIONS: &[&str] = &[
         check (length(idempotency_key) between 1 and 256),
         check (source_external_id is null or length(source_external_id) between 1 and 1024),
         check (hash_algo in ('sha1', 'sha256')),
-        constraint grit_migration_phase_range check (phase between 1 and 5),
+        constraint grit_migration_phase_range check (phase between 1 and 9),
         check (state between 1 and 3),
         check (fencing_token >= 0),
         check (attempt_count >= 0),
@@ -407,7 +407,7 @@ pub const MIGRATIONS: &[&str] = &[
     "alter table grit_migration_sessions drop constraint if exists grit_migration_sessions_phase_check",
     "alter table grit_migration_sessions drop constraint if exists grit_migration_phase_range",
     "alter table grit_migration_sessions add constraint grit_migration_phase_range
-        check (phase between 1 and 5)",
+        check (phase between 1 and 9)",
     "do $$ declare constraint_row record; begin
         for constraint_row in
             select conname from pg_constraint
@@ -546,6 +546,96 @@ pub const MIGRATIONS: &[&str] = &[
         on grit_migration_sessions (state, phase, lease_expires_at, migration_id)",
     "create index if not exists grit_migration_sessions_destination_idx
         on grit_migration_sessions (destination_repository_pk, migration_id)",
+    "create sequence if not exists grit_migration_verification_report_id_seq",
+    "create table if not exists grit_migration_verification_reports (
+        report_id bigint primary key default nextval('grit_migration_verification_report_id_seq'),
+        migration_id bigint not null,
+        report_generation bigint not null,
+        mode smallint not null,
+        source_ref_generation bigint not null,
+        source_history_generation bigint not null,
+        source_config_generation bigint not null,
+        destination_ref_generation bigint not null,
+        destination_history_generation bigint not null,
+        destination_config_generation bigint not null,
+        passed boolean not null,
+        created_at timestamptz not null,
+        constraint grit_migration_verification_report_session_fk foreign key (migration_id)
+            references grit_migration_sessions (migration_id) on delete cascade,
+        check (report_id > 0),
+        check (report_generation > 0),
+        check (mode in (1, 2)),
+        check (source_ref_generation >= 0 and source_history_generation >= 0
+            and source_config_generation >= 0),
+        check (destination_ref_generation >= 0 and destination_history_generation >= 0
+            and destination_config_generation >= 0),
+        unique (migration_id, report_generation)
+    )",
+    "alter table grit_migration_verification_reports
+        add column if not exists report_generation bigint",
+    "alter table grit_migration_verification_reports
+        add column if not exists destination_ref_generation bigint",
+    "alter table grit_migration_verification_reports
+        add column if not exists destination_history_generation bigint",
+    "alter table grit_migration_verification_reports
+        add column if not exists destination_config_generation bigint",
+    "create unique index if not exists grit_migration_verification_report_generation_idx
+        on grit_migration_verification_reports (migration_id, report_generation)
+        where report_generation is not null",
+    "create table if not exists grit_migration_verification_checks (
+        report_id bigint not null,
+        check_kind smallint not null,
+        result smallint not null,
+        source_count bigint,
+        destination_count bigint,
+        mismatch_count bigint,
+        detail text,
+        primary key (report_id, check_kind),
+        constraint grit_migration_verification_check_report_fk foreign key (report_id)
+            references grit_migration_verification_reports (report_id) on delete cascade,
+        check (check_kind between 1 and 9),
+        check (result between 1 and 3),
+        check (source_count is null or source_count >= 0),
+        check (destination_count is null or destination_count >= 0),
+        check (mismatch_count is null or mismatch_count >= 0)
+    )",
+    "create table if not exists grit_repository_routes (
+        source_repository_pk bigint primary key,
+        active_repository_pk bigint not null,
+        destination_repository_pk bigint not null,
+        migration_id bigint not null unique,
+        report_id bigint not null unique,
+        destination_ref_generation bigint not null,
+        destination_history_generation bigint not null,
+        destination_config_generation bigint not null,
+        cutover_at timestamptz not null,
+        rollback_deadline timestamptz not null,
+        rolled_back_at timestamptz,
+        route_generation bigint not null default 1,
+        constraint grit_repository_routes_source_fk foreign key (source_repository_pk)
+            references grit_repositories (repository_pk) on delete cascade,
+        constraint grit_repository_routes_active_fk foreign key (active_repository_pk)
+            references grit_repositories (repository_pk),
+        constraint grit_repository_routes_destination_fk foreign key (destination_repository_pk)
+            references grit_repositories (repository_pk),
+        constraint grit_repository_routes_migration_fk foreign key (migration_id)
+            references grit_migration_sessions (migration_id) on delete cascade,
+        constraint grit_repository_routes_report_fk foreign key (report_id)
+            references grit_migration_verification_reports (report_id),
+        check (source_repository_pk <> destination_repository_pk),
+        check (active_repository_pk in (source_repository_pk, destination_repository_pk)),
+        check (destination_ref_generation >= 0 and destination_history_generation >= 0
+            and destination_config_generation >= 0),
+        check (rollback_deadline > cutover_at),
+        check (route_generation > 0),
+        check ((active_repository_pk = source_repository_pk) = (rolled_back_at is not null))
+    )",
+    "alter table grit_repository_routes
+        add column if not exists route_generation bigint not null default 1",
+    "alter sequence grit_migration_verification_report_id_seq
+        owned by grit_migration_verification_reports.report_id",
+    "create index if not exists grit_migration_verification_reports_migration_idx
+        on grit_migration_verification_reports (migration_id, report_id desc)",
     "create table if not exists grit_import_trusted_objects (
         tenant_id text not null,
         repository_id text not null,
@@ -898,6 +988,14 @@ pub enum PgMigrationPhase {
     InitialCopyComplete,
     /// Apply bounded changes observed after the immutable initial snapshot.
     CatchUp,
+    /// Compare the caught-up source and destination durable state.
+    Verification,
+    /// A persisted verification report authorizes a coordinated cutover.
+    ReadyForCutover,
+    /// The source logical route points at the destination repository.
+    CutOver,
+    /// The source logical route was restored during the rollback window.
+    RolledBack,
 }
 
 impl PgMigrationPhase {
@@ -908,6 +1006,10 @@ impl PgMigrationPhase {
             Self::BulkTransfer => 3,
             Self::InitialCopyComplete => 4,
             Self::CatchUp => 5,
+            Self::Verification => 6,
+            Self::ReadyForCutover => 7,
+            Self::CutOver => 8,
+            Self::RolledBack => 9,
         }
     }
 
@@ -918,6 +1020,10 @@ impl PgMigrationPhase {
             3 => Ok(Self::BulkTransfer),
             4 => Ok(Self::InitialCopyComplete),
             5 => Ok(Self::CatchUp),
+            6 => Ok(Self::Verification),
+            7 => Ok(Self::ReadyForCutover),
+            8 => Ok(Self::CutOver),
+            9 => Ok(Self::RolledBack),
             _ => Err(Error::Backend(format!(
                 "invalid migration phase code {code}"
             ))),
@@ -1112,6 +1218,164 @@ pub enum PgMigrationCatchUpApplyResult {
         /// Missing object ID or pack checksum.
         oid: ObjectId,
     },
+}
+
+/// Verification depth for an internal PostgreSQL migration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PgMigrationVerificationMode {
+    /// Compare every supported manifest and graph projection.
+    Full,
+    /// Compare durable manifests while marking graph and sample checks unsupported.
+    Manifest,
+}
+
+impl PgMigrationVerificationMode {
+    const fn code(self) -> i16 {
+        match self {
+            Self::Full => 1,
+            Self::Manifest => 2,
+        }
+    }
+}
+
+/// Stable verification check recorded in a migration report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PgMigrationVerificationCheckKind {
+    /// Repository hash algorithms match.
+    HashAlgorithm,
+    /// Ref names and direct or symbolic targets match exactly.
+    Refs,
+    /// The direct or symbolic `HEAD` value matches exactly.
+    DefaultBranch,
+    /// Persisted peeled-tag values match when the storage model exposes them.
+    PeeledTags,
+    /// Object identifiers match exactly.
+    ObjectManifest,
+    /// Pack checksums match exactly.
+    PackManifest,
+    /// Commits and ordered parent edges match exactly.
+    CommitGraph,
+    /// Repository configuration, including default-branch settings, matches exactly.
+    Config,
+    /// Caller-selected object identifiers exist with matching kinds.
+    SampleObjects,
+}
+
+impl PgMigrationVerificationCheckKind {
+    const fn code(self) -> i16 {
+        match self {
+            Self::HashAlgorithm => 1,
+            Self::Refs => 2,
+            Self::DefaultBranch => 3,
+            Self::PeeledTags => 4,
+            Self::ObjectManifest => 5,
+            Self::PackManifest => 6,
+            Self::CommitGraph => 7,
+            Self::Config => 8,
+            Self::SampleObjects => 9,
+        }
+    }
+}
+
+/// Typed result of one persisted verification check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PgMigrationVerificationResult {
+    /// The compared projections match.
+    Passed,
+    /// The compared projections differ.
+    Failed,
+    /// The selected verification mode does not perform this check.
+    Unsupported,
+}
+
+impl PgMigrationVerificationResult {
+    const fn code(self) -> i16 {
+        match self {
+            Self::Passed => 1,
+            Self::Failed => 2,
+            Self::Unsupported => 3,
+        }
+    }
+}
+
+/// One immutable check row in a migration verification report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgMigrationVerificationCheck {
+    /// Stable check identity.
+    pub kind: PgMigrationVerificationCheckKind,
+    /// Typed check outcome.
+    pub result: PgMigrationVerificationResult,
+    /// Source row count, when meaningful.
+    pub source_count: Option<u64>,
+    /// Destination row count, when meaningful.
+    pub destination_count: Option<u64>,
+    /// Number of bounded mismatches found.
+    pub mismatch_count: Option<u64>,
+    /// Short durable explanation for a failure or unsupported check.
+    pub detail: Option<String>,
+}
+
+/// Immutable verification report authorizing cutover when `passed` is true.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgMigrationVerificationReport {
+    /// Database-assigned immutable report identifier.
+    pub report_id: u64,
+    /// Migration owning this report.
+    pub migration_id: u64,
+    /// Monotonic report generation within the migration.
+    pub report_generation: u64,
+    /// Selected verification depth.
+    pub mode: PgMigrationVerificationMode,
+    /// Exact source generation token observed by the report.
+    pub source_token: PgMigrationSourceToken,
+    /// Exact destination generation tuple observed by the same snapshot.
+    pub destination_token: PgMigrationSourceToken,
+    /// Whether every required check passed.
+    pub passed: bool,
+    /// Explicit caller-supplied report timestamp.
+    pub created_at: OffsetDateTime,
+    /// Persisted typed checks.
+    pub checks: Vec<PgMigrationVerificationCheck>,
+}
+
+/// Inputs for one bounded internal PostgreSQL verification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgMigrationVerificationOptions {
+    /// Verification depth.
+    pub mode: PgMigrationVerificationMode,
+    /// Explicit snapshot and report timestamp.
+    pub observed_at: OffsetDateTime,
+    /// Caller-selected object identifiers, bounded to 128 entries.
+    pub sample_oids: Vec<ObjectId>,
+}
+
+/// Options for atomically publishing a verified destination route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PgMigrationCutoverOptions {
+    /// Explicit cutover timestamp within the current claim lease.
+    pub observed_at: OffsetDateTime,
+    /// Exclusive rollback deadline after `observed_at`.
+    pub rollback_deadline: OffsetDateTime,
+}
+
+/// Options for restoring the source route during the rollback window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PgMigrationRollbackOptions {
+    /// Migration whose route must be restored.
+    pub migration_id: u64,
+    /// Explicit rollback timestamp no later than the stored deadline.
+    pub observed_at: OffsetDateTime,
+}
+
+/// Idempotent cutover or rollback outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PgMigrationRouteOutcome {
+    /// The route and migration phase changed atomically.
+    Applied,
+    /// The requested route state was already installed.
+    AlreadyApplied,
+    /// The claim, verification report, source position, or rollback window is no longer valid.
+    PreconditionsChanged,
 }
 
 /// Maximum operations returned by one catch-up planning call.
@@ -1717,7 +1981,7 @@ impl PgServerStorage {
         let rows = sqlx::query(
             "with candidates as (
                  select migration_id from grit_migration_sessions
-                 where state = 1 and phase <= 5
+                 where state = 1 and phase <= 7
                    and updated_at <= $2
                    and (claimed_by is null or lease_expires_at <= $2)
                    and attempt_count < 2147483647
@@ -2523,6 +2787,623 @@ impl PgServerStorage {
         }
         tx.commit().await?;
         Ok(PgMigrationCatchUpApplyResult::Applied)
+    }
+
+    /// Verify a fully caught-up internal PostgreSQL migration and persist an immutable report.
+    ///
+    /// All probes share one repeatable-read snapshot. The source ref, history, and config
+    /// generations must exactly equal the last applied token, with no partial journal cursors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Backend`] for external sources, stale claims, invalid samples, incomplete
+    /// catch-up, or corrupt rows, and propagates SQLx failures.
+    pub async fn verify_migration(
+        &self,
+        claim: &PgMigrationClaim,
+        options: PgMigrationVerificationOptions,
+    ) -> Result<PgMigrationVerificationReport> {
+        validate_migration_claim(claim, options.observed_at)?;
+        if claim.session.phase != PgMigrationPhase::CatchUp || options.sample_oids.len() > 128 {
+            return Err(Error::Backend(
+                "verification requires a catch-up claim and at most 128 sample objects".to_owned(),
+            ));
+        }
+        if options
+            .sample_oids
+            .iter()
+            .any(|oid| oid.algo() != claim.session.hash_algo)
+        {
+            return Err(Error::Backend(
+                "verification sample has the wrong hash algorithm".to_owned(),
+            ));
+        }
+        let migration_id = positive_u64_to_i64(claim.session.migration_id, "migration id")?;
+        let fencing_token = positive_u64_to_i64(claim.fencing_token, "migration fencing token")?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("set transaction isolation level repeatable read")
+            .execute(&mut *tx)
+            .await?;
+        let session_row = sqlx::query(
+            "select * from grit_migration_sessions
+             where migration_id = $1 and claimed_by = $2 and fencing_token = $3
+               and state = 1 and phase = 5 and lease_expires_at > $4 and updated_at <= $4
+             for update",
+        )
+        .bind(migration_id)
+        .bind(&claim.worker_id)
+        .bind(fencing_token)
+        .bind(options.observed_at)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| Error::Backend("migration verification claim was lost".to_owned()))?;
+        let session = row_to_migration_session(&session_row)?;
+        let PgMigrationSource::Repository(source_pk) = session.source else {
+            return Err(Error::Backend(
+                "external migration verification is unsupported".to_owned(),
+            ));
+        };
+        let repositories = sqlx::query(
+            "select repository_pk, tenant_id, repository_id, hash_algo, ref_generation,
+                    history_generation, config_generation
+             from grit_repositories where repository_pk in ($1, $2) and deleted_at is null",
+        )
+        .bind(source_pk.get())
+        .bind(session.destination_repository.get())
+        .fetch_all(&mut *tx)
+        .await?;
+        if repositories.len() != 2 {
+            return Err(Error::Backend(
+                "migration source or destination no longer exists".to_owned(),
+            ));
+        }
+        let source_row = repositories
+            .iter()
+            .find(|row| row.get::<i64, _>("repository_pk") == source_pk.get())
+            .ok_or_else(|| Error::Backend("migration source row is missing".to_owned()))?;
+        let destination_row = repositories
+            .iter()
+            .find(|row| row.get::<i64, _>("repository_pk") == session.destination_repository.get())
+            .ok_or_else(|| Error::Backend("migration destination row is missing".to_owned()))?;
+        let source_token = PgMigrationSourceToken::Postgres {
+            ref_generation: nonnegative_i64_to_u64(
+                source_row.try_get("ref_generation")?,
+                "verification source ref generation",
+            )?,
+            history_generation: nonnegative_i64_to_u64(
+                source_row.try_get("history_generation")?,
+                "verification source history generation",
+            )?,
+            config_generation: nonnegative_i64_to_u64(
+                source_row.try_get("config_generation")?,
+                "verification source config generation",
+            )?,
+        };
+        let destination_token = PgMigrationSourceToken::Postgres {
+            ref_generation: nonnegative_i64_to_u64(
+                destination_row.try_get("ref_generation")?,
+                "verification destination ref generation",
+            )?,
+            history_generation: nonnegative_i64_to_u64(
+                destination_row.try_get("history_generation")?,
+                "verification destination history generation",
+            )?,
+            config_generation: nonnegative_i64_to_u64(
+                destination_row.try_get("config_generation")?,
+                "verification destination config generation",
+            )?,
+        };
+        if session.last_applied.as_ref() != Some(&source_token)
+            || session.last_applied_ref_cursor.is_some()
+            || session.last_applied_config_cursor.is_some()
+        {
+            return Err(Error::Backend(
+                "migration must have zero ref, history, and config lag before verification"
+                    .to_owned(),
+            ));
+        }
+        let source_tenant: String = source_row.try_get("tenant_id")?;
+        let source_repository: String = source_row.try_get("repository_id")?;
+        let destination_tenant: String = destination_row.try_get("tenant_id")?;
+        let destination_repository: String = destination_row.try_get("repository_id")?;
+        let source_hash: String = source_row.try_get("hash_algo")?;
+        let destination_hash: String = destination_row.try_get("hash_algo")?;
+        let entered_verification = sqlx::query(
+            "update grit_migration_sessions set phase = 6, updated_at = $4
+             where migration_id = $1 and claimed_by = $2 and fencing_token = $3
+               and state = 1 and phase = 5 and lease_expires_at > $4",
+        )
+        .bind(migration_id)
+        .bind(&claim.worker_id)
+        .bind(fencing_token)
+        .bind(options.observed_at)
+        .execute(&mut *tx)
+        .await?;
+        if entered_verification.rows_affected() != 1 {
+            return Err(Error::Backend(
+                "migration verification claim was lost".to_owned(),
+            ));
+        }
+        let mut checks = Vec::with_capacity(9);
+        checks.push(verification_check(
+            PgMigrationVerificationCheckKind::HashAlgorithm,
+            source_hash == destination_hash && source_hash == session.hash_algo.name(),
+            None,
+            None,
+            None,
+            None,
+        ));
+        let projections = [
+            (
+                PgMigrationVerificationCheckKind::Refs,
+                "grit_refs",
+                "refname",
+                "s.target_oid is distinct from d.target_oid or s.symbolic_target is distinct from d.symbolic_target",
+            ),
+            (
+                PgMigrationVerificationCheckKind::PackManifest,
+                "grit_packs",
+                "pack_checksum",
+                "s.index_checksum is distinct from d.index_checksum or s.object_count is distinct from d.object_count or s.size_bytes is distinct from d.size_bytes",
+            ),
+            (
+                PgMigrationVerificationCheckKind::Config,
+                "grit_config",
+                "key",
+                "s.value is distinct from d.value",
+            ),
+        ];
+        for (kind, table, key, unequal) in projections {
+            checks.push(
+                compare_repository_projection(
+                    &mut tx,
+                    kind,
+                    table,
+                    key,
+                    unequal,
+                    &source_tenant,
+                    &source_repository,
+                    &destination_tenant,
+                    &destination_repository,
+                )
+                .await?,
+            );
+        }
+        checks.push(
+            compare_default_branch(
+                &mut tx,
+                &source_tenant,
+                &source_repository,
+                &destination_tenant,
+                &destination_repository,
+            )
+            .await?,
+        );
+        checks.push(PgMigrationVerificationCheck {
+            kind: PgMigrationVerificationCheckKind::PeeledTags,
+            result: PgMigrationVerificationResult::Unsupported,
+            source_count: None,
+            destination_count: None,
+            mismatch_count: None,
+            detail: Some(
+                "the current storage model has no durable peeled-tag projection; exact tag refs and object manifests are checked"
+                    .to_owned(),
+            ),
+        });
+        checks.push(
+            compare_object_manifest(
+                &mut tx,
+                &source_tenant,
+                &source_repository,
+                &destination_tenant,
+                &destination_repository,
+            )
+            .await?,
+        );
+        if options.mode == PgMigrationVerificationMode::Full {
+            checks.push(
+                compare_commit_graph(
+                    &mut tx,
+                    &source_tenant,
+                    &source_repository,
+                    &destination_tenant,
+                    &destination_repository,
+                )
+                .await?,
+            );
+            checks.push(unsupported_canonical_samples(&options.sample_oids));
+        } else {
+            for kind in [
+                PgMigrationVerificationCheckKind::CommitGraph,
+                PgMigrationVerificationCheckKind::SampleObjects,
+            ] {
+                checks.push(PgMigrationVerificationCheck {
+                    kind,
+                    result: PgMigrationVerificationResult::Unsupported,
+                    source_count: None,
+                    destination_count: None,
+                    mismatch_count: None,
+                    detail: Some("not performed in manifest verification mode".to_owned()),
+                });
+            }
+        }
+        checks.sort_unstable_by_key(|check| check.kind.code());
+        let passed =
+            verification_checks_pass(options.mode, !options.sample_oids.is_empty(), &checks);
+        let (source_ref_generation, source_history_generation, source_config_generation) =
+            postgres_token_generations(&source_token)?;
+        let (
+            destination_ref_generation,
+            destination_history_generation,
+            destination_config_generation,
+        ) = postgres_token_generations(&destination_token)?;
+        let report_generation: i64 = sqlx::query_scalar(
+            "select coalesce(max(report_generation), 0) + 1
+             from grit_migration_verification_reports where migration_id = $1",
+        )
+        .bind(migration_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let report_id: i64 =
+            sqlx::query_scalar(
+                "insert into grit_migration_verification_reports
+                (migration_id, report_generation, mode, source_ref_generation,
+                 source_history_generation, source_config_generation, destination_ref_generation,
+                 destination_history_generation, destination_config_generation, passed, created_at)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) returning report_id",
+            )
+            .bind(migration_id)
+            .bind(report_generation)
+            .bind(options.mode.code())
+            .bind(i64::try_from(source_ref_generation).map_err(|_| {
+                Error::Backend("verification ref generation exceeds i64".to_owned())
+            })?)
+            .bind(i64::try_from(source_history_generation).map_err(|_| {
+                Error::Backend("verification history generation exceeds i64".to_owned())
+            })?)
+            .bind(i64::try_from(source_config_generation).map_err(|_| {
+                Error::Backend("verification config generation exceeds i64".to_owned())
+            })?)
+            .bind(i64::try_from(destination_ref_generation).map_err(|_| {
+                Error::Backend("verification destination ref generation exceeds i64".to_owned())
+            })?)
+            .bind(i64::try_from(destination_history_generation).map_err(|_| {
+                Error::Backend("verification destination history generation exceeds i64".to_owned())
+            })?)
+            .bind(i64::try_from(destination_config_generation).map_err(|_| {
+                Error::Backend("verification destination config generation exceeds i64".to_owned())
+            })?)
+            .bind(passed)
+            .bind(options.observed_at)
+            .fetch_one(&mut *tx)
+            .await?;
+        insert_verification_checks(&mut tx, report_id, &checks).await?;
+        let next_phase = if passed { 7_i16 } else { 5_i16 };
+        let changed = sqlx::query(
+            "update grit_migration_sessions set phase = $5, updated_at = $4
+             where migration_id = $1 and claimed_by = $2 and fencing_token = $3
+               and state = 1 and phase = 6 and lease_expires_at > $4",
+        )
+        .bind(migration_id)
+        .bind(&claim.worker_id)
+        .bind(fencing_token)
+        .bind(options.observed_at)
+        .bind(next_phase)
+        .execute(&mut *tx)
+        .await?;
+        if changed.rows_affected() != 1 {
+            return Err(Error::Backend(
+                "migration verification claim was lost".to_owned(),
+            ));
+        }
+        tx.commit().await?;
+        Ok(PgMigrationVerificationReport {
+            report_id: nonnegative_i64_to_u64(report_id, "verification report id")?,
+            migration_id: claim.session.migration_id,
+            report_generation: nonnegative_i64_to_u64(
+                report_generation,
+                "verification report generation",
+            )?,
+            mode: options.mode,
+            source_token,
+            destination_token,
+            passed,
+            created_at: options.observed_at,
+            checks,
+        })
+    }
+
+    /// Atomically route a verified source identity to its destination repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Backend`] for invalid timestamps or external sources, and propagates SQLx
+    /// failures. Changed verification, source, or lease state is a typed outcome.
+    pub async fn cut_over_migration(
+        &self,
+        claim: &PgMigrationClaim,
+        options: PgMigrationCutoverOptions,
+    ) -> Result<PgMigrationRouteOutcome> {
+        validate_migration_claim(claim, options.observed_at)?;
+        if options.rollback_deadline <= options.observed_at {
+            return Err(Error::Backend(
+                "migration rollback deadline must be after cutover".to_owned(),
+            ));
+        }
+        let PgMigrationSource::Repository(source_pk) = claim.session.source else {
+            return Err(Error::Backend("external cutover is unsupported".to_owned()));
+        };
+        let destination_pk = claim.session.destination_repository;
+        let source_identity = repository_identity_by_pk(&self.pool, source_pk).await?;
+        let destination_identity = repository_identity_by_pk(&self.pool, destination_pk).await?;
+        let migration_id = positive_u64_to_i64(claim.session.migration_id, "migration id")?;
+        let fencing_token = positive_u64_to_i64(claim.fencing_token, "migration fencing token")?;
+        let mut tx = self.pool.begin().await?;
+        if !lock_migration_repository_pair(
+            &mut tx,
+            source_pk,
+            &source_identity,
+            destination_pk,
+            &destination_identity,
+        )
+        .await?
+        {
+            tx.rollback().await?;
+            return Ok(PgMigrationRouteOutcome::PreconditionsChanged);
+        }
+        let session_row = sqlx::query(
+            "select * from grit_migration_sessions
+             where migration_id = $1 and claimed_by = $2 and fencing_token = $3
+               and state = 1 and phase = 7 and lease_expires_at > $4 and updated_at <= $4
+             for update",
+        )
+        .bind(migration_id)
+        .bind(&claim.worker_id)
+        .bind(fencing_token)
+        .bind(options.observed_at)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(session_row) = session_row else {
+            tx.rollback().await?;
+            return Ok(PgMigrationRouteOutcome::PreconditionsChanged);
+        };
+        let session = row_to_migration_session(&session_row)?;
+        if session.source != PgMigrationSource::Repository(source_pk)
+            || session.destination_repository != destination_pk
+            || session.last_applied_ref_cursor.is_some()
+            || session.last_applied_config_cursor.is_some()
+        {
+            tx.rollback().await?;
+            return Ok(PgMigrationRouteOutcome::PreconditionsChanged);
+        }
+        let source_generations = repository_generations_for_update(&mut tx, source_pk).await?;
+        let destination_generations =
+            repository_generations_for_update(&mut tx, destination_pk).await?;
+        let report = sqlx::query(
+            "select report_id, report_generation, source_ref_generation,
+                    source_history_generation, source_config_generation,
+                    destination_ref_generation, destination_history_generation,
+                    destination_config_generation, created_at
+             from grit_migration_verification_reports
+             where migration_id = $1 and passed = true and report_generation is not null
+             order by report_generation desc limit 1 for share",
+        )
+        .bind(migration_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(report) = report else {
+            tx.rollback().await?;
+            return Ok(PgMigrationRouteOutcome::PreconditionsChanged);
+        };
+        let report_generations = (
+            report.try_get::<i64, _>("source_ref_generation")?,
+            report.try_get::<i64, _>("source_history_generation")?,
+            report.try_get::<i64, _>("source_config_generation")?,
+        );
+        let report_destination_generations = (
+            report.try_get::<i64, _>("destination_ref_generation")?,
+            report.try_get::<i64, _>("destination_history_generation")?,
+            report.try_get::<i64, _>("destination_config_generation")?,
+        );
+        let applied = session
+            .last_applied
+            .as_ref()
+            .map(postgres_token_generations)
+            .transpose()?;
+        let applied = applied
+            .map(|values| {
+                Ok::<_, Error>((
+                    i64::try_from(values.0).map_err(|_| {
+                        Error::Backend("applied ref generation exceeds i64".to_owned())
+                    })?,
+                    i64::try_from(values.1).map_err(|_| {
+                        Error::Backend("applied history generation exceeds i64".to_owned())
+                    })?,
+                    i64::try_from(values.2).map_err(|_| {
+                        Error::Backend("applied config generation exceeds i64".to_owned())
+                    })?,
+                ))
+            })
+            .transpose()?;
+        if report_generations != source_generations
+            || report_destination_generations != destination_generations
+            || applied != Some(source_generations)
+        {
+            tx.rollback().await?;
+            return Ok(PgMigrationRouteOutcome::PreconditionsChanged);
+        }
+        let existing = sqlx::query(
+            "select migration_id, active_repository_pk, route_generation
+             from grit_repository_routes
+             where source_repository_pk = $1 for update",
+        )
+        .bind(source_pk.get())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(existing) = existing {
+            let same = existing.try_get::<i64, _>("migration_id")? == migration_id
+                && existing.try_get::<i64, _>("active_repository_pk")? == destination_pk.get();
+            tx.rollback().await?;
+            return Ok(if same {
+                PgMigrationRouteOutcome::AlreadyApplied
+            } else {
+                PgMigrationRouteOutcome::PreconditionsChanged
+            });
+        }
+        let report_id: i64 = report.try_get("report_id")?;
+        let inserted = sqlx::query(
+            "insert into grit_repository_routes
+                (source_repository_pk, active_repository_pk, destination_repository_pk,
+                 migration_id, report_id, destination_ref_generation,
+                 destination_history_generation, destination_config_generation,
+                 cutover_at, rollback_deadline, route_generation)
+             values ($1, $2, $2, $3, $4, $5, $6, $7, $8, $9, 1)",
+        )
+        .bind(source_pk.get())
+        .bind(destination_pk.get())
+        .bind(migration_id)
+        .bind(report_id)
+        .bind(destination_generations.0)
+        .bind(destination_generations.1)
+        .bind(destination_generations.2)
+        .bind(options.observed_at)
+        .bind(options.rollback_deadline)
+        .execute(&mut *tx)
+        .await?;
+        if inserted.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(PgMigrationRouteOutcome::PreconditionsChanged);
+        }
+        let changed = sqlx::query(
+            "update grit_migration_sessions
+             set phase = 8, claimed_by = null, lease_expires_at = null, updated_at = $4
+             where migration_id = $1 and claimed_by = $2 and fencing_token = $3 and phase = 7",
+        )
+        .bind(migration_id)
+        .bind(&claim.worker_id)
+        .bind(fencing_token)
+        .bind(options.observed_at)
+        .execute(&mut *tx)
+        .await?;
+        if changed.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(PgMigrationRouteOutcome::PreconditionsChanged);
+        }
+        tx.commit().await?;
+        Ok(PgMigrationRouteOutcome::Applied)
+    }
+
+    /// Restore a cut-over source route before its explicit rollback deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Backend`] for invalid identifiers and propagates SQLx failures.
+    pub async fn rollback_migration(
+        &self,
+        options: PgMigrationRollbackOptions,
+    ) -> Result<PgMigrationRouteOutcome> {
+        let migration_id = positive_u64_to_i64(options.migration_id, "migration id")?;
+        let endpoints = sqlx::query(
+            "select source_repository_pk, destination_repository_pk
+             from grit_migration_sessions where migration_id = $1",
+        )
+        .bind(migration_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(endpoints) = endpoints else {
+            return Ok(PgMigrationRouteOutcome::PreconditionsChanged);
+        };
+        let source_pk =
+            RepositoryPk::try_from(endpoints.try_get::<i64, _>("source_repository_pk")?)
+                .map_err(|error| Error::Backend(error.to_string()))?;
+        let destination_pk =
+            RepositoryPk::try_from(endpoints.try_get::<i64, _>("destination_repository_pk")?)
+                .map_err(|error| Error::Backend(error.to_string()))?;
+        let source_identity = repository_identity_by_pk(&self.pool, source_pk).await?;
+        let destination_identity = repository_identity_by_pk(&self.pool, destination_pk).await?;
+        let mut tx = self.pool.begin().await?;
+        if !lock_migration_repository_pair(
+            &mut tx,
+            source_pk,
+            &source_identity,
+            destination_pk,
+            &destination_identity,
+        )
+        .await?
+        {
+            tx.rollback().await?;
+            return Ok(PgMigrationRouteOutcome::PreconditionsChanged);
+        }
+        let phase: Option<i16> = sqlx::query_scalar(
+            "select phase from grit_migration_sessions where migration_id = $1 for update",
+        )
+        .bind(migration_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if phase == Some(PgMigrationPhase::RolledBack.code()) {
+            tx.rollback().await?;
+            return Ok(PgMigrationRouteOutcome::AlreadyApplied);
+        }
+        if phase != Some(PgMigrationPhase::CutOver.code()) {
+            tx.rollback().await?;
+            return Ok(PgMigrationRouteOutcome::PreconditionsChanged);
+        }
+        let route = sqlx::query(
+            "select active_repository_pk, rollback_deadline, rolled_back_at, route_generation
+             from grit_repository_routes where source_repository_pk = $1
+               and migration_id = $2 for update",
+        )
+        .bind(source_pk.get())
+        .bind(migration_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(route) = route else {
+            tx.rollback().await?;
+            return Ok(PgMigrationRouteOutcome::PreconditionsChanged);
+        };
+        let deadline: OffsetDateTime = route.try_get("rollback_deadline")?;
+        if options.observed_at >= deadline
+            || route
+                .try_get::<Option<OffsetDateTime>, _>("rolled_back_at")?
+                .is_some()
+            || route.try_get::<i64, _>("active_repository_pk")? != destination_pk.get()
+        {
+            tx.rollback().await?;
+            return Ok(PgMigrationRouteOutcome::PreconditionsChanged);
+        }
+        let route_generation: i64 = route.try_get("route_generation")?;
+        let route_changed = sqlx::query(
+            "update grit_repository_routes
+             set active_repository_pk = source_repository_pk, rolled_back_at = $2,
+                 route_generation = route_generation + 1
+             where source_repository_pk = $1 and migration_id = $3
+               and active_repository_pk = destination_repository_pk
+               and rolled_back_at is null and route_generation = $4",
+        )
+        .bind(source_pk.get())
+        .bind(options.observed_at)
+        .bind(migration_id)
+        .bind(route_generation)
+        .execute(&mut *tx)
+        .await?;
+        if route_changed.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(PgMigrationRouteOutcome::PreconditionsChanged);
+        }
+        let session_changed = sqlx::query(
+            "update grit_migration_sessions set phase = 9, updated_at = $2
+             where migration_id = $1 and phase = 8",
+        )
+        .bind(migration_id)
+        .bind(options.observed_at)
+        .execute(&mut *tx)
+        .await?;
+        if session_changed.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(PgMigrationRouteOutcome::PreconditionsChanged);
+        }
+        tx.commit().await?;
+        Ok(PgMigrationRouteOutcome::Applied)
     }
 
     /// Claim a bounded oldest-first batch of durable cache invalidation events.
@@ -4756,6 +5637,328 @@ enum PgRepositoryGeneration {
     Config,
 }
 
+fn verification_check(
+    kind: PgMigrationVerificationCheckKind,
+    passed: bool,
+    source_count: Option<u64>,
+    destination_count: Option<u64>,
+    mismatch_count: Option<u64>,
+    detail: Option<String>,
+) -> PgMigrationVerificationCheck {
+    PgMigrationVerificationCheck {
+        kind,
+        result: if passed {
+            PgMigrationVerificationResult::Passed
+        } else {
+            PgMigrationVerificationResult::Failed
+        },
+        source_count,
+        destination_count,
+        mismatch_count,
+        detail,
+    }
+}
+
+async fn compare_repository_projection(
+    tx: &mut Transaction<'static, Postgres>,
+    kind: PgMigrationVerificationCheckKind,
+    table: &str,
+    key: &str,
+    unequal: &str,
+    source_tenant: &str,
+    source_repository: &str,
+    destination_tenant: &str,
+    destination_repository: &str,
+) -> Result<PgMigrationVerificationCheck> {
+    let sql = format!(
+        "select
+            (select count(*) from {table} where tenant_id = $1 and repository_id = $2)
+                as source_count,
+            (select count(*) from {table} where tenant_id = $3 and repository_id = $4)
+                as destination_count,
+            (select count(*) from
+                (select * from {table} where tenant_id = $1 and repository_id = $2) s
+                full join
+                (select * from {table} where tenant_id = $3 and repository_id = $4) d
+                on s.{key} = d.{key}
+             where s.{key} is null or d.{key} is null or {unequal}) as mismatch_count"
+    );
+    let row = sqlx::query(&sql)
+        .bind(source_tenant)
+        .bind(source_repository)
+        .bind(destination_tenant)
+        .bind(destination_repository)
+        .fetch_one(&mut **tx)
+        .await?;
+    let source_count = nonnegative_i64_to_u64(row.try_get("source_count")?, "source count")?;
+    let destination_count =
+        nonnegative_i64_to_u64(row.try_get("destination_count")?, "destination count")?;
+    let mismatch_count = nonnegative_i64_to_u64(row.try_get("mismatch_count")?, "mismatch count")?;
+    Ok(verification_check(
+        kind,
+        mismatch_count == 0,
+        Some(source_count),
+        Some(destination_count),
+        Some(mismatch_count),
+        (mismatch_count > 0).then(|| "repository projections differ".to_owned()),
+    ))
+}
+
+async fn compare_commit_graph(
+    tx: &mut Transaction<'static, Postgres>,
+    source_tenant: &str,
+    source_repository: &str,
+    destination_tenant: &str,
+    destination_repository: &str,
+) -> Result<PgMigrationVerificationCheck> {
+    let commits = compare_repository_projection(
+        tx,
+        PgMigrationVerificationCheckKind::CommitGraph,
+        "grit_commits",
+        "commit_oid",
+        "s.tree_oid is distinct from d.tree_oid or s.commit_time is distinct from d.commit_time or s.generation is distinct from d.generation",
+        source_tenant,
+        source_repository,
+        destination_tenant,
+        destination_repository,
+    )
+    .await?;
+    let row = sqlx::query(
+        "select
+            (select count(*) from grit_commit_parents
+             where tenant_id = $1 and repository_id = $2) as source_count,
+            (select count(*) from grit_commit_parents
+             where tenant_id = $3 and repository_id = $4) as destination_count,
+            (select count(*) from
+                (select commit_oid, parent_order, parent_oid from grit_commit_parents
+                 where tenant_id = $1 and repository_id = $2) s
+                full join
+                (select commit_oid, parent_order, parent_oid from grit_commit_parents
+                 where tenant_id = $3 and repository_id = $4) d
+                on s.commit_oid = d.commit_oid and s.parent_order = d.parent_order
+             where s.commit_oid is null or d.commit_oid is null
+                or s.parent_oid is distinct from d.parent_oid) as mismatch_count",
+    )
+    .bind(source_tenant)
+    .bind(source_repository)
+    .bind(destination_tenant)
+    .bind(destination_repository)
+    .fetch_one(&mut **tx)
+    .await?;
+    let parents = verification_check(
+        PgMigrationVerificationCheckKind::CommitGraph,
+        row.try_get::<i64, _>("mismatch_count")? == 0,
+        Some(nonnegative_i64_to_u64(
+            row.try_get("source_count")?,
+            "commit parent source count",
+        )?),
+        Some(nonnegative_i64_to_u64(
+            row.try_get("destination_count")?,
+            "commit parent destination count",
+        )?),
+        Some(nonnegative_i64_to_u64(
+            row.try_get("mismatch_count")?,
+            "commit parent mismatch count",
+        )?),
+        None,
+    );
+    let source_count = commits
+        .source_count
+        .unwrap_or_default()
+        .checked_add(parents.source_count.unwrap_or_default())
+        .ok_or_else(|| Error::Backend("commit graph source count overflow".to_owned()))?;
+    let destination_count = commits
+        .destination_count
+        .unwrap_or_default()
+        .checked_add(parents.destination_count.unwrap_or_default())
+        .ok_or_else(|| Error::Backend("commit graph destination count overflow".to_owned()))?;
+    let mismatch_count = commits
+        .mismatch_count
+        .unwrap_or_default()
+        .checked_add(parents.mismatch_count.unwrap_or_default())
+        .ok_or_else(|| Error::Backend("commit graph mismatch count overflow".to_owned()))?;
+    Ok(verification_check(
+        PgMigrationVerificationCheckKind::CommitGraph,
+        mismatch_count == 0,
+        Some(source_count),
+        Some(destination_count),
+        Some(mismatch_count),
+        (mismatch_count > 0).then(|| "commit or ordered parent projections differ".to_owned()),
+    ))
+}
+
+async fn compare_default_branch(
+    tx: &mut Transaction<'static, Postgres>,
+    source_tenant: &str,
+    source_repository: &str,
+    destination_tenant: &str,
+    destination_repository: &str,
+) -> Result<PgMigrationVerificationCheck> {
+    let row = sqlx::query(
+        "select count(*) filter (where side = 1) as source_count,
+                count(*) filter (where side = 2) as destination_count,
+                case when
+                    (select row(target_oid, symbolic_target) from grit_refs
+                     where tenant_id = $1 and repository_id = $2 and refname = 'HEAD')
+                    is not distinct from
+                    (select row(target_oid, symbolic_target) from grit_refs
+                     where tenant_id = $3 and repository_id = $4 and refname = 'HEAD')
+                then 0 else 1 end as mismatch_count
+         from (values (1), (2)) sides(side)",
+    )
+    .bind(source_tenant)
+    .bind(source_repository)
+    .bind(destination_tenant)
+    .bind(destination_repository)
+    .fetch_one(&mut **tx)
+    .await?;
+    let mismatch_count = nonnegative_i64_to_u64(
+        row.try_get("mismatch_count")?,
+        "default branch mismatch count",
+    )?;
+    Ok(verification_check(
+        PgMigrationVerificationCheckKind::DefaultBranch,
+        mismatch_count == 0,
+        None,
+        None,
+        Some(mismatch_count),
+        (mismatch_count > 0).then(|| "HEAD values differ".to_owned()),
+    ))
+}
+
+async fn compare_object_manifest(
+    tx: &mut Transaction<'static, Postgres>,
+    source_tenant: &str,
+    source_repository: &str,
+    destination_tenant: &str,
+    destination_repository: &str,
+) -> Result<PgMigrationVerificationCheck> {
+    let row = sqlx::query(
+        "with source as (
+            select oid, min(kind) as kind, count(distinct kind) as kind_count from (
+                select oid, kind from grit_objects where tenant_id = $1 and repository_id = $2
+                union all
+                select oid, kind from grit_pack_objects where tenant_id = $1 and repository_id = $2
+            ) rows group by oid
+         ), destination as (
+            select oid, min(kind) as kind, count(distinct kind) as kind_count from (
+                select oid, kind from grit_objects where tenant_id = $3 and repository_id = $4
+                union all
+                select oid, kind from grit_pack_objects where tenant_id = $3 and repository_id = $4
+            ) rows group by oid
+         ) select
+            (select count(*) from source) as source_count,
+            (select count(*) from destination) as destination_count,
+            (select count(*) from source full join destination using (oid)
+             where source.oid is null or destination.oid is null
+                or source.kind_count <> 1 or destination.kind_count <> 1
+                or source.kind is distinct from destination.kind) as mismatch_count",
+    )
+    .bind(source_tenant)
+    .bind(source_repository)
+    .bind(destination_tenant)
+    .bind(destination_repository)
+    .fetch_one(&mut **tx)
+    .await?;
+    let source_count = nonnegative_i64_to_u64(row.try_get("source_count")?, "object source count")?;
+    let destination_count = nonnegative_i64_to_u64(
+        row.try_get("destination_count")?,
+        "object destination count",
+    )?;
+    let mismatch_count =
+        nonnegative_i64_to_u64(row.try_get("mismatch_count")?, "object mismatch count")?;
+    Ok(verification_check(
+        PgMigrationVerificationCheckKind::ObjectManifest,
+        mismatch_count == 0,
+        Some(source_count),
+        Some(destination_count),
+        Some(mismatch_count),
+        (mismatch_count > 0).then(|| "loose/packed object manifests differ".to_owned()),
+    ))
+}
+
+fn unsupported_canonical_samples(samples: &[ObjectId]) -> PgMigrationVerificationCheck {
+    if samples.is_empty() {
+        return verification_check(
+            PgMigrationVerificationCheckKind::SampleObjects,
+            true,
+            Some(0),
+            Some(0),
+            Some(0),
+            None,
+        );
+    }
+    PgMigrationVerificationCheck {
+        kind: PgMigrationVerificationCheckKind::SampleObjects,
+        result: PgMigrationVerificationResult::Unsupported,
+        source_count: None,
+        destination_count: None,
+        mismatch_count: None,
+        detail: Some(
+            "canonical decoded object bytes are not exposed by this transactional projection; row presence and kind alone would not prove sample equality"
+                .to_owned(),
+        ),
+    }
+}
+
+fn verification_checks_pass(
+    mode: PgMigrationVerificationMode,
+    has_samples: bool,
+    checks: &[PgMigrationVerificationCheck],
+) -> bool {
+    checks.iter().all(|check| {
+        let required = match check.kind {
+            PgMigrationVerificationCheckKind::PeeledTags => false,
+            PgMigrationVerificationCheckKind::CommitGraph => {
+                mode == PgMigrationVerificationMode::Full
+            }
+            PgMigrationVerificationCheckKind::SampleObjects => {
+                mode == PgMigrationVerificationMode::Full && has_samples
+            }
+            _ => true,
+        };
+        if required {
+            check.result == PgMigrationVerificationResult::Passed
+        } else {
+            check.result != PgMigrationVerificationResult::Failed
+        }
+    })
+}
+
+async fn insert_verification_checks(
+    tx: &mut Transaction<'static, Postgres>,
+    report_id: i64,
+    checks: &[PgMigrationVerificationCheck],
+) -> Result<()> {
+    let mut query = QueryBuilder::<Postgres>::new(
+        "insert into grit_migration_verification_checks
+            (report_id, check_kind, result, source_count, destination_count, mismatch_count, detail) ",
+    );
+    query.push_values(checks, |mut row, check| {
+        row.push_bind(report_id)
+            .push_bind(check.kind.code())
+            .push_bind(check.result.code())
+            .push_bind(
+                check
+                    .source_count
+                    .and_then(|value| i64::try_from(value).ok()),
+            )
+            .push_bind(
+                check
+                    .destination_count
+                    .and_then(|value| i64::try_from(value).ok()),
+            )
+            .push_bind(
+                check
+                    .mismatch_count
+                    .and_then(|value| i64::try_from(value).ok()),
+            )
+            .push_bind(check.detail.as_deref());
+    });
+    query.build().persistent(false).execute(&mut **tx).await?;
+    Ok(())
+}
+
 async fn bump_repository_generation_at(
     tx: &mut Transaction<'static, Postgres>,
     tenant: &TenantId,
@@ -5483,6 +6686,76 @@ async fn lock_repository_name(
         .execute(&mut **tx)
         .await?;
     Ok(())
+}
+
+async fn repository_identity_by_pk(
+    pool: &PgPool,
+    repository_pk: RepositoryPk,
+) -> Result<(TenantId, RepositoryId)> {
+    let row = sqlx::query(
+        "select tenant_id, repository_id from grit_repositories
+         where repository_pk = $1 and deleted_at is null",
+    )
+    .bind(repository_pk.get())
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| Error::Backend("migration repository no longer exists".to_owned()))?;
+    Ok((
+        TenantId::new(row.try_get::<String, _>("tenant_id")?)?,
+        RepositoryId::new(row.try_get::<String, _>("repository_id")?)?,
+    ))
+}
+
+async fn lock_migration_repository_pair(
+    tx: &mut Transaction<'static, Postgres>,
+    source_pk: RepositoryPk,
+    source: &(TenantId, RepositoryId),
+    destination_pk: RepositoryPk,
+    destination: &(TenantId, RepositoryId),
+) -> Result<bool> {
+    let mut repositories = [
+        (source_pk, &source.0, &source.1),
+        (destination_pk, &destination.0, &destination.1),
+    ];
+    repositories.sort_unstable_by(|left, right| {
+        (left.1.as_str(), left.2.as_str()).cmp(&(right.1.as_str(), right.2.as_str()))
+    });
+    for (_, tenant, repository) in &repositories {
+        lock_repository_name(tx, tenant, repository).await?;
+    }
+    for (expected_pk, tenant, repository) in repositories {
+        let actual_pk: Option<i64> = sqlx::query_scalar(
+            "select repository_pk from grit_repositories
+             where tenant_id = $1 and repository_id = $2 and deleted_at is null for update",
+        )
+        .bind(tenant.as_str())
+        .bind(repository.as_str())
+        .fetch_optional(&mut **tx)
+        .await?;
+        if actual_pk != Some(expected_pk.get()) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn repository_generations_for_update(
+    tx: &mut Transaction<'static, Postgres>,
+    repository_pk: RepositoryPk,
+) -> Result<(i64, i64, i64)> {
+    let row = sqlx::query(
+        "select ref_generation, history_generation, config_generation
+         from grit_repositories where repository_pk = $1 and deleted_at is null for update",
+    )
+    .bind(repository_pk.get())
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| Error::Backend("migration repository no longer exists".to_owned()))?;
+    Ok((
+        row.try_get("ref_generation")?,
+        row.try_get("history_generation")?,
+        row.try_get("config_generation")?,
+    ))
 }
 
 fn is_unique_violation(error: &sqlx::Error) -> bool {
