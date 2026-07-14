@@ -303,6 +303,75 @@ pub const MIGRATIONS: &[&str] = &[
         add column if not exists published boolean not null default false",
     "alter table grit_import_state
         add column if not exists token bigint not null default 0",
+    "create sequence if not exists grit_migration_session_id_seq",
+    "create sequence if not exists grit_migration_fencing_token_seq",
+    "create table if not exists grit_migration_sessions (
+        migration_id bigint not null default nextval('grit_migration_session_id_seq'),
+        idempotency_key text not null,
+        source_repository_pk bigint,
+        source_external_id text,
+        destination_repository_pk bigint not null,
+        hash_algo text not null,
+        phase smallint not null,
+        state smallint not null,
+        fencing_token bigint not null default 0,
+        claimed_by text,
+        lease_expires_at timestamptz,
+        attempt_count integer not null default 0,
+        last_object_oid bytea,
+        last_ref_name text,
+        last_tree_oid bytea,
+        last_pack_checksum bytea,
+        completed_objects bigint not null default 0,
+        completed_refs bigint not null default 0,
+        completed_trees bigint not null default 0,
+        completed_packs bigint not null default 0,
+        completed_bytes bigint not null default 0,
+        terminal_reason text,
+        created_at timestamptz not null,
+        updated_at timestamptz not null,
+        primary key (migration_id),
+        unique (idempotency_key),
+        constraint grit_migration_destination_fk foreign key (destination_repository_pk)
+            references grit_repositories (repository_pk) on delete cascade,
+        check (migration_id > 0),
+        check ((source_repository_pk is null) <> (source_external_id is null)),
+        check (source_repository_pk is null or source_repository_pk > 0),
+        check (source_repository_pk is null
+            or source_repository_pk <> destination_repository_pk),
+        check (length(idempotency_key) between 1 and 256),
+        check (source_external_id is null or length(source_external_id) between 1 and 1024),
+        check (hash_algo in ('sha1', 'sha256')),
+        check (phase between 1 and 4),
+        check (state between 1 and 3),
+        check (fencing_token >= 0),
+        check (attempt_count >= 0),
+        check ((claimed_by is null) = (lease_expires_at is null)),
+        check (claimed_by is null or length(claimed_by) between 1 and 256),
+        check (claimed_by is null or lease_expires_at > updated_at),
+        check (state = 1 or claimed_by is null),
+        check (phase < 4 or claimed_by is null),
+        check (claimed_by is null or fencing_token > 0),
+        check ((state = 1 and terminal_reason is null)
+            or (state in (2, 3) and terminal_reason is not null
+                and length(terminal_reason) between 1 and 4096)),
+        check (last_object_oid is null or octet_length(last_object_oid)
+            = case hash_algo when 'sha1' then 20 else 32 end),
+        check (last_tree_oid is null or octet_length(last_tree_oid)
+            = case hash_algo when 'sha1' then 20 else 32 end),
+        check (last_pack_checksum is null or octet_length(last_pack_checksum)
+            = case hash_algo when 'sha1' then 20 else 32 end),
+        check (last_ref_name is null or length(last_ref_name) between 1 and 1024),
+        check (completed_objects >= 0 and completed_refs >= 0 and completed_trees >= 0
+            and completed_packs >= 0 and completed_bytes >= 0),
+        check (updated_at >= created_at)
+    )",
+    "alter sequence grit_migration_session_id_seq
+        owned by grit_migration_sessions.migration_id",
+    "create index if not exists grit_migration_sessions_claim_idx
+        on grit_migration_sessions (state, phase, lease_expires_at, migration_id)",
+    "create index if not exists grit_migration_sessions_destination_idx
+        on grit_migration_sessions (destination_repository_pk, migration_id)",
     "create table if not exists grit_import_trusted_objects (
         tenant_id text not null,
         repository_id text not null,
@@ -642,6 +711,224 @@ pub struct PgCacheOutboxClaim {
     pub attempts: u32,
 }
 
+/// Stable phase of a resumable repository migration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PgMigrationPhase {
+    /// Validate the source, destination, and migration inputs.
+    Preflight,
+    /// Capture the source state that bounds the initial copy.
+    Snapshot,
+    /// Copy immutable payloads and their repository metadata.
+    BulkTransfer,
+    /// The resumable initial migration finished successfully.
+    InitialCopyComplete,
+}
+
+impl PgMigrationPhase {
+    const fn code(self) -> i16 {
+        match self {
+            Self::Preflight => 1,
+            Self::Snapshot => 2,
+            Self::BulkTransfer => 3,
+            Self::InitialCopyComplete => 4,
+        }
+    }
+
+    fn from_code(code: i16) -> Result<Self> {
+        match code {
+            1 => Ok(Self::Preflight),
+            2 => Ok(Self::Snapshot),
+            3 => Ok(Self::BulkTransfer),
+            4 => Ok(Self::InitialCopyComplete),
+            _ => Err(Error::Backend(format!(
+                "invalid migration phase code {code}"
+            ))),
+        }
+    }
+}
+
+/// Durable lifecycle state of a resumable migration session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PgMigrationState {
+    /// The session can be claimed and resumed.
+    Active,
+    /// The session stopped because migration work failed.
+    Failed,
+    /// An operator or caller cancelled the session.
+    Cancelled,
+}
+
+impl PgMigrationState {
+    const fn code(self) -> i16 {
+        match self {
+            Self::Active => 1,
+            Self::Failed => 2,
+            Self::Cancelled => 3,
+        }
+    }
+
+    fn from_code(code: i16) -> Result<Self> {
+        match code {
+            1 => Ok(Self::Active),
+            2 => Ok(Self::Failed),
+            3 => Ok(Self::Cancelled),
+            _ => Err(Error::Backend(format!(
+                "invalid migration state code {code}"
+            ))),
+        }
+    }
+}
+
+/// Typed source identity for a resumable migration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PgMigrationSource {
+    /// Another repository stored in the same PostgreSQL control plane.
+    Repository(RepositoryPk),
+    /// A caller-defined external source descriptor.
+    External(String),
+}
+
+/// Cursor after the last fully durable object in bytewise object-ID order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgMigrationObjectCursor {
+    /// Object identifier at the trusted boundary.
+    pub oid: ObjectId,
+}
+
+/// Cursor after the last fully durable ref in bytewise name order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgMigrationRefCursor {
+    /// Full source ref name at the trusted boundary.
+    pub name: String,
+}
+
+/// Cursor after the last fully indexed tree in bytewise object-ID order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgMigrationTreeCursor {
+    /// Tree identifier at the trusted boundary.
+    pub oid: ObjectId,
+}
+
+/// Cursor after the last fully durable pack in bytewise checksum order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgMigrationPackCursor {
+    /// Pack checksum at the trusted boundary.
+    pub checksum: ObjectId,
+}
+
+/// Durable, monotonic progress recorded at a trusted migration boundary.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PgMigrationCheckpoint {
+    /// Last fully durable object, if the phase has an object cursor.
+    pub object: Option<PgMigrationObjectCursor>,
+    /// Last fully durable ref name, if the phase has a ref cursor.
+    pub reference: Option<PgMigrationRefCursor>,
+    /// Last fully indexed tree, if the phase has a tree cursor.
+    pub tree: Option<PgMigrationTreeCursor>,
+    /// Last fully durable pack checksum, if the phase has a pack cursor.
+    pub pack: Option<PgMigrationPackCursor>,
+    /// Number of fully durable objects.
+    pub completed_objects: u64,
+    /// Number of fully durable refs.
+    pub completed_refs: u64,
+    /// Number of fully indexed trees.
+    pub completed_trees: u64,
+    /// Number of fully durable packs.
+    pub completed_packs: u64,
+    /// Number of fully durable payload bytes.
+    pub completed_bytes: u64,
+}
+
+/// One durable resumable migration session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgMigrationSession {
+    /// Database-assigned migration identifier.
+    pub migration_id: u64,
+    /// Caller-provided key used to make creation idempotent.
+    pub idempotency_key: String,
+    /// Stable source identity.
+    pub source: PgMigrationSource,
+    /// Destination repository receiving migrated data.
+    pub destination_repository: RepositoryPk,
+    /// Object hash algorithm shared by the source and destination.
+    pub hash_algo: HashAlgo,
+    /// Current resumable phase.
+    pub phase: PgMigrationPhase,
+    /// Current durable lifecycle state.
+    pub state: PgMigrationState,
+    /// Most recently issued fencing token, or zero before the first claim.
+    pub fencing_token: u64,
+    /// Current worker identity, if leased.
+    pub claimed_by: Option<String>,
+    /// Exclusive end of the current lease, if leased.
+    pub lease_expires_at: Option<OffsetDateTime>,
+    /// Number of claims issued for this session.
+    pub attempt_count: u32,
+    /// Latest trusted checkpoint.
+    pub checkpoint: PgMigrationCheckpoint,
+    /// Failure or cancellation reason for a terminal session.
+    pub terminal_reason: Option<String>,
+    /// Caller-supplied creation timestamp.
+    pub created_at: OffsetDateTime,
+    /// Caller-supplied timestamp of the latest durable mutation.
+    pub updated_at: OffsetDateTime,
+}
+
+/// Inputs used to create an idempotent resumable migration session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgMigrationCreateOptions {
+    /// Stable non-empty idempotency key.
+    pub idempotency_key: String,
+    /// Stable source identity.
+    pub source: PgMigrationSource,
+    /// Destination repository receiving migrated data.
+    pub destination_repository: RepositoryPk,
+    /// Object hash algorithm shared by the source and destination.
+    pub hash_algo: HashAlgo,
+    /// Explicit creation and initial update timestamp.
+    pub created_at: OffsetDateTime,
+}
+
+/// Explicit worker and lease timestamps for claiming one migration session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgMigrationClaimOptions {
+    /// Stable non-empty worker identity.
+    pub worker_id: String,
+    /// Caller-observed time used to expire an earlier lease.
+    pub observed_at: OffsetDateTime,
+    /// Caller-selected exclusive end of the new lease.
+    pub lease_expires_at: OffsetDateTime,
+    /// Maximum sessions returned, in `1..=`[`MAX_MIGRATION_CLAIM_BATCH`].
+    pub max_sessions: usize,
+}
+
+/// A resumable migration lease fenced from every earlier claim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgMigrationClaim {
+    /// Latest durable session state at claim time.
+    pub session: PgMigrationSession,
+    /// Worker identity owning this lease.
+    pub worker_id: String,
+    /// Fresh monotonic fencing token.
+    pub fencing_token: u64,
+    /// Exclusive end of this lease.
+    pub lease_expires_at: OffsetDateTime,
+}
+
+/// Outcome of an owned migration-session mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PgMigrationClaimResult {
+    /// The requested durable mutation was applied.
+    Applied,
+    /// The session is no longer owned by this claim or its lease expired.
+    ClaimLost,
+    /// The session already failed, was cancelled, or completed its initial copy.
+    Terminal,
+}
+
+/// Maximum migration sessions leased by one PostgreSQL claim call.
+pub const MAX_MIGRATION_CLAIM_BATCH: usize = 256;
+
 /// Idempotent outcome of acknowledging, releasing, or retrying an outbox claim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PgCacheOutboxClaimResult {
@@ -955,6 +1242,365 @@ impl PgServerStorage {
     #[must_use]
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Create or read the migration session identified by an idempotency key.
+    ///
+    /// Reusing a key with a different source, destination, or hash algorithm is rejected. The
+    /// destination and an internal source must name live repository rows, and the destination's
+    /// stored hash algorithm must match `options.hash_algo`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Backend`] for invalid or conflicting options, or a SQLx error when the
+    /// durable session cannot be read or created.
+    pub async fn create_migration_session(
+        &self,
+        options: PgMigrationCreateOptions,
+    ) -> Result<PgMigrationSession> {
+        validate_migration_create_options(&options)?;
+        let mut tx = self.pool.begin().await?;
+        let destination_hash = sqlx::query_scalar::<_, String>(
+            "select hash_algo from grit_repositories
+             where repository_pk = $1 and deleted_at is null
+             for key share",
+        )
+        .bind(options.destination_repository.get())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            Error::Backend("migration destination repository does not exist".to_owned())
+        })?;
+        if destination_hash != options.hash_algo.name() {
+            return Err(Error::Backend(
+                "migration destination hash algorithm does not match".to_owned(),
+            ));
+        }
+        let (source_repository_pk, source_external_id) = match &options.source {
+            PgMigrationSource::Repository(repository_pk) => {
+                if *repository_pk == options.destination_repository {
+                    return Err(Error::Backend(
+                        "migration source and destination repositories must differ".to_owned(),
+                    ));
+                }
+                let source_hash = sqlx::query_scalar::<_, String>(
+                    "select hash_algo from grit_repositories
+                     where repository_pk = $1 and deleted_at is null
+                     for key share",
+                )
+                .bind(repository_pk.get())
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| {
+                    Error::Backend("migration source repository does not exist".to_owned())
+                })?;
+                if source_hash != options.hash_algo.name() {
+                    return Err(Error::Backend(
+                        "migration source hash algorithm does not match".to_owned(),
+                    ));
+                }
+                (Some(repository_pk.get()), None)
+            }
+            PgMigrationSource::External(identity) => (None, Some(identity.as_str())),
+        };
+        let inserted = sqlx::query(
+            "insert into grit_migration_sessions
+                (idempotency_key, source_repository_pk, source_external_id,
+                 destination_repository_pk, hash_algo, phase, state, created_at, updated_at)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+             on conflict (idempotency_key) do nothing
+             returning *",
+        )
+        .bind(&options.idempotency_key)
+        .bind(source_repository_pk)
+        .bind(source_external_id)
+        .bind(options.destination_repository.get())
+        .bind(options.hash_algo.name())
+        .bind(PgMigrationPhase::Preflight.code())
+        .bind(PgMigrationState::Active.code())
+        .bind(options.created_at)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let row = match inserted {
+            Some(row) => row,
+            None => {
+                sqlx::query("select * from grit_migration_sessions where idempotency_key = $1")
+                    .bind(&options.idempotency_key)
+                    .fetch_one(&mut *tx)
+                    .await?
+            }
+        };
+        let session = row_to_migration_session(&row)?;
+        if session.source != options.source
+            || session.destination_repository != options.destination_repository
+            || session.hash_algo != options.hash_algo
+        {
+            return Err(Error::Backend(
+                "migration idempotency key belongs to different immutable inputs".to_owned(),
+            ));
+        }
+        tx.commit().await?;
+        Ok(session)
+    }
+
+    /// Read one durable migration session by its database-assigned identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Backend`] when `migration_id` exceeds PostgreSQL's integer range or a
+    /// stored row is invalid, and propagates SQLx read failures.
+    pub async fn read_migration_session(
+        &self,
+        migration_id: u64,
+    ) -> Result<Option<PgMigrationSession>> {
+        let migration_id = positive_u64_to_i64(migration_id, "migration id")?;
+        let row = sqlx::query("select * from grit_migration_sessions where migration_id = $1")
+            .bind(migration_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(row_to_migration_session).transpose()
+    }
+
+    /// Claim a bounded oldest-first batch of active migration sessions.
+    ///
+    /// PostgreSQL skips rows locked by other workers. Expired leases may be reclaimed, and every
+    /// claim receives a fresh database fencing token. Initial-copy-complete and terminal sessions
+    /// are never selected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Backend`] for invalid options or stored rows, and propagates SQLx failures.
+    pub async fn claim_migration_sessions(
+        &self,
+        options: PgMigrationClaimOptions,
+    ) -> Result<Vec<PgMigrationClaim>> {
+        validate_migration_claim_options(&options)?;
+        let max_sessions = i64::try_from(options.max_sessions)
+            .map_err(|_| Error::Backend("migration claim bound exceeds i64".to_owned()))?;
+        let rows = sqlx::query(
+            "with candidates as (
+                 select migration_id from grit_migration_sessions
+                 where state = 1 and phase < 4
+                   and updated_at <= $2
+                   and (claimed_by is null or lease_expires_at <= $2)
+                   and attempt_count < 2147483647
+                 order by phase, migration_id
+                 limit $4 for update skip locked
+             )
+             update grit_migration_sessions session
+             set claimed_by = $1,
+                 fencing_token = nextval('grit_migration_fencing_token_seq'),
+                 lease_expires_at = $3,
+                 attempt_count = session.attempt_count + 1,
+                 updated_at = $2
+             from candidates
+             where session.migration_id = candidates.migration_id
+             returning session.*",
+        )
+        .bind(&options.worker_id)
+        .bind(options.observed_at)
+        .bind(options.lease_expires_at)
+        .bind(max_sessions)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut claims = rows
+            .iter()
+            .map(|row| {
+                let session = row_to_migration_session(row)?;
+                migration_claim_from_session(session)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        claims.sort_unstable_by_key(|claim| claim.session.migration_id);
+        Ok(claims)
+    }
+
+    /// Persist a monotonic checkpoint while retaining the current lease.
+    ///
+    /// `phase` must equal the stored phase or its immediate successor. Entering
+    /// [`PgMigrationPhase::InitialCopyComplete`] releases the lease and makes the session
+    /// terminal within this initial-copy control plane.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Backend`] for invalid timestamps, cursors, counters, or claims, and
+    /// propagates SQLx failures.
+    pub async fn checkpoint_migration_session(
+        &self,
+        claim: &PgMigrationClaim,
+        phase: PgMigrationPhase,
+        checkpoint: &PgMigrationCheckpoint,
+        observed_at: OffsetDateTime,
+    ) -> Result<PgMigrationClaimResult> {
+        validate_migration_claim(claim, observed_at)?;
+        validate_migration_checkpoint(checkpoint, claim.session.hash_algo)?;
+        let migration_id = positive_u64_to_i64(claim.session.migration_id, "migration id")?;
+        let fencing_token = positive_u64_to_i64(claim.fencing_token, "migration fencing token")?;
+        let object = checkpoint
+            .object
+            .as_ref()
+            .map(|cursor| cursor.oid.as_bytes());
+        let reference = checkpoint
+            .reference
+            .as_ref()
+            .map(|cursor| cursor.name.as_str());
+        let tree = checkpoint.tree.as_ref().map(|cursor| cursor.oid.as_bytes());
+        let pack = checkpoint
+            .pack
+            .as_ref()
+            .map(|cursor| cursor.checksum.as_bytes());
+        let counts = checkpoint_counts(checkpoint)?;
+        let rows = sqlx::query(
+            "update grit_migration_sessions
+             set phase = $5, last_object_oid = $6, last_ref_name = $7,
+                 last_tree_oid = $8, last_pack_checksum = $9,
+                 completed_objects = $10, completed_refs = $11,
+                 completed_trees = $12, completed_packs = $13, completed_bytes = $14,
+                 claimed_by = case when $5 = 4 then null else claimed_by end,
+                 lease_expires_at = case when $5 = 4 then null else lease_expires_at end,
+                 updated_at = $4
+             where migration_id = $1 and claimed_by = $2 and fencing_token = $3
+               and state = 1 and phase < 4 and lease_expires_at > $4 and updated_at <= $4
+               and ($5 = phase or $5 = phase + 1)
+               and (($6::bytea is null and last_object_oid is null)
+                    or ($6 is not null and (last_object_oid is null or last_object_oid <= $6)))
+               and (($7::text is null and last_ref_name is null)
+                    or ($7 is not null and (last_ref_name is null
+                        or last_ref_name collate \"C\" <= $7 collate \"C\")))
+               and (($8::bytea is null and last_tree_oid is null)
+                    or ($8 is not null and (last_tree_oid is null or last_tree_oid <= $8)))
+               and (($9::bytea is null and last_pack_checksum is null)
+                    or ($9 is not null and (last_pack_checksum is null or last_pack_checksum <= $9)))
+               and completed_objects <= $10 and completed_refs <= $11
+               and completed_trees <= $12 and completed_packs <= $13
+               and completed_bytes <= $14",
+        )
+        .bind(migration_id)
+        .bind(&claim.worker_id)
+        .bind(fencing_token)
+        .bind(observed_at)
+        .bind(phase.code())
+        .bind(object)
+        .bind(reference)
+        .bind(tree)
+        .bind(pack)
+        .bind(counts[0])
+        .bind(counts[1])
+        .bind(counts[2])
+        .bind(counts[3])
+        .bind(counts[4])
+        .execute(&self.pool)
+        .await?;
+        self.migration_mutation_result(migration_id, rows.rows_affected())
+            .await
+    }
+
+    /// Release an owned migration session for immediate reclaim.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Backend`] for an invalid claim or timestamp, and propagates SQLx failures.
+    pub async fn release_migration_session(
+        &self,
+        claim: &PgMigrationClaim,
+        observed_at: OffsetDateTime,
+    ) -> Result<PgMigrationClaimResult> {
+        self.finish_migration_session(claim, observed_at, PgMigrationFinish::Release)
+            .await
+    }
+
+    /// Mark an owned migration session as failed with an actionable reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Backend`] for an invalid claim, timestamp, or reason, and propagates SQLx
+    /// failures.
+    pub async fn fail_migration_session(
+        &self,
+        claim: &PgMigrationClaim,
+        observed_at: OffsetDateTime,
+        reason: &str,
+    ) -> Result<PgMigrationClaimResult> {
+        self.finish_migration_session(claim, observed_at, PgMigrationFinish::Fail(reason))
+            .await
+    }
+
+    /// Mark an owned migration session as cancelled with an operator reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Backend`] for an invalid claim, timestamp, or reason, and propagates SQLx
+    /// failures.
+    pub async fn cancel_migration_session(
+        &self,
+        claim: &PgMigrationClaim,
+        observed_at: OffsetDateTime,
+        reason: &str,
+    ) -> Result<PgMigrationClaimResult> {
+        self.finish_migration_session(claim, observed_at, PgMigrationFinish::Cancel(reason))
+            .await
+    }
+
+    async fn finish_migration_session(
+        &self,
+        claim: &PgMigrationClaim,
+        observed_at: OffsetDateTime,
+        finish: PgMigrationFinish<'_>,
+    ) -> Result<PgMigrationClaimResult> {
+        validate_migration_claim(claim, observed_at)?;
+        let migration_id = positive_u64_to_i64(claim.session.migration_id, "migration id")?;
+        let fencing_token = positive_u64_to_i64(claim.fencing_token, "migration fencing token")?;
+        let (state, reason) = match finish {
+            PgMigrationFinish::Release => (PgMigrationState::Active, None),
+            PgMigrationFinish::Fail(reason) => {
+                validate_migration_terminal_reason(reason)?;
+                (PgMigrationState::Failed, Some(reason))
+            }
+            PgMigrationFinish::Cancel(reason) => {
+                validate_migration_terminal_reason(reason)?;
+                (PgMigrationState::Cancelled, Some(reason))
+            }
+        };
+        let rows = sqlx::query(
+            "update grit_migration_sessions
+             set state = $5, terminal_reason = $6, claimed_by = null,
+                 lease_expires_at = null, updated_at = $4
+             where migration_id = $1 and claimed_by = $2 and fencing_token = $3
+               and state = 1 and phase < 4 and lease_expires_at > $4 and updated_at <= $4",
+        )
+        .bind(migration_id)
+        .bind(&claim.worker_id)
+        .bind(fencing_token)
+        .bind(observed_at)
+        .bind(state.code())
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+        self.migration_mutation_result(migration_id, rows.rows_affected())
+            .await
+    }
+
+    async fn migration_mutation_result(
+        &self,
+        migration_id: i64,
+        rows_affected: u64,
+    ) -> Result<PgMigrationClaimResult> {
+        if rows_affected == 1 {
+            return Ok(PgMigrationClaimResult::Applied);
+        }
+        let row =
+            sqlx::query("select phase, state from grit_migration_sessions where migration_id = $1")
+                .bind(migration_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some(row) = row else {
+            return Ok(PgMigrationClaimResult::ClaimLost);
+        };
+        let phase = PgMigrationPhase::from_code(row.try_get("phase")?)?;
+        let state = PgMigrationState::from_code(row.try_get("state")?)?;
+        if state != PgMigrationState::Active || phase == PgMigrationPhase::InitialCopyComplete {
+            return Ok(PgMigrationClaimResult::Terminal);
+        }
+        Ok(PgMigrationClaimResult::ClaimLost)
     }
 
     /// Claim a bounded oldest-first batch of durable cache invalidation events.
@@ -2868,6 +3514,330 @@ enum PgCacheOutboxFinish {
     Acknowledge,
     Release,
     Retry(OffsetDateTime),
+}
+
+enum PgMigrationFinish<'a> {
+    Release,
+    Fail(&'a str),
+    Cancel(&'a str),
+}
+
+fn validate_migration_create_options(options: &PgMigrationCreateOptions) -> Result<()> {
+    if options.idempotency_key.trim().is_empty() || options.idempotency_key.len() > 256 {
+        return Err(Error::Backend(
+            "migration idempotency key must contain 1 to 256 bytes".to_owned(),
+        ));
+    }
+    if let PgMigrationSource::External(identity) = &options.source {
+        if identity.trim().is_empty() || identity.len() > 1_024 {
+            return Err(Error::Backend(
+                "external migration source identity must contain 1 to 1024 bytes".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_migration_claim_options(options: &PgMigrationClaimOptions) -> Result<()> {
+    if options.worker_id.trim().is_empty() || options.worker_id.len() > 256 {
+        return Err(Error::Backend(
+            "migration worker identity must contain 1 to 256 bytes".to_owned(),
+        ));
+    }
+    if options.max_sessions == 0 || options.max_sessions > MAX_MIGRATION_CLAIM_BATCH {
+        return Err(Error::Backend(format!(
+            "migration claim batch must be between 1 and {MAX_MIGRATION_CLAIM_BATCH}"
+        )));
+    }
+    if options.lease_expires_at <= options.observed_at {
+        return Err(Error::Backend(
+            "migration lease expiry must be after the observed time".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_migration_claim(claim: &PgMigrationClaim, observed_at: OffsetDateTime) -> Result<()> {
+    if claim.session.migration_id == 0
+        || claim.fencing_token == 0
+        || claim.session.attempt_count == 0
+        || claim.worker_id.trim().is_empty()
+        || claim.worker_id.len() > 256
+    {
+        return Err(Error::Backend(
+            "migration claim identifiers, attempt count, and worker must be valid".to_owned(),
+        ));
+    }
+    if claim.session.state != PgMigrationState::Active
+        || claim.session.phase == PgMigrationPhase::InitialCopyComplete
+        || claim.session.fencing_token != claim.fencing_token
+        || claim.session.claimed_by.as_deref() != Some(claim.worker_id.as_str())
+        || claim.session.lease_expires_at != Some(claim.lease_expires_at)
+    {
+        return Err(Error::Backend(
+            "migration claim does not match its session lease".to_owned(),
+        ));
+    }
+    if observed_at < claim.session.updated_at || observed_at >= claim.lease_expires_at {
+        return Err(Error::Backend(
+            "migration mutation time must be within the current lease".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_migration_checkpoint(
+    checkpoint: &PgMigrationCheckpoint,
+    hash_algo: HashAlgo,
+) -> Result<()> {
+    if checkpoint
+        .object
+        .as_ref()
+        .is_some_and(|cursor| cursor.oid.algo() != hash_algo)
+        || checkpoint
+            .tree
+            .as_ref()
+            .is_some_and(|cursor| cursor.oid.algo() != hash_algo)
+        || checkpoint
+            .pack
+            .as_ref()
+            .is_some_and(|cursor| cursor.checksum.algo() != hash_algo)
+    {
+        return Err(Error::Backend(
+            "migration checkpoint digest has the wrong hash algorithm".to_owned(),
+        ));
+    }
+    if checkpoint
+        .reference
+        .as_ref()
+        .is_some_and(|cursor| cursor.name.trim().is_empty() || cursor.name.len() > 1_024)
+    {
+        return Err(Error::Backend(
+            "migration ref cursor must contain 1 to 1024 bytes".to_owned(),
+        ));
+    }
+    let _ = checkpoint_counts(checkpoint)?;
+    Ok(())
+}
+
+fn validate_migration_terminal_reason(reason: &str) -> Result<()> {
+    if reason.trim().is_empty() || reason.len() > 4_096 {
+        return Err(Error::Backend(
+            "migration terminal reason must contain 1 to 4096 bytes".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn checkpoint_counts(checkpoint: &PgMigrationCheckpoint) -> Result<[i64; 5]> {
+    [
+        checkpoint.completed_objects,
+        checkpoint.completed_refs,
+        checkpoint.completed_trees,
+        checkpoint.completed_packs,
+        checkpoint.completed_bytes,
+    ]
+    .map(|value| {
+        i64::try_from(value)
+            .map_err(|_| Error::Backend("migration checkpoint counter exceeds i64".to_owned()))
+    })
+    .into_iter()
+    .collect::<Result<Vec<_>>>()?
+    .try_into()
+    .map_err(|_| Error::Backend("migration checkpoint counter shape is invalid".to_owned()))
+}
+
+fn positive_u64_to_i64(value: u64, field: &str) -> Result<i64> {
+    if value == 0 {
+        return Err(Error::Backend(format!("{field} must be positive")));
+    }
+    i64::try_from(value).map_err(|_| Error::Backend(format!("{field} exceeds i64")))
+}
+
+fn migration_claim_from_session(session: PgMigrationSession) -> Result<PgMigrationClaim> {
+    let worker_id = session
+        .claimed_by
+        .clone()
+        .ok_or_else(|| Error::Backend("claimed migration session has no worker".to_owned()))?;
+    let lease_expires_at = session.lease_expires_at.ok_or_else(|| {
+        Error::Backend("claimed migration session has no lease expiry".to_owned())
+    })?;
+    if session.fencing_token == 0 || session.attempt_count == 0 {
+        return Err(Error::Backend(
+            "claimed migration session has invalid fencing metadata".to_owned(),
+        ));
+    }
+    Ok(PgMigrationClaim {
+        worker_id,
+        fencing_token: session.fencing_token,
+        lease_expires_at,
+        session,
+    })
+}
+
+fn row_to_migration_session(row: &sqlx::postgres::PgRow) -> Result<PgMigrationSession> {
+    let migration_id = nonnegative_i64_to_u64(row.try_get("migration_id")?, "migration id")?;
+    if migration_id == 0 {
+        return Err(Error::Backend("migration id must be positive".to_owned()));
+    }
+    let source = match (
+        row.try_get::<Option<i64>, _>("source_repository_pk")?,
+        row.try_get::<Option<String>, _>("source_external_id")?,
+    ) {
+        (Some(repository_pk), None) => PgMigrationSource::Repository(
+            RepositoryPk::try_from(repository_pk)
+                .map_err(|error| Error::Backend(error.to_string()))?,
+        ),
+        (None, Some(identity)) if !identity.trim().is_empty() && identity.len() <= 1_024 => {
+            PgMigrationSource::External(identity)
+        }
+        _ => {
+            return Err(Error::Backend(
+                "invalid migration source identity".to_owned(),
+            ))
+        }
+    };
+    let hash_algo_name: String = row.try_get("hash_algo")?;
+    let hash_algo = HashAlgo::from_name(&hash_algo_name).ok_or_else(|| {
+        Error::Backend(format!(
+            "unknown migration hash algorithm '{hash_algo_name}'"
+        ))
+    })?;
+    let object = row
+        .try_get::<Option<Vec<u8>>, _>("last_object_oid")?
+        .map(|bytes| ObjectId::from_bytes(&bytes).map(|oid| PgMigrationObjectCursor { oid }))
+        .transpose()?;
+    let tree = row
+        .try_get::<Option<Vec<u8>>, _>("last_tree_oid")?
+        .map(|bytes| ObjectId::from_bytes(&bytes).map(|oid| PgMigrationTreeCursor { oid }))
+        .transpose()?;
+    let pack = row
+        .try_get::<Option<Vec<u8>>, _>("last_pack_checksum")?
+        .map(|bytes| {
+            ObjectId::from_bytes(&bytes).map(|checksum| PgMigrationPackCursor { checksum })
+        })
+        .transpose()?;
+    if object
+        .as_ref()
+        .is_some_and(|cursor| cursor.oid.algo() != hash_algo)
+        || tree
+            .as_ref()
+            .is_some_and(|cursor| cursor.oid.algo() != hash_algo)
+        || pack
+            .as_ref()
+            .is_some_and(|cursor| cursor.checksum.algo() != hash_algo)
+    {
+        return Err(Error::Backend(
+            "stored migration cursor has the wrong hash algorithm".to_owned(),
+        ));
+    }
+    let claimed_by = row.try_get::<Option<String>, _>("claimed_by")?;
+    let lease_expires_at = row.try_get::<Option<OffsetDateTime>, _>("lease_expires_at")?;
+    if claimed_by.is_some() != lease_expires_at.is_some() {
+        return Err(Error::Backend(
+            "stored migration lease columns disagree".to_owned(),
+        ));
+    }
+    let idempotency_key: String = row.try_get("idempotency_key")?;
+    if idempotency_key.trim().is_empty() || idempotency_key.len() > 256 {
+        return Err(Error::Backend(
+            "stored migration idempotency key is invalid".to_owned(),
+        ));
+    }
+    let reference = row
+        .try_get::<Option<String>, _>("last_ref_name")?
+        .map(|name| {
+            if name.trim().is_empty() || name.len() > 1_024 {
+                return Err(Error::Backend(
+                    "stored migration ref cursor is invalid".to_owned(),
+                ));
+            }
+            Ok(PgMigrationRefCursor { name })
+        })
+        .transpose()?;
+    let terminal_reason: Option<String> = row.try_get("terminal_reason")?;
+    let state = PgMigrationState::from_code(row.try_get("state")?)?;
+    match (state, terminal_reason.as_deref()) {
+        (PgMigrationState::Active, None) => {}
+        (PgMigrationState::Failed | PgMigrationState::Cancelled, Some(reason)) => {
+            validate_migration_terminal_reason(reason)?;
+        }
+        _ => {
+            return Err(Error::Backend(
+                "stored migration terminal state is invalid".to_owned(),
+            ));
+        }
+    }
+    let created_at: OffsetDateTime = row.try_get("created_at")?;
+    let updated_at: OffsetDateTime = row.try_get("updated_at")?;
+    if updated_at < created_at {
+        return Err(Error::Backend(
+            "stored migration timestamps are not monotonic".to_owned(),
+        ));
+    }
+    let session = PgMigrationSession {
+        migration_id,
+        idempotency_key,
+        source,
+        destination_repository: RepositoryPk::try_from(
+            row.try_get::<i64, _>("destination_repository_pk")?,
+        )
+        .map_err(|error| Error::Backend(error.to_string()))?,
+        hash_algo,
+        phase: PgMigrationPhase::from_code(row.try_get("phase")?)?,
+        state,
+        fencing_token: nonnegative_i64_to_u64(
+            row.try_get("fencing_token")?,
+            "migration fencing token",
+        )?,
+        claimed_by,
+        lease_expires_at,
+        attempt_count: u32::try_from(row.try_get::<i32, _>("attempt_count")?)
+            .map_err(|_| Error::Backend("migration attempt count is negative".to_owned()))?,
+        checkpoint: PgMigrationCheckpoint {
+            object,
+            reference,
+            tree,
+            pack,
+            completed_objects: nonnegative_i64_to_u64(
+                row.try_get("completed_objects")?,
+                "completed migration objects",
+            )?,
+            completed_refs: nonnegative_i64_to_u64(
+                row.try_get("completed_refs")?,
+                "completed migration refs",
+            )?,
+            completed_trees: nonnegative_i64_to_u64(
+                row.try_get("completed_trees")?,
+                "completed migration trees",
+            )?,
+            completed_packs: nonnegative_i64_to_u64(
+                row.try_get("completed_packs")?,
+                "completed migration packs",
+            )?,
+            completed_bytes: nonnegative_i64_to_u64(
+                row.try_get("completed_bytes")?,
+                "completed migration bytes",
+            )?,
+        },
+        terminal_reason,
+        created_at,
+        updated_at,
+    };
+    if session.claimed_by.is_some()
+        && (session.state != PgMigrationState::Active
+            || session.phase == PgMigrationPhase::InitialCopyComplete
+            || session.fencing_token == 0
+            || session.attempt_count == 0
+            || session
+                .lease_expires_at
+                .is_some_and(|lease_expires_at| lease_expires_at <= session.updated_at))
+    {
+        return Err(Error::Backend(
+            "stored migration lease is invalid".to_owned(),
+        ));
+    }
+    Ok(session)
 }
 
 fn validate_cache_outbox_claim_options(options: &PgCacheOutboxClaimOptions) -> Result<()> {
