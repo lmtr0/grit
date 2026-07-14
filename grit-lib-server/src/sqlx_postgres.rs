@@ -116,6 +116,19 @@ pub const MIGRATIONS: &[&str] = &[
         size bigint,
         primary key (tenant_id, repository_id, tree_oid, path)
     )",
+    "create table if not exists grit_tree_blocks (
+        repository_pk bigint not null,
+        tree_oid bytea not null,
+        format_version smallint not null,
+        entry_count bigint not null,
+        data bytea not null,
+        primary key (repository_pk, tree_oid),
+        constraint grit_tree_blocks_repository_fk foreign key (repository_pk)
+            references grit_repositories (repository_pk) on delete cascade,
+        check (octet_length(tree_oid) in (20, 32)),
+        check (format_version between 1 and 255),
+        check (entry_count between 0 and 4294967295)
+    )",
     "create table if not exists grit_commits (
         tenant_id text not null,
         repository_id text not null,

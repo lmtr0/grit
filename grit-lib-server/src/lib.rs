@@ -29,6 +29,7 @@ pub mod s3_byte_store;
 #[cfg(feature = "sqlx-postgres")]
 pub mod sqlx_postgres;
 pub mod storage;
+pub mod tree_block;
 pub mod views;
 
 /// Commonly used server-layer types.
@@ -86,6 +87,10 @@ pub mod prelude {
         ImportSession, ImportStateStore, ImportedPack, IndexedCommit, ObjectStore, PackMetadata,
         PackObjectIndex, PackStore, PackedObject, RefStore, ReflogEntry, ReflogStore, RepackPlan,
         StoredObject, StoredPack, StoredRef,
+    };
+    pub use crate::tree_block::{
+        decode_tree_block, encode_tree_block, TreeBlockEntry, TreeBlockError,
+        TREE_BLOCK_FORMAT_VERSION,
     };
     pub use crate::views::{
         BlobContentDelivery, BlobContentView, BlobDownloadOptions, BlobDownloadView,
