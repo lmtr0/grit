@@ -1973,11 +1973,39 @@ impl ObjectStore for PgServerStorage {
         else {
             return Ok(None);
         };
+        const PACK_OBJECT_HEADER_SLACK: u64 = 64;
+        let range_len = index
+            .compressed_size
+            .checked_add(PACK_OBJECT_HEADER_SLACK)
+            .ok_or_else(|| Error::Backend("pack object range length overflow".to_owned()))?;
+        let range = self
+            .read_pack_range(
+                tenant,
+                repository,
+                &metadata.pack_checksum,
+                index.offset,
+                range_len,
+            )
+            .await?
+            .ok_or_else(|| Error::Backend("pack index points at missing pack data".to_owned()))?;
+        match crate::packfile::read_object_from_pack_range(&range, oid, index.offset, oid.algo()) {
+            Ok(object) => return Ok(Some(object)),
+            Err(Error::Protocol(_)) => {}
+            Err(error) => return Err(error),
+        }
         let data = self
             .read_pack_data(tenant, repository, &metadata.pack_checksum)
             .await?
             .ok_or_else(|| Error::Backend("pack index points at missing pack data".to_owned()))?;
-        crate::packfile::read_object_at_offset(&data, index.offset, oid.algo()).map(Some)
+        let object = crate::packfile::read_object_at_offset(&data, index.offset, oid.algo())?;
+        if object.object_id(oid.algo()) != *oid {
+            return Err(Error::Protocol(format!(
+                "pack object at offset {} does not match expected object {}",
+                index.offset,
+                oid.to_hex()
+            )));
+        }
+        Ok(Some(object))
     }
 
     async fn write_object(
@@ -2759,6 +2787,55 @@ impl PackStore for PgServerStorage {
         .bind(tenant.as_str())
         .bind(repository.as_str())
         .bind(bytes_to_hex(pack_checksum))
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let data: Option<Vec<u8>> = row.try_get("data")?;
+        if let Some(data) = data {
+            return Ok(Some(data));
+        }
+        let storage_backend: String = row.try_get("storage_backend")?;
+        let storage_key: Option<String> = row.try_get("storage_key")?;
+        Err(Error::Backend(format!(
+            "pack {} is stored in external backend {} at {}; use externalized storage",
+            bytes_to_hex(pack_checksum),
+            storage_backend,
+            storage_key.unwrap_or_else(|| "<missing key>".to_owned())
+        )))
+    }
+
+    async fn read_pack_range(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        pack_checksum: &[u8],
+        start: u64,
+        len: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        start
+            .checked_add(len)
+            .ok_or_else(|| Error::Backend("pack range overflow".to_owned()))?;
+        // PostgreSQL's bytea substring arguments are int4, while bytea values are bounded below
+        // that range. Capping larger validated requests preserves beyond-end/through-end slicing.
+        let position = start
+            .checked_add(1)
+            .and_then(|position| i32::try_from(position).ok())
+            .unwrap_or(i32::MAX);
+        let len = i32::try_from(len).unwrap_or(i32::MAX);
+
+        let row = sqlx::query(
+            "select substring(data from $4 for $5) as data, storage_backend, storage_key
+             from grit_packs
+             where tenant_id = $1 and repository_id = $2 and pack_checksum = $3",
+        )
+        .bind(tenant.as_str())
+        .bind(repository.as_str())
+        .bind(bytes_to_hex(pack_checksum))
+        .bind(position)
+        .bind(len)
         .fetch_optional(&self.pool)
         .await?;
 
