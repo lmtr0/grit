@@ -6,6 +6,7 @@
 use async_trait::async_trait;
 use grit_lib::objects::{HashAlgo, ObjectId, ObjectKind};
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
+use std::collections::HashMap;
 use time::OffsetDateTime;
 
 use crate::error::{Error, Result};
@@ -1593,33 +1594,84 @@ async fn upsert_tree_entries_in_transaction(
     repository: &RepositoryId,
     entries: &[IndexedTreeEntry],
 ) -> Result<()> {
+    let values = prepare_tree_entry_values(entries)?;
     lock_import_repository(tx, tenant, repository).await?;
-    for entry in entries {
-        let size = entry
-            .size
-            .map(i64::try_from)
-            .transpose()
-            .map_err(|_| Error::Backend("tree entry size exceeds i64".to_owned()))?;
-        sqlx::query(
+    insert_tree_entries_in_transaction(tx, tenant, repository, entries, &values).await
+}
+
+#[derive(Clone, Copy)]
+struct PgTreeEntryValues {
+    mode: i32,
+    size: Option<i64>,
+}
+
+fn prepare_tree_entry_values(entries: &[IndexedTreeEntry]) -> Result<Vec<PgTreeEntryValues>> {
+    entries
+        .iter()
+        .map(|entry| {
+            let mode = i32::try_from(entry.mode)
+                .map_err(|_| Error::Backend("tree entry mode exceeds i32".to_owned()))?;
+            let size = entry
+                .size
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| Error::Backend("tree entry size exceeds i64".to_owned()))?;
+            Ok(PgTreeEntryValues { mode, size })
+        })
+        .collect()
+}
+
+async fn insert_tree_entries_in_transaction(
+    tx: &mut Transaction<'static, Postgres>,
+    tenant: &TenantId,
+    repository: &RepositoryId,
+    entries: &[IndexedTreeEntry],
+    values: &[PgTreeEntryValues],
+) -> Result<()> {
+    const POSTGRES_BIND_LIMIT: usize = 65_535;
+    const BINDS_PER_ROW: usize = 8;
+    let rows_per_chunk = POSTGRES_BIND_LIMIT / BINDS_PER_ROW;
+    let chunk_capacity = rows_per_chunk.min(entries.len());
+    let mut final_rows = HashMap::with_capacity(chunk_capacity);
+    let mut final_row_indexes = Vec::with_capacity(chunk_capacity);
+    for (entry_chunk, value_chunk) in entries
+        .chunks(rows_per_chunk)
+        .zip(values.chunks(rows_per_chunk))
+    {
+        // PostgreSQL cannot update the same conflict target twice in one statement. Keep the
+        // final occurrence in each chunk to preserve the previous row-at-a-time semantics.
+        final_rows.clear();
+        for (index, entry) in entry_chunk.iter().enumerate() {
+            final_rows.insert((entry.tree_oid, entry.path.as_str()), index);
+        }
+        final_row_indexes.clear();
+        final_row_indexes.extend(final_rows.values().copied());
+        final_row_indexes.sort_unstable();
+
+        let mut query = QueryBuilder::<Postgres>::new(
             "insert into grit_tree_entries
-                (tenant_id, repository_id, tree_oid, path, mode, oid, kind, size)
-             values ($1, $2, $3, $4, $5, $6, $7, $8)
-             on conflict (tenant_id, repository_id, tree_oid, path)
-             do update set mode = excluded.mode,
-                           oid = excluded.oid,
-                           kind = excluded.kind,
-                           size = excluded.size",
-        )
-        .bind(tenant.as_str())
-        .bind(repository.as_str())
-        .bind(entry.tree_oid.to_hex())
-        .bind(&entry.path)
-        .bind(entry.mode as i32)
-        .bind(entry.oid.to_hex())
-        .bind(kind_to_name(entry.kind))
-        .bind(size)
-        .execute(&mut **tx)
-        .await?;
+                (tenant_id, repository_id, tree_oid, path, mode, oid, kind, size) ",
+        );
+        query.push_values(final_row_indexes.iter().copied(), |mut row, index| {
+            let entry = &entry_chunk[index];
+            let value = value_chunk[index];
+            row.push_bind(tenant.as_str())
+                .push_bind(repository.as_str())
+                .push_bind(entry.tree_oid.to_hex())
+                .push_bind(entry.path.as_str())
+                .push_bind(value.mode)
+                .push_bind(entry.oid.to_hex())
+                .push_bind(kind_to_name(entry.kind))
+                .push_bind(value.size);
+        });
+        query.push(
+            " on conflict (tenant_id, repository_id, tree_oid, path)
+              do update set mode = excluded.mode,
+                            oid = excluded.oid,
+                            kind = excluded.kind,
+                            size = excluded.size",
+        );
+        query.build().persistent(false).execute(&mut **tx).await?;
     }
     Ok(())
 }
@@ -2114,9 +2166,10 @@ impl BrowseIndex for PgServerStorage {
         repository: &RepositoryId,
         entries: &[IndexedTreeEntry],
     ) -> Result<()> {
+        let values = prepare_tree_entry_values(entries)?;
         let mut tx = self.pool.begin().await?;
         lock_import_repository(&mut tx, tenant, repository).await?;
-        upsert_tree_entries_in_transaction(&mut tx, tenant, repository, entries).await?;
+        insert_tree_entries_in_transaction(&mut tx, tenant, repository, entries, &values).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -2127,6 +2180,7 @@ impl BrowseIndex for PgServerStorage {
         repository: &RepositoryId,
         entries: &[IndexedTreeEntry],
     ) -> Result<()> {
+        let values = prepare_tree_entry_values(entries)?;
         let mut tx = self.pool.begin().await?;
         lock_import_repository(&mut tx, tenant, repository).await?;
         sqlx::query(
@@ -2137,7 +2191,7 @@ impl BrowseIndex for PgServerStorage {
         .bind(repository.as_str())
         .execute(&mut *tx)
         .await?;
-        upsert_tree_entries_in_transaction(&mut tx, tenant, repository, entries).await?;
+        insert_tree_entries_in_transaction(&mut tx, tenant, repository, entries, &values).await?;
         tx.commit().await?;
         Ok(())
     }
