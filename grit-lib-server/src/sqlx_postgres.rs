@@ -13,9 +13,9 @@ use crate::error::{Error, Result};
 use crate::ids::{RepositoryId, TenantId};
 use crate::storage::{
     BrowseIndex, CommitGraphStore, ConfigStore, ImportPublication, ImportPublicationResult,
-    ImportSession, ImportStateStore, IndexedCommit, IndexedTreeEntry, ObjectStore, PackMetadata,
-    PackObjectIndex, PackStore, RefStore, ReflogEntry, ReflogStore, StoredObject, StoredPack,
-    StoredRef,
+    ImportSession, ImportStateStore, ImportedPack, IndexedCommit, IndexedTreeEntry, ObjectStore,
+    PackMetadata, PackObjectIndex, PackStore, RefStore, ReflogEntry, ReflogStore, StoredObject,
+    StoredPack, StoredRef,
 };
 
 /// SQL migration statements for the initial server storage schema.
@@ -1682,10 +1682,31 @@ async fn write_pack_in_transaction(
     repository: &RepositoryId,
     pack: &StoredPack,
 ) -> Result<PackMetadata> {
-    let values = prepare_pack_values(pack)?;
-    let pack_checksum = bytes_to_hex(&pack.metadata.pack_checksum);
-    let index_checksum = bytes_to_hex(&pack.metadata.index_checksum);
+    let values = prepare_pack_values(&pack.metadata, pack.data.len(), &pack.index)?;
     lock_import_repository(tx, tenant, repository).await?;
+    install_database_pack_in_transaction(
+        tx,
+        tenant,
+        repository,
+        &pack.metadata,
+        pack.data.as_slice(),
+        &pack.index,
+        &values,
+    )
+    .await
+}
+
+async fn install_database_pack_in_transaction(
+    tx: &mut Transaction<'static, Postgres>,
+    tenant: &TenantId,
+    repository: &RepositoryId,
+    metadata: &PackMetadata,
+    data: &[u8],
+    index: &[PackObjectIndex],
+    values: &PgPackValues,
+) -> Result<PackMetadata> {
+    let pack_checksum = bytes_to_hex(&metadata.pack_checksum);
+    let index_checksum = bytes_to_hex(&metadata.index_checksum);
     let row = sqlx::query(
         "insert into grit_packs
             (tenant_id, repository_id, pack_checksum, index_checksum, data,
@@ -1693,17 +1714,27 @@ async fn write_pack_in_transaction(
          values ($1, $2, $3, $4, $5, $6, $7)
          on conflict (tenant_id, repository_id, pack_checksum)
          do update set pack_checksum = excluded.pack_checksum
+         where grit_packs.storage_backend = 'database'
+           and grit_packs.storage_key is null
+           and grit_packs.data = excluded.data
+           and grit_packs.object_count = excluded.object_count
+           and grit_packs.size_bytes = excluded.size_bytes
          returning pack_checksum, index_checksum, object_count, size_bytes, storage_order",
     )
     .bind(tenant.as_str())
     .bind(repository.as_str())
     .bind(&pack_checksum)
     .bind(&index_checksum)
-    .bind(&pack.data)
+    .bind(data)
     .bind(values.object_count)
     .bind(values.size_bytes)
-    .fetch_one(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await?;
+    let row = row.ok_or_else(|| {
+        Error::Protocol(format!(
+            "stored pack {pack_checksum} conflicts with imported bytes or metadata"
+        ))
+    })?;
 
     sqlx::query(
         "delete from grit_pack_objects
@@ -1717,8 +1748,7 @@ async fn write_pack_in_transaction(
 
     const POSTGRES_BIND_LIMIT: usize = 65_535;
     const BINDS_PER_ROW: usize = 8;
-    for (entry_chunk, value_chunk) in pack
-        .index
+    for (entry_chunk, value_chunk) in index
         .chunks(POSTGRES_BIND_LIMIT / BINDS_PER_ROW)
         .zip(values.index.chunks(POSTGRES_BIND_LIMIT / BINDS_PER_ROW))
     {
@@ -1758,22 +1788,25 @@ struct PgPackIndexValues {
     compressed_size: i64,
 }
 
-fn prepare_pack_values(pack: &StoredPack) -> Result<PgPackValues> {
-    if usize::try_from(pack.metadata.object_count).ok() != Some(pack.index.len()) {
+fn prepare_pack_values(
+    metadata: &PackMetadata,
+    data_len: usize,
+    index_rows: &[PackObjectIndex],
+) -> Result<PgPackValues> {
+    if usize::try_from(metadata.object_count).ok() != Some(index_rows.len()) {
         return Err(Error::Protocol(
             "pack metadata object count does not match its index".to_owned(),
         ));
     }
-    if u64::try_from(pack.data.len()).ok() != Some(pack.metadata.size_bytes) {
+    if u64::try_from(data_len).ok() != Some(metadata.size_bytes) {
         return Err(Error::Protocol(
             "pack metadata size does not match its bytes".to_owned(),
         ));
     }
-    let hash_bytes = pack.metadata.pack_checksum.len();
+    let hash_bytes = metadata.pack_checksum.len();
     if !matches!(hash_bytes, 20 | 32)
-        || pack.metadata.index_checksum.len() != hash_bytes
-        || pack
-            .index
+        || metadata.index_checksum.len() != hash_bytes
+        || index_rows
             .iter()
             .any(|entry| entry.oid.as_bytes().len() != hash_bytes)
     {
@@ -1782,15 +1815,15 @@ fn prepare_pack_values(pack: &StoredPack) -> Result<PgPackValues> {
         ));
     }
 
-    let object_count = i32::try_from(pack.metadata.object_count)
+    let object_count = i32::try_from(metadata.object_count)
         .map_err(|_| Error::Backend("pack object count exceeds i32".to_owned()))?;
-    let size_bytes = i64::try_from(pack.metadata.size_bytes)
+    let size_bytes = i64::try_from(metadata.size_bytes)
         .map_err(|_| Error::Backend("pack size exceeds i64".to_owned()))?;
 
-    let mut seen_oids = HashSet::with_capacity(pack.index.len());
-    let mut seen_offsets = HashSet::with_capacity(pack.index.len());
-    let mut index = Vec::with_capacity(pack.index.len());
-    for entry in &pack.index {
+    let mut seen_oids = HashSet::with_capacity(index_rows.len());
+    let mut seen_offsets = HashSet::with_capacity(index_rows.len());
+    let mut index = Vec::with_capacity(index_rows.len());
+    for entry in index_rows {
         if !seen_oids.insert(entry.oid) || !seen_offsets.insert(entry.offset) {
             return Err(Error::Protocol(
                 "pack index contains duplicate object ids or offsets".to_owned(),
@@ -1814,6 +1847,44 @@ fn prepare_pack_values(pack: &StoredPack) -> Result<PgPackValues> {
         size_bytes,
         index,
     })
+}
+
+struct PreparedImportedPack {
+    pack: ImportedPack,
+    values: PgPackValues,
+}
+
+fn prepare_imported_pack_batch(
+    packs: Vec<ImportedPack>,
+) -> Result<(Vec<PreparedImportedPack>, Vec<usize>)> {
+    let mut checksum_indexes = HashMap::<Vec<u8>, usize>::with_capacity(packs.len());
+    let mut prepared = Vec::<PreparedImportedPack>::with_capacity(packs.len());
+    let mut result_indexes = Vec::with_capacity(packs.len());
+    for pack in packs {
+        let values = prepare_pack_values(&pack.metadata, pack.data.len(), &pack.index)?;
+        if let Some(&existing_index) = checksum_indexes.get(&pack.metadata.pack_checksum) {
+            if !imported_pack_contents_match(&prepared[existing_index].pack, &pack) {
+                return Err(Error::Protocol(
+                    "imported pack batch contains conflicting duplicate checksums".to_owned(),
+                ));
+            }
+            result_indexes.push(existing_index);
+            continue;
+        }
+
+        let index = prepared.len();
+        checksum_indexes.insert(pack.metadata.pack_checksum.clone(), index);
+        prepared.push(PreparedImportedPack { pack, values });
+        result_indexes.push(index);
+    }
+    Ok((prepared, result_indexes))
+}
+
+fn imported_pack_contents_match(left: &ImportedPack, right: &ImportedPack) -> bool {
+    left.metadata.object_count == right.metadata.object_count
+        && left.metadata.size_bytes == right.metadata.size_bytes
+        && left.data == right.data
+        && left.index == right.index
 }
 
 #[async_trait]
@@ -2607,6 +2678,43 @@ impl CommitGraphStore for PgServerStorage {
 
 #[async_trait]
 impl PackStore for PgServerStorage {
+    fn supports_native_pack_import(&self) -> bool {
+        true
+    }
+
+    async fn write_imported_packs(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        packs: Vec<ImportedPack>,
+    ) -> Result<Vec<PackMetadata>> {
+        let (prepared, result_indexes) = prepare_imported_pack_batch(packs)?;
+        let mut tx = self.pool.begin().await?;
+        lock_import_repository(&mut tx, tenant, repository).await?;
+
+        let mut unique_metadata = Vec::with_capacity(prepared.len());
+        for prepared_pack in &prepared {
+            unique_metadata.push(
+                install_database_pack_in_transaction(
+                    &mut tx,
+                    tenant,
+                    repository,
+                    &prepared_pack.pack.metadata,
+                    prepared_pack.pack.data.as_slice(),
+                    &prepared_pack.pack.index,
+                    &prepared_pack.values,
+                )
+                .await?,
+            );
+        }
+        tx.commit().await?;
+
+        Ok(result_indexes
+            .into_iter()
+            .map(|index| unique_metadata[index].clone())
+            .collect())
+    }
+
     async fn write_pack(
         &self,
         tenant: &TenantId,
