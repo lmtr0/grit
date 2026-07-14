@@ -7,7 +7,7 @@ use flate2::{Decompress, FlushDecompress, Status};
 use grit_lib::objects::{HashAlgo, ObjectId, ObjectKind};
 
 use crate::protocol::pack_writer::PackWriterError;
-use crate::storage::PackMetadata;
+use crate::storage::{PackMetadata, StoredObject};
 
 /// Maximum encoded PACK entry header accepted from a validated source pack.
 pub const MAX_REUSED_ENTRY_HEADER_BYTES: usize = 16;
@@ -103,6 +103,7 @@ pub struct ValidatedPackEntry {
     kind: StoredPackEntryKind,
     declared_size: u64,
     result_size: u64,
+    result_oid: ObjectId,
     compressed: Arc<[u8]>,
 }
 
@@ -118,7 +119,8 @@ impl ValidatedPackEntry {
     ///
     /// Returns a typed error for checksum width, source bounds, header type/size disagreement,
     /// malformed or over-budget compressed/delta data, or checked arithmetic failure.
-    pub fn from_prevalidated_pack(
+    #[allow(dead_code)]
+    pub(crate) fn from_prevalidated_pack(
         pack: &PackMetadata,
         hash_algo: HashAlgo,
         source_offset: u64,
@@ -127,6 +129,7 @@ impl ValidatedPackEntry {
         kind: StoredPackEntryKind,
         declared_size: u64,
         result_size: u64,
+        result_oid: ObjectId,
         compressed: Arc<[u8]>,
     ) -> Result<Self, PackEntrySourceError> {
         let trailer_len = hash_algo.len();
@@ -145,6 +148,9 @@ impl ValidatedPackEntry {
         }
         if compressed.is_empty() {
             return Err(PackEntrySourceError::EmptyCompressedStream);
+        }
+        if result_oid.algo() != hash_algo || result_oid.is_zero() {
+            return Err(PackEntrySourceError::TypeMismatch);
         }
         let (type_code, encoded_size, consumed) = decode_source_header(source_header)?;
         if consumed != source_header.len() {
@@ -213,6 +219,7 @@ impl ValidatedPackEntry {
             kind,
             declared_size,
             result_size,
+            result_oid,
             compressed,
         })
     }
@@ -227,6 +234,23 @@ impl ValidatedPackEntry {
     #[must_use]
     pub const fn source_offset(&self) -> u64 {
         self.source_offset
+    }
+
+    /// Return the validated source representation kind and resolved delta dependency.
+    #[must_use]
+    pub const fn kind(&self) -> StoredPackEntryKind {
+        self.kind
+    }
+
+    pub(crate) fn matches_result(&self, oid: ObjectId, object: &StoredObject) -> bool {
+        self.result_oid == oid
+            && self.result_oid.algo() == oid.algo()
+            && u64::try_from(object.data.len()).ok() == Some(self.result_size)
+            && match self.kind {
+                StoredPackEntryKind::Direct(kind) => kind == object.kind,
+                StoredPackEntryKind::RefDelta { result_kind, .. }
+                | StoredPackEntryKind::OfsDelta { result_kind, .. } => result_kind == object.kind,
+            }
     }
 }
 
@@ -243,8 +267,17 @@ impl PackDependencySet {
         Self::default()
     }
 
+    /// Record one object after its entry header has been emitted in the outgoing pack.
+    pub(crate) fn record_outgoing(&mut self, oid: ObjectId, output_offset: u64) {
+        self.outgoing_offsets.entry(oid).or_insert(output_offset);
+    }
+
     fn outgoing_offset(&self, oid: &ObjectId) -> Option<u64> {
         self.outgoing_offsets.get(oid).copied()
+    }
+
+    pub(crate) fn outgoing_offset_for(&self, oid: &ObjectId) -> Option<u64> {
+        self.outgoing_offset(oid)
     }
 }
 
