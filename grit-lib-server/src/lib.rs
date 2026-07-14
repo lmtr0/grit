@@ -132,6 +132,12 @@ pub mod prelude {
         IncrementalPackWriter, PackObjectWriteReport, PackWriterError, PackWriterFailure,
         PackWriterReport, PackWriterState,
     };
+    pub use crate::protocol::push_metrics::{
+        PushBackendFailureReason, PushBackendMetrics, PushCancellationReason, PushMemoryMetrics,
+        PushMetricCounter, PushMetricsError, PushMetricsRecorder, PushMetricsReport, PushOutcome,
+        PushPackMetrics, PushPhase, PushPhaseMetrics, PushQuarantineMetrics, PushRejectionReason,
+        ReceivePackLimitError, ReceivePackLimitKind, ReceivePackLimits,
+    };
     pub use crate::protocol::receive_pack::{
         AllowAllPushPolicy, ProtectedRefPolicy, PushCommandKind, PushCommandStatus, PushPlan,
         PushPolicy, PushPolicyContext, QuarantinedObject, ReceivePackAdvertisedRef,
