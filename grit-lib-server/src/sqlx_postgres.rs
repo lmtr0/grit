@@ -246,6 +246,91 @@ pub const MIGRATIONS: &[&str] = &[
          );
        end loop;
      end $$",
+    "do $$
+     declare column_mapping record;
+     begin
+       for column_mapping in
+         select * from (values
+           ('grit_objects', 'oid', 'oid_bytes',
+            'grit_objects_pk_oid_bytes_idx', 'grit_objects_oid_bytes_width'),
+           ('grit_refs', 'target_oid', 'target_oid_bytes',
+            'grit_refs_pk_target_oid_bytes_idx', 'grit_refs_target_oid_bytes_width'),
+           ('grit_reflog', 'old_oid', 'old_oid_bytes',
+            'grit_reflog_pk_old_oid_bytes_idx', 'grit_reflog_old_oid_bytes_width'),
+           ('grit_reflog', 'new_oid', 'new_oid_bytes',
+            'grit_reflog_pk_new_oid_bytes_idx', 'grit_reflog_new_oid_bytes_width'),
+           ('grit_tree_entries', 'tree_oid', 'tree_oid_bytes',
+            'grit_trees_pk_tree_oid_bytes_idx', 'grit_trees_tree_oid_bytes_width'),
+           ('grit_tree_entries', 'oid', 'oid_bytes',
+            'grit_trees_pk_oid_bytes_idx', 'grit_trees_oid_bytes_width'),
+           ('grit_commits', 'commit_oid', 'commit_oid_bytes',
+            'grit_commits_pk_commit_oid_bytes_idx', 'grit_commits_commit_oid_bytes_width'),
+           ('grit_commits', 'tree_oid', 'tree_oid_bytes',
+            'grit_commits_pk_tree_oid_bytes_idx', 'grit_commits_tree_oid_bytes_width'),
+           ('grit_commit_parents', 'commit_oid', 'commit_oid_bytes',
+            'grit_parents_pk_commit_oid_bytes_idx', 'grit_parents_commit_oid_bytes_width'),
+           ('grit_commit_parents', 'parent_oid', 'parent_oid_bytes',
+            'grit_parents_pk_parent_oid_bytes_idx', 'grit_parents_parent_oid_bytes_width'),
+           ('grit_import_trusted_objects', 'oid', 'oid_bytes',
+            'grit_trusted_pk_oid_bytes_idx', 'grit_trusted_oid_bytes_width'),
+           ('grit_packs', 'pack_checksum', 'pack_checksum_bytes',
+            'grit_packs_pk_pack_checksum_bytes_idx', 'grit_packs_pack_checksum_bytes_width'),
+           ('grit_packs', 'index_checksum', 'index_checksum_bytes',
+            'grit_packs_pk_index_checksum_bytes_idx', 'grit_packs_index_checksum_bytes_width'),
+           ('grit_pack_objects', 'pack_checksum', 'pack_checksum_bytes',
+            'grit_pack_objects_pk_pack_bytes_idx', 'grit_pack_objects_pack_bytes_width'),
+           ('grit_pack_objects', 'oid', 'oid_bytes',
+            'grit_pack_objects_pk_oid_bytes_idx', 'grit_pack_objects_oid_bytes_width')
+         ) as mapping(
+           table_name,
+           source_column,
+           binary_column,
+           index_name,
+           constraint_name
+         )
+       loop
+         if not exists (
+           select 1 from pg_attribute
+           where attrelid = to_regclass(column_mapping.table_name)
+             and attname = column_mapping.binary_column
+             and not attisdropped
+         ) then
+           execute format(
+             'alter table %I add column %I bytea
+                generated always as (decode(%I, ''hex'')) stored',
+             column_mapping.table_name,
+             column_mapping.binary_column,
+             column_mapping.source_column
+           );
+         end if;
+
+         if not exists (
+           select 1 from pg_constraint
+           where conrelid = to_regclass(column_mapping.table_name)
+             and conname = column_mapping.constraint_name
+         ) then
+           execute format(
+             'alter table %I add constraint %I
+                check (%I is null or octet_length(%I) in (20, 32)) not valid',
+             column_mapping.table_name,
+             column_mapping.constraint_name,
+             column_mapping.binary_column,
+             column_mapping.binary_column
+           );
+         end if;
+         execute format(
+           'alter table %I validate constraint %I',
+           column_mapping.table_name,
+           column_mapping.constraint_name
+         );
+         execute format(
+           'create index if not exists %I on %I (repository_pk, %I)',
+           column_mapping.index_name,
+           column_mapping.table_name,
+           column_mapping.binary_column
+         );
+       end loop;
+     end $$",
     "create index if not exists grit_repositories_listing_idx
         on grit_repositories (tenant_id, archived_at, repository_id)
         where deleted_at is null",
