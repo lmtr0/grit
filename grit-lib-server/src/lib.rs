@@ -93,6 +93,11 @@ pub mod prelude {
         CanonicalCloneServeError, CanonicalCloneServeOptions, CanonicalCloneServeReport,
         DEFAULT_CANONICAL_CLONE_RANGE_BYTES,
     };
+    pub use crate::protocol::clone_admission::{
+        abort_admitted_clone, CloneAdmissionCost, CloneAdmissionError, CloneAdmissionRequest,
+        CloneAdmissionScheduler, CloneAdmissionTicket, CloneExecutionPermit, CloneQueueLimits,
+        CloneQueueWorkBudget, CloneQueueWorkLimit, CloneScheduleDecision,
+    };
     pub use crate::protocol::clone_metrics::{
         CloneBackendKind, CloneBackendMetrics, CloneCacheMetrics, CloneCancellationMetrics,
         CloneLimitError, CloneLimits, CloneMemoryMetrics, CloneMetricsRecorder, CloneMetricsReport,

@@ -2,6 +2,7 @@
 
 pub mod canonical_clone;
 pub mod canonical_clone_serve;
+pub mod clone_admission;
 pub mod clone_metrics;
 pub mod delta_pack;
 pub mod negotiation;
