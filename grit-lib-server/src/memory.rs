@@ -11,6 +11,10 @@ use grit_lib::pack::{PackIndex, PackIndexEntry};
 use crate::cache::{Cache, CacheKey, CacheValue, EventPublisher, InvalidationEvent};
 use crate::error::{Error, Result};
 use crate::ids::{RepositoryId, TenantId};
+use crate::protocol::memory_pack_promotion::{
+    canonical_promoted_object_id, MemoryPackPromotionError, MemoryPackPromotionReceipt,
+    MemoryPackPromotionStage,
+};
 use crate::storage::{
     commit_time_from_identity, BrowseIndex, CommitGraphStore, ConfigStore, ImportPublication,
     ImportPublicationResult, ImportSession, ImportStateStore, ImportedPack, IndexedCommit,
@@ -44,8 +48,18 @@ struct RepoState {
 
 #[derive(Default)]
 struct MemoryPackState {
+    repository_generation: u64,
+    storage_order: u64,
     by_checksum: HashMap<Vec<u8>, Arc<MemoryPack>>,
     newest_by_oid: HashMap<ObjectId, PackLocation>,
+    promotion_receipts: HashMap<MemoryPromotionKey, MemoryPackPromotionReceipt>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct MemoryPromotionKey {
+    quarantine_id: crate::protocol::push_quarantine::QuarantineId,
+    quarantine_generation: u64,
+    prepared_fingerprint: ObjectId,
 }
 
 struct MemoryPack {
@@ -76,7 +90,6 @@ struct PreparedMemoryPack {
 pub struct MemoryBackend {
     repositories: RwLock<HashMap<TenantId, HashMap<RepositoryId, Arc<RepoState>>>>,
     import_sequence: RwLock<u64>,
-    pack_sequence: RwLock<u64>,
     events: RwLock<Vec<InvalidationEvent>>,
 }
 
@@ -98,6 +111,17 @@ impl ImportStateStore for MemoryBackend {
             *sequence
         };
         let repo = self.repo_state(tenant, repository)?;
+        let repository_generation = {
+            let mut packs = repo
+                .packs
+                .write()
+                .map_err(|_| Error::Backend("memory pack lock poisoned".to_owned()))?;
+            packs.repository_generation = packs
+                .repository_generation
+                .checked_add(1)
+                .ok_or_else(|| Error::Backend("repository generation overflow".to_owned()))?;
+            packs.repository_generation
+        };
         let mut state = repo
             .import
             .write()
@@ -112,10 +136,7 @@ impl ImportStateStore for MemoryBackend {
             Vec::new()
         };
         trusted_objects.sort_by_key(|(oid, _)| *oid);
-        state.generation = state
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| Error::Backend("import generation overflow".to_owned()))?;
+        state.generation = repository_generation;
         state.complete = false;
         state.published = false;
         state.token = token;
@@ -247,6 +268,147 @@ impl MemoryBackend {
             .map_err(|_| Error::Backend("memory event log lock poisoned".to_owned()))
     }
 
+    /// Return the repository generation to bind into a prepared memory push snapshot.
+    ///
+    /// The first observation initializes generation one. Import starts advance the same value,
+    /// causing any previously prepared pack promotion to fail its under-lock recheck.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error when repository or pack-state locking fails.
+    pub fn push_repository_generation(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+    ) -> Result<u64> {
+        let repo = self.repo_state(tenant, repository)?;
+        let mut packs = repo
+            .packs
+            .write()
+            .map_err(|_| Error::Backend("memory pack lock poisoned".to_owned()))?;
+        if packs.repository_generation == 0 {
+            packs.repository_generation = 1;
+        }
+        Ok(packs.repository_generation)
+    }
+
+    pub(crate) fn install_staged_push_pack(
+        &self,
+        stage: MemoryPackPromotionStage,
+    ) -> std::result::Result<MemoryPackPromotionReceipt, MemoryPackPromotionError> {
+        let prepared =
+            Self::prepare_memory_pack(stage.pack).map_err(|_| MemoryPackPromotionError::Backend)?;
+        let object_count = prepared.metadata.object_count;
+        let repo = self
+            .existing_repo_state(&stage.tenant, &stage.repository)
+            .map_err(|_| MemoryPackPromotionError::Backend)?
+            .ok_or(MemoryPackPromotionError::StaleGeneration)?;
+        let loose_objects = repo
+            .objects
+            .read()
+            .map_err(|_| MemoryPackPromotionError::Backend)?;
+        for entry in &prepared.entries {
+            let Some(loose) = loose_objects.get(&entry.oid) else {
+                continue;
+            };
+            if entry.kind != loose.kind
+                || canonical_promoted_object_id(entry.kind, &loose.data, entry.oid.algo())?
+                    != entry.oid
+            {
+                return Err(MemoryPackPromotionError::Collision);
+            }
+        }
+        let mut packs = repo
+            .packs
+            .write()
+            .map_err(|_| MemoryPackPromotionError::Backend)?;
+        if packs.repository_generation != stage.repository_generation {
+            return Err(MemoryPackPromotionError::StaleGeneration);
+        }
+        let key = MemoryPromotionKey {
+            quarantine_id: stage.quarantine_id,
+            quarantine_generation: stage.quarantine_generation,
+            prepared_fingerprint: stage.prepared_fingerprint,
+        };
+        if let Some(receipt) = packs.promotion_receipts.get(&key) {
+            if receipt.tenant() == &stage.tenant
+                && receipt.repository() == &stage.repository
+                && receipt.quarantine_id() == stage.quarantine_id
+                && receipt.quarantine_generation() == stage.quarantine_generation
+                && receipt.prepared_fingerprint() == stage.prepared_fingerprint
+                && receipt.pack_checksum() == stage.pack_checksum
+                && receipt.index_checksum() == stage.index_checksum
+                && receipt.repository_generation() == stage.repository_generation
+                && receipt.object_count() == object_count
+            {
+                return Ok(receipt.clone());
+            }
+            return Err(MemoryPackPromotionError::Collision);
+        }
+
+        let existing = packs
+            .by_checksum
+            .get(stage.pack_checksum.as_bytes())
+            .cloned();
+        if let Some(existing) = &existing {
+            let metadata_matches = existing.metadata.index_checksum
+                == stage.index_checksum.as_bytes()
+                && existing.metadata.object_count == prepared.metadata.object_count
+                && existing.metadata.size_bytes == prepared.metadata.size_bytes;
+            if !metadata_matches
+                || existing.data.as_slice() != prepared.data.as_slice()
+                || existing.entries != prepared.entries
+            {
+                return Err(MemoryPackPromotionError::Collision);
+            }
+        }
+        if prepared.entries.iter().any(|entry| {
+            packs
+                .newest_by_oid
+                .get(&entry.oid)
+                .map(|location| &location.pack.entries[location.entry_index])
+                .is_some_and(|current| current.kind != entry.kind || current.size != entry.size)
+        }) {
+            return Err(MemoryPackPromotionError::Collision);
+        }
+        packs
+            .promotion_receipts
+            .try_reserve(1)
+            .map_err(|_| MemoryPackPromotionError::Allocation)?;
+        if existing.is_none() {
+            packs
+                .by_checksum
+                .try_reserve(1)
+                .map_err(|_| MemoryPackPromotionError::Allocation)?;
+            packs
+                .newest_by_oid
+                .try_reserve(prepared.entries.len())
+                .map_err(|_| MemoryPackPromotionError::Allocation)?;
+        }
+
+        let deduplicated = existing.is_some();
+        if !deduplicated {
+            let storage_order = Self::reserve_pack_orders(&mut packs, 1)
+                .map_err(|_| MemoryPackPromotionError::Backend)?;
+            Self::install_prepared_pack(&mut packs, prepared, storage_order);
+        }
+        let receipt = MemoryPackPromotionReceipt::new(
+            stage.tenant,
+            stage.repository,
+            stage.quarantine_id,
+            stage.quarantine_generation,
+            stage.repository_generation,
+            stage.pack_checksum,
+            stage.index_checksum,
+            stage.prepared_fingerprint,
+            object_count,
+            deduplicated,
+        );
+        packs.promotion_receipts.insert(key, receipt.clone());
+        drop(loose_objects);
+        Ok(receipt)
+    }
+
     fn repo_state(&self, tenant: &TenantId, repository: &RepositoryId) -> Result<Arc<RepoState>> {
         if let Some(state) = self
             .repositories
@@ -325,21 +487,15 @@ impl MemoryBackend {
         }))
     }
 
-    fn next_pack_order(&self) -> Result<u64> {
-        self.reserve_pack_orders(1)
-    }
-
-    fn reserve_pack_orders(&self, count: usize) -> Result<u64> {
-        let mut sequence = self
-            .pack_sequence
-            .write()
-            .map_err(|_| Error::Backend("memory pack sequence lock poisoned".to_owned()))?;
+    fn reserve_pack_orders(packs: &mut MemoryPackState, count: usize) -> Result<u64> {
         let count = u64::try_from(count)
             .map_err(|_| Error::Backend("memory pack count exceeds u64".to_owned()))?;
-        let first = sequence
+        let first = packs
+            .storage_order
             .checked_add(1)
             .ok_or_else(|| Error::Backend("memory pack storage order overflow".to_owned()))?;
-        *sequence = sequence
+        packs.storage_order = packs
+            .storage_order
             .checked_add(count)
             .ok_or_else(|| Error::Backend("memory pack storage order overflow".to_owned()))?;
         Ok(first)
@@ -376,6 +532,8 @@ impl MemoryBackend {
             .map(|entry| entry.oid.as_bytes().len())
             .unwrap_or_else(|| metadata.pack_checksum.len());
         if !matches!(hash_bytes, 20 | 32)
+            || metadata.pack_checksum.len() != hash_bytes
+            || metadata.index_checksum.len() != hash_bytes
             || index
                 .iter()
                 .any(|entry| entry.oid.as_bytes().len() != hash_bytes)
@@ -384,8 +542,14 @@ impl MemoryBackend {
                 "pack index mixes incompatible object hash algorithms".to_owned(),
             ));
         }
-        let mut seen_oids = HashSet::with_capacity(index.len());
-        let mut seen_offsets = HashSet::with_capacity(index.len());
+        let mut seen_oids = HashSet::new();
+        seen_oids
+            .try_reserve(index.len())
+            .map_err(|_| Error::Backend("cannot reserve pack OID validation set".to_owned()))?;
+        let mut seen_offsets = HashSet::new();
+        seen_offsets
+            .try_reserve(index.len())
+            .map_err(|_| Error::Backend("cannot reserve pack offset validation set".to_owned()))?;
         if index
             .iter()
             .any(|entry| !seen_oids.insert(entry.oid) || !seen_offsets.insert(entry.offset))
@@ -395,14 +559,21 @@ impl MemoryBackend {
             ));
         }
 
-        let mut decode_entries = index
-            .iter()
-            .map(|entry| PackIndexEntry {
-                oid: entry.oid.as_bytes().to_vec(),
+        let mut decode_entries = Vec::new();
+        decode_entries
+            .try_reserve_exact(index.len())
+            .map_err(|_| Error::Backend("cannot reserve decoded pack index".to_owned()))?;
+        for entry in &index {
+            let mut oid = Vec::new();
+            oid.try_reserve_exact(hash_bytes)
+                .map_err(|_| Error::Backend("cannot reserve pack index OID".to_owned()))?;
+            oid.extend_from_slice(entry.oid.as_bytes());
+            decode_entries.push(PackIndexEntry {
+                oid,
                 offset: entry.offset,
                 crc32: None,
-            })
-            .collect::<Vec<_>>();
+            });
+        }
         decode_entries.sort_by(|left, right| left.oid.cmp(&right.oid));
         let mut fanout = [0u32; 256];
         for entry in &decode_entries {
@@ -1080,7 +1251,7 @@ impl PackStore for MemoryBackend {
         let mut next_order = if new_pack_count == 0 {
             0
         } else {
-            self.reserve_pack_orders(new_pack_count)?
+            Self::reserve_pack_orders(&mut stored, new_pack_count)?
         };
         for pack in prepared {
             if let Some(existing) = stored.by_checksum.get(&pack.metadata.pack_checksum) {
@@ -1108,7 +1279,7 @@ impl PackStore for MemoryBackend {
         if let Some(existing) = packs.by_checksum.get(&prepared.metadata.pack_checksum) {
             return Ok(existing.metadata.clone());
         }
-        let storage_order = self.next_pack_order()?;
+        let storage_order = Self::reserve_pack_orders(&mut packs, 1)?;
         Ok(Self::install_prepared_pack(
             &mut packs,
             prepared,

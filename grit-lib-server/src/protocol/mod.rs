@@ -5,6 +5,7 @@ pub mod canonical_clone_serve;
 pub mod clone_admission;
 pub mod clone_metrics;
 pub mod delta_pack;
+pub mod memory_pack_promotion;
 pub mod negotiation;
 pub mod pack_entry_reuse;
 pub mod pack_stream;

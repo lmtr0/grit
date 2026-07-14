@@ -111,6 +111,10 @@ pub mod prelude {
         GeneratedDeltaPlan, MAX_DELTA_CANDIDATE_COMPARISONS, MAX_DELTA_DEPTH,
         MAX_DELTA_RETAINED_BASE_BYTES, MAX_DELTA_WINDOW, MAX_GENERATED_DELTA_INSTRUCTION_BYTES,
     };
+    pub use crate::protocol::memory_pack_promotion::{
+        promote_memory_push_pack, MemoryPackPromotionError, MemoryPackPromotionLimits,
+        MemoryPackPromotionReceipt,
+    };
     pub use crate::protocol::negotiation::{
         negotiate_bounded, NegotiationCommit, NegotiationCommitParent, NegotiationError,
         NegotiationLimitKind, NegotiationLimits, NegotiationMetadataSource, NegotiationPlan,
