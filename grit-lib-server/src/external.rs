@@ -20,6 +20,22 @@ pub trait ExternalByteStore: Send + Sync {
     /// Returns backend errors from the external byte store.
     async fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<()>;
 
+    /// Store a potentially large immutable value at `key` when the key is not already present.
+    ///
+    /// The default implementation delegates to [`Self::put_if_absent`]. Backends that support
+    /// streaming or multipart uploads can override this method without requiring existing byte
+    /// store implementations to change.
+    ///
+    /// Callers must use immutable, content-addressed keys: an existing key is assumed to identify
+    /// the same content as `bytes`.
+    ///
+    /// # Errors
+    ///
+    /// Returns backend errors from the external byte store.
+    async fn put_large_if_absent(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        self.put_if_absent(key, bytes).await
+    }
+
     /// Read all bytes stored at `key`.
     ///
     /// # Errors

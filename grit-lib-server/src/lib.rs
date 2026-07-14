@@ -78,7 +78,7 @@ pub mod prelude {
     pub use crate::redis_cache::{RedisCache, RedisCacheOptions};
     pub use crate::repository::ServerRepository;
     #[cfg(feature = "s3")]
-    pub use crate::s3_byte_store::S3ByteStore;
+    pub use crate::s3_byte_store::{S3ByteStore, S3MultipartUploadOptions};
     pub use crate::storage::{
         BrowseIndex, CommitGraphStore, ConfigStore, ImportPublication, ImportPublicationResult,
         ImportSession, ImportStateStore, ImportedPack, IndexedCommit, ObjectStore, PackMetadata,

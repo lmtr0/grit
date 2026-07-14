@@ -612,8 +612,6 @@ where
             return self.sql.write_pack(tenant, repository, pack).await;
         }
 
-        let mut tx = self.pool().begin().await?;
-        lock_import_repository(&mut tx, tenant, repository).await?;
         let key = self.pack_key(
             tenant,
             repository,
@@ -623,7 +621,9 @@ where
                 .map(|entry| entry.oid.algo().name())
                 .unwrap_or("sha1"),
         );
-        self.bytes.put_if_absent(&key, &pack.data).await?;
+        self.bytes.put_large_if_absent(&key, &pack.data).await?;
+        let mut tx = self.pool().begin().await?;
+        lock_import_repository(&mut tx, tenant, repository).await?;
         let metadata = write_external_pack_metadata_in_transaction(
             &mut tx,
             tenant,
