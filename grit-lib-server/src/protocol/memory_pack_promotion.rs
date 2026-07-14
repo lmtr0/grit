@@ -94,6 +94,7 @@ pub struct MemoryPackPromotionReceipt {
     index_checksum: ObjectId,
     prepared_fingerprint: ObjectId,
     object_count: u32,
+    size_bytes: u64,
     deduplicated: bool,
 }
 
@@ -109,6 +110,7 @@ impl MemoryPackPromotionReceipt {
         index_checksum: ObjectId,
         prepared_fingerprint: ObjectId,
         object_count: u32,
+        size_bytes: u64,
         deduplicated: bool,
     ) -> Self {
         Self {
@@ -121,6 +123,7 @@ impl MemoryPackPromotionReceipt {
             index_checksum,
             prepared_fingerprint,
             object_count,
+            size_bytes,
             deduplicated,
         }
     }
@@ -177,6 +180,12 @@ impl MemoryPackPromotionReceipt {
     #[must_use]
     pub const fn object_count(&self) -> u32 {
         self.object_count
+    }
+
+    /// Return complete installed PACK bytes.
+    #[must_use]
+    pub const fn size_bytes(&self) -> u64 {
+        self.size_bytes
     }
 
     /// Return whether identical content-addressed pack bytes were already installed.

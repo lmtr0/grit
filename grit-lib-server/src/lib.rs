@@ -150,6 +150,16 @@ pub mod prelude {
         PgPackPromotionObservation, PgPackPromotionReceipt, PgPackPromotionWork,
         PgPackPromotionWorkLimit,
     };
+    pub use crate::protocol::push_atomic_publication::{
+        publish_prepared_push, PromotionReceiptBinding, PushAtomicPublicationBackend,
+        PushAtomicPublicationControl, PushAtomicPublicationError, PushAtomicPublicationLimits,
+        PushAtomicPublicationObservation, PushAtomicPublicationWork,
+        PushAtomicPublicationWorkLimit, PushPromotionReceipt, PushPublicationAudit,
+        PushPublicationBackendError, PushPublicationCommand, PushPublicationCommandOutcome,
+        PushPublicationCommandStatus, PushPublicationOutboxEvent, PushPublicationRejection,
+        PushPublicationReport, PushPublicationTransaction, PushReportStatusVersion,
+        PushStructuralPublicationPrerequisite,
+    };
     pub use crate::protocol::push_fix_thin::{
         plan_fix_thin_pack, rewrite_fix_thin_pack, AuthorizedThinBase, AuthorizedThinBaseProvider,
         FixThinBase, FixThinControl, FixThinError, FixThinObservation, FixThinOptions, FixThinPlan,

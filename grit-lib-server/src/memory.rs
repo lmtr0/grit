@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
+use grit_lib::check_ref_format::{check_refname_format, RefNameOptions};
 use grit_lib::objects::{parse_commit, ObjectId, ObjectKind};
 use grit_lib::pack::{PackIndex, PackIndexEntry};
 
@@ -14,6 +15,12 @@ use crate::ids::{RepositoryId, TenantId};
 use crate::protocol::memory_pack_promotion::{
     canonical_promoted_object_id, MemoryPackPromotionError, MemoryPackPromotionReceipt,
     MemoryPackPromotionStage,
+};
+use crate::protocol::push_atomic_publication::{
+    command_reflog, PromotionReceiptBinding, PushAtomicPublicationBackend, PushPromotionReceipt,
+    PushPublicationAudit, PushPublicationBackendError, PushPublicationCommand,
+    PushPublicationCommandOutcome, PushPublicationCommandStatus, PushPublicationOutboxEvent,
+    PushPublicationRejection, PushPublicationReport, PushPublicationTransaction,
 };
 use crate::storage::{
     commit_time_from_identity, BrowseIndex, CommitGraphStore, ConfigStore, ImportPublication,
@@ -53,6 +60,20 @@ struct MemoryPackState {
     by_checksum: HashMap<Vec<u8>, Arc<MemoryPack>>,
     newest_by_oid: HashMap<ObjectId, PackLocation>,
     promotion_receipts: HashMap<MemoryPromotionKey, MemoryPackPromotionReceipt>,
+    publication_receipts: HashMap<ObjectId, MemoryPublicationRecord>,
+    rejection_audits: HashMap<ObjectId, MemoryRejectionRecord>,
+}
+
+#[derive(Clone)]
+struct MemoryPublicationRecord {
+    transaction: PushPublicationTransaction,
+    report: PushPublicationReport,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct MemoryRejectionRecord {
+    audit: PushPublicationAudit,
+    reason: PushPublicationRejection,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -91,6 +112,7 @@ pub struct MemoryBackend {
     repositories: RwLock<HashMap<TenantId, HashMap<RepositoryId, Arc<RepoState>>>>,
     import_sequence: RwLock<u64>,
     events: RwLock<Vec<InvalidationEvent>>,
+    publication_outbox: RwLock<Vec<PushPublicationOutboxEvent>>,
 }
 
 #[async_trait]
@@ -268,6 +290,18 @@ impl MemoryBackend {
             .map_err(|_| Error::Backend("memory event log lock poisoned".to_owned()))
     }
 
+    /// Return durable publication outbox records in commit order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the outbox lock is poisoned.
+    pub fn publication_outbox(&self) -> Result<Vec<PushPublicationOutboxEvent>> {
+        self.publication_outbox
+            .read()
+            .map(|outbox| outbox.clone())
+            .map_err(|_| Error::Backend("memory publication outbox lock poisoned".to_owned()))
+    }
+
     /// Return the repository generation to bind into a prepared memory push snapshot.
     ///
     /// The first observation initializes generation one. Import starts advance the same value,
@@ -299,6 +333,7 @@ impl MemoryBackend {
         let prepared =
             Self::prepare_memory_pack(stage.pack).map_err(|_| MemoryPackPromotionError::Backend)?;
         let object_count = prepared.metadata.object_count;
+        let size_bytes = prepared.metadata.size_bytes;
         let repo = self
             .existing_repo_state(&stage.tenant, &stage.repository)
             .map_err(|_| MemoryPackPromotionError::Backend)?
@@ -340,6 +375,7 @@ impl MemoryBackend {
                 && receipt.index_checksum() == stage.index_checksum
                 && receipt.repository_generation() == stage.repository_generation
                 && receipt.object_count() == object_count
+                && receipt.size_bytes() == size_bytes
             {
                 return Ok(receipt.clone());
             }
@@ -402,6 +438,7 @@ impl MemoryBackend {
             stage.index_checksum,
             stage.prepared_fingerprint,
             object_count,
+            size_bytes,
             deduplicated,
         );
         packs.promotion_receipts.insert(key, receipt.clone());
@@ -649,6 +686,401 @@ impl MemoryBackend {
             .map(|objects| objects.get(oid).cloned())
             .map_err(|_| Error::Backend("memory object lock poisoned".to_owned()))
     }
+}
+
+#[async_trait]
+impl PushAtomicPublicationBackend for MemoryBackend {
+    async fn publish_transaction(
+        &self,
+        transaction: PushPublicationTransaction,
+    ) -> std::result::Result<PushPublicationReport, PushPublicationBackendError> {
+        let repo = self
+            .existing_repo_state(&transaction.tenant, &transaction.repository)
+            .map_err(|_| PushPublicationBackendError)?
+            .ok_or(PushPublicationBackendError)?;
+        let mut packs = repo
+            .packs
+            .write()
+            .map_err(|_| PushPublicationBackendError)?;
+        if let Some(record) = packs
+            .publication_receipts
+            .get(&transaction.prepared_fingerprint)
+        {
+            if record.transaction == transaction {
+                return Ok(record.report.clone());
+            }
+            return Err(PushPublicationBackendError);
+        }
+        if packs
+            .rejection_audits
+            .contains_key(&transaction.prepared_fingerprint)
+        {
+            return Err(PushPublicationBackendError);
+        }
+        validate_memory_publication_transaction(&transaction)?;
+        let mut refs = repo.refs.write().map_err(|_| PushPublicationBackendError)?;
+        let mut reflogs = repo
+            .reflogs
+            .write()
+            .map_err(|_| PushPublicationBackendError)?;
+        let mut outbox = self
+            .publication_outbox
+            .write()
+            .map_err(|_| PushPublicationBackendError)?;
+
+        let commands = &transaction.commands;
+        let mut lock_order = Vec::new();
+        lock_order
+            .try_reserve_exact(commands.len())
+            .map_err(|_| PushPublicationBackendError)?;
+        lock_order.extend(commands.iter().map(|command| command.refname.as_str()));
+        lock_order.sort_unstable();
+        if lock_order.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(PushPublicationBackendError);
+        }
+
+        let generation_matches = packs.repository_generation == transaction.repository_generation;
+        let promotion_matches = match &transaction.promotion {
+            Some(binding) => memory_promotion_available(&packs, binding),
+            None => true,
+        };
+        let mut statuses = Vec::new();
+        statuses
+            .try_reserve_exact(commands.len())
+            .map_err(|_| PushPublicationBackendError)?;
+        let mut evaluation_refs = refs.clone();
+        for command in commands {
+            let rejection = if !command.policy_allowed {
+                Some(PushPublicationRejection::Policy)
+            } else if !generation_matches {
+                Some(PushPublicationRejection::StaleGeneration)
+            } else if !promotion_matches {
+                Some(PushPublicationRejection::PromotionMissing)
+            } else if !memory_ref_matches(&evaluation_refs, command) {
+                Some(PushPublicationRejection::RefConflict)
+            } else if memory_namespace_conflicts(&evaluation_refs, command) {
+                Some(PushPublicationRejection::RefConflict)
+            } else if !memory_fast_forward_matches(command) {
+                Some(PushPublicationRejection::NonFastForward)
+            } else {
+                None
+            };
+            statuses.push(PushPublicationCommandStatus {
+                ordinal: command.ordinal,
+                refname: command.refname.clone(),
+                kind: command.kind,
+                outcome: rejection.map_or(
+                    PushPublicationCommandOutcome::Applied,
+                    PushPublicationCommandOutcome::Rejected,
+                ),
+            });
+            if rejection.is_none() && !transaction.atomic {
+                apply_memory_ref(&mut evaluation_refs, command);
+            }
+        }
+        let first_rejection = statuses.iter().find_map(|status| match status.outcome {
+            PushPublicationCommandOutcome::Rejected(reason) => Some(reason),
+            PushPublicationCommandOutcome::Applied => None,
+        });
+        if transaction.atomic && first_rejection.is_some() {
+            for status in &mut statuses {
+                if status.outcome == PushPublicationCommandOutcome::Applied {
+                    status.outcome = PushPublicationCommandOutcome::Rejected(
+                        PushPublicationRejection::AtomicAborted,
+                    );
+                }
+            }
+        }
+
+        let mut applied = HashSet::new();
+        applied
+            .try_reserve(statuses.len())
+            .map_err(|_| PushPublicationBackendError)?;
+        applied.extend(statuses.iter().filter_map(|status| {
+            (status.outcome == PushPublicationCommandOutcome::Applied).then_some(status.ordinal)
+        }));
+        let next_generation = if applied.is_empty() {
+            packs.repository_generation
+        } else {
+            packs
+                .repository_generation
+                .checked_add(1)
+                .ok_or(PushPublicationBackendError)?
+        };
+        let mut next_refs = refs.clone();
+        let mut next_reflogs = reflogs.clone();
+        let mut events = Vec::new();
+        events
+            .try_reserve_exact(applied.len().saturating_add(2))
+            .map_err(|_| PushPublicationBackendError)?;
+        for command in commands
+            .iter()
+            .filter(|command| applied.contains(&command.ordinal))
+        {
+            match command.new_oid {
+                Some(new_oid) => {
+                    next_refs.insert(command.refname.clone(), StoredRef::Direct(new_oid));
+                }
+                None => {
+                    next_refs.remove(&command.refname);
+                }
+            }
+            next_reflogs
+                .entry(command.refname.clone())
+                .or_default()
+                .push(command_reflog(
+                    command,
+                    transaction.hash_algo,
+                    &transaction.reflog_identity,
+                    transaction.timestamp,
+                ));
+            events.push(PushPublicationOutboxEvent::RefChanged {
+                refname: command.refname.clone(),
+                deleted: command.new_oid.is_none(),
+            });
+        }
+        if !applied.is_empty() {
+            let mut ordinals = Vec::new();
+            ordinals
+                .try_reserve_exact(applied.len())
+                .map_err(|_| PushPublicationBackendError)?;
+            ordinals.extend(
+                commands
+                    .iter()
+                    .filter(|command| applied.contains(&command.ordinal))
+                    .map(|command| command.ordinal),
+            );
+            events.push(PushPublicationOutboxEvent::PostReceive { ordinals });
+            events.push(PushPublicationOutboxEvent::AcceptedAudit(
+                transaction.audit.clone(),
+            ));
+        } else if let Some(reason) = first_rejection {
+            events.push(PushPublicationOutboxEvent::RejectedAudit {
+                audit: transaction.audit.clone(),
+                reason,
+            });
+        }
+        let report = PushPublicationReport {
+            prepared_fingerprint: transaction.prepared_fingerprint,
+            repository_generation: next_generation,
+            statuses,
+            structural: transaction.structural,
+        };
+        packs
+            .publication_receipts
+            .try_reserve(1)
+            .map_err(|_| PushPublicationBackendError)?;
+        outbox
+            .try_reserve(events.len())
+            .map_err(|_| PushPublicationBackendError)?;
+        let receipt_report = report.clone();
+
+        *refs = next_refs;
+        *reflogs = next_reflogs;
+        packs.repository_generation = next_generation;
+        outbox.extend(events);
+        packs.publication_receipts.insert(
+            transaction.prepared_fingerprint,
+            MemoryPublicationRecord {
+                transaction,
+                report: receipt_report,
+            },
+        );
+        Ok(report)
+    }
+
+    async fn record_rejection(
+        &self,
+        audit: PushPublicationAudit,
+        reason: PushPublicationRejection,
+    ) -> std::result::Result<(), PushPublicationBackendError> {
+        let repo = self
+            .existing_repo_state(&audit.tenant, &audit.repository)
+            .map_err(|_| PushPublicationBackendError)?
+            .ok_or(PushPublicationBackendError)?;
+        let mut packs = repo
+            .packs
+            .write()
+            .map_err(|_| PushPublicationBackendError)?;
+        if let Some(record) = packs.rejection_audits.get(&audit.prepared_fingerprint) {
+            if record.audit == audit && record.reason == reason {
+                return Ok(());
+            }
+            return Err(PushPublicationBackendError);
+        }
+        let mut outbox = self
+            .publication_outbox
+            .write()
+            .map_err(|_| PushPublicationBackendError)?;
+        outbox
+            .try_reserve(1)
+            .map_err(|_| PushPublicationBackendError)?;
+        packs
+            .rejection_audits
+            .try_reserve(1)
+            .map_err(|_| PushPublicationBackendError)?;
+        packs.rejection_audits.insert(
+            audit.prepared_fingerprint,
+            MemoryRejectionRecord {
+                audit: audit.clone(),
+                reason,
+            },
+        );
+        outbox.push(PushPublicationOutboxEvent::RejectedAudit { audit, reason });
+        Ok(())
+    }
+}
+
+fn memory_promotion_available(packs: &MemoryPackState, binding: &PromotionReceiptBinding) -> bool {
+    let key = MemoryPromotionKey {
+        quarantine_id: binding.quarantine_id,
+        quarantine_generation: binding.quarantine_generation,
+        prepared_fingerprint: binding.prepared_fingerprint,
+    };
+    packs
+        .promotion_receipts
+        .get(&key)
+        .is_some_and(|receipt| receipt.publication_binding() == *binding)
+}
+
+fn validate_memory_publication_transaction(
+    transaction: &PushPublicationTransaction,
+) -> std::result::Result<(), PushPublicationBackendError> {
+    if transaction.commands.is_empty()
+        || transaction.repository_generation == 0
+        || transaction.prepared_fingerprint.algo() != transaction.hash_algo
+        || transaction.audit.tenant != transaction.tenant
+        || transaction.audit.repository != transaction.repository
+        || transaction.audit.prepared_fingerprint != transaction.prepared_fingerprint
+        || transaction.audit.timestamp != transaction.timestamp
+        || matches!(
+            transaction.structural,
+            crate::protocol::push_atomic_publication::PushStructuralPublicationPrerequisite::DeferredCanonicalIndex {
+                objects: 0
+            }
+        )
+    {
+        return Err(PushPublicationBackendError);
+    }
+    if let Some(binding) = &transaction.promotion {
+        if binding.tenant != transaction.tenant
+            || binding.repository != transaction.repository
+            || binding.repository_generation != transaction.repository_generation
+            || binding.prepared_fingerprint != transaction.prepared_fingerprint
+            || binding.quarantine_generation == 0
+            || binding.pack_checksum.algo() != transaction.hash_algo
+            || binding.index_checksum.algo() != transaction.hash_algo
+            || binding.size_bytes == 0
+        {
+            return Err(PushPublicationBackendError);
+        }
+    }
+
+    for (index, command) in transaction.commands.iter().enumerate() {
+        let ordinal_matches = usize::try_from(command.ordinal).ok() == Some(index);
+        let refname_valid = command.refname.starts_with("refs/")
+            && check_refname_format(&command.refname, &RefNameOptions::default()).is_ok();
+        let expected_valid = command
+            .expected
+            .is_none_or(|oid| oid.algo() == transaction.hash_algo && !oid.is_zero());
+        let new_valid = command
+            .new_oid
+            .is_none_or(|oid| oid.algo() == transaction.hash_algo && !oid.is_zero());
+        let kind_matches = match command.kind {
+            crate::protocol::receive_pack::PushCommandKind::Create => {
+                command.expected.is_none() && command.new_oid.is_some()
+            }
+            crate::protocol::receive_pack::PushCommandKind::Update => {
+                command.expected.is_some() && command.new_oid.is_some()
+            }
+            crate::protocol::receive_pack::PushCommandKind::Delete => {
+                command.expected.is_some() && command.new_oid.is_none()
+            }
+        };
+        let ancestry_valid = command.ancestry.command_ordinal == command.ordinal
+            && command
+                .ancestry
+                .old_commit
+                .is_none_or(|oid| oid.algo() == transaction.hash_algo && !oid.is_zero())
+            && command
+                .ancestry
+                .new_commit
+                .is_none_or(|oid| oid.algo() == transaction.hash_algo && !oid.is_zero());
+        if !ordinal_matches
+            || !refname_valid
+            || !expected_valid
+            || !new_valid
+            || !kind_matches
+            || !ancestry_valid
+        {
+            return Err(PushPublicationBackendError);
+        }
+    }
+    if transaction
+        .commands
+        .iter()
+        .enumerate()
+        .any(|(left, command)| {
+            transaction.commands[left + 1..].iter().any(|other| {
+                command.refname == other.refname
+                    || ref_namespace_conflicts(&command.refname, &other.refname)
+            })
+        })
+    {
+        return Err(PushPublicationBackendError);
+    }
+    Ok(())
+}
+
+fn apply_memory_ref(refs: &mut BTreeMap<String, StoredRef>, command: &PushPublicationCommand) {
+    match command.new_oid {
+        Some(new_oid) => {
+            refs.insert(command.refname.clone(), StoredRef::Direct(new_oid));
+        }
+        None => {
+            refs.remove(&command.refname);
+        }
+    }
+}
+
+fn memory_ref_matches(
+    refs: &BTreeMap<String, StoredRef>,
+    command: &PushPublicationCommand,
+) -> bool {
+    match (refs.get(&command.refname), command.expected) {
+        (None, None) => true,
+        (Some(StoredRef::Direct(current)), Some(expected)) => *current == expected,
+        _ => false,
+    }
+}
+
+fn memory_namespace_conflicts(
+    refs: &BTreeMap<String, StoredRef>,
+    command: &PushPublicationCommand,
+) -> bool {
+    command.kind == crate::protocol::receive_pack::PushCommandKind::Create
+        && refs.keys().any(|existing| {
+            existing != &command.refname && ref_namespace_conflicts(existing, &command.refname)
+        })
+}
+
+fn ref_namespace_conflicts(left: &str, right: &str) -> bool {
+    left.strip_prefix(right)
+        .is_some_and(|suffix| suffix.starts_with('/'))
+        || right
+            .strip_prefix(left)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn memory_fast_forward_matches(command: &PushPublicationCommand) -> bool {
+    if command.kind != crate::protocol::receive_pack::PushCommandKind::Update
+        || !command.refname.starts_with("refs/heads/")
+    {
+        return true;
+    }
+    command.ancestry.old_commit == command.expected
+        && command.ancestry.new_commit == command.new_oid
+        && command.ancestry.old_is_ancestor == Some(true)
 }
 
 #[async_trait]
