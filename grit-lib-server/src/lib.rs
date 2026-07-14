@@ -25,6 +25,7 @@ pub mod protocol;
 #[cfg(feature = "redis")]
 pub mod redis_cache;
 pub mod repository;
+pub mod resilience;
 #[cfg(feature = "s3")]
 pub mod s3_byte_store;
 #[cfg(feature = "sqlx-postgres")]
@@ -89,6 +90,13 @@ pub mod prelude {
     #[cfg(feature = "redis")]
     pub use crate::redis_cache::{RedisCache, RedisCacheOptions};
     pub use crate::repository::ServerRepository;
+    pub use crate::resilience::{
+        route_read, ComponentRecoveryObservation, FailoverDecision, PackManifestState,
+        PackReplicaState, PrimaryRouteReason, ReadOperation, ReadRoute, RecoveryBlocker,
+        RecoveryComponent, RecoveryObjective, RecoveryPlan, RecoveryReadiness, RegionalPackReplica,
+        ReplicaHealth, ReplicaObservation, ReplicaPolicy, RepositoryGeneration, ResilienceError,
+        RestoreChecks,
+    };
     #[cfg(feature = "s3")]
     pub use crate::s3_byte_store::{S3ByteStore, S3MultipartUploadOptions};
     #[cfg(feature = "sqlx-postgres")]
