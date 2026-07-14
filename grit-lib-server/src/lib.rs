@@ -138,12 +138,20 @@ pub mod prelude {
         PushPackMetrics, PushPhase, PushPhaseMetrics, PushQuarantineMetrics, PushRejectionReason,
         ReceivePackLimitError, ReceivePackLimitKind, ReceivePackLimits,
     };
+    pub use crate::protocol::push_pack_validation::{
+        validate_quarantined_pack, AuthorizedPushBase, AuthorizedPushBaseError,
+        AuthorizedPushBaseProvider, NoAuthorizedPushBases, PushPackByteSpan, PushPackEntryKind,
+        PushPackIndexRow, PushPackValidationControl, PushPackValidationError,
+        PushPackValidationObservation, PushPackValidationOptions, PushPackValidationWork,
+        PushPackValidationWorkLimit, PushStructuralMetadata, PushStructuralObject,
+        PushValidationSummary, ValidatedPushPack,
+    };
     pub use crate::protocol::push_quarantine::{
         MemoryPackQuarantine, MemoryQuarantineLimits, PackQuarantine, QuarantineDiscard,
         QuarantineDiscardReport, QuarantineError, QuarantineFence, QuarantineId,
-        QuarantineManifest, QuarantineOperation, QuarantineOwnerToken, QuarantinePromotion,
-        QuarantinePromotionId, QuarantineReceivePackSink, QuarantineScope, QuarantineScratch,
-        QuarantineSnapshot, QuarantineState,
+        QuarantineIndexAttestation, QuarantineManifest, QuarantineOperation, QuarantineOwnerToken,
+        QuarantinePromotion, QuarantinePromotionId, QuarantineReceivePackSink, QuarantineScope,
+        QuarantineScratch, QuarantineSnapshot, QuarantineState,
     };
     pub use crate::protocol::receive_pack::{
         AllowAllPushPolicy, ProtectedRefPolicy, PushCommandKind, PushCommandStatus, PushPlan,

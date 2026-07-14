@@ -247,6 +247,71 @@ pub struct QuarantineManifest {
     pub metadata_bytes: u64,
     /// Whether later thin-pack validation proved the representation self-contained.
     pub self_contained: bool,
+    /// Canonical validated index checksum when incremental validation completed.
+    pub index_checksum: Option<ObjectId>,
+}
+
+/// Evidence produced only after bounded entry indexing and dependency validation completes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuarantineIndexAttestation {
+    /// PACK body/trailer checksum bound to the index.
+    pack_checksum: ObjectId,
+    /// Canonical checksum of ordered validated index rows.
+    index_checksum: ObjectId,
+    /// Complete validated entry count.
+    object_count: u32,
+    /// Every entry and retained structural object was validated.
+    validation_complete: bool,
+    /// Every delta base is contained in the quarantine PACK.
+    self_contained: bool,
+}
+
+impl QuarantineIndexAttestation {
+    /// Construct evidence from the crate's completed incremental validator.
+    pub(crate) const fn validated(
+        pack_checksum: ObjectId,
+        index_checksum: ObjectId,
+        object_count: u32,
+        self_contained: bool,
+    ) -> Self {
+        Self {
+            pack_checksum,
+            index_checksum,
+            object_count,
+            validation_complete: true,
+            self_contained,
+        }
+    }
+
+    /// Return the PACK checksum to which this attestation is bound.
+    #[must_use]
+    pub const fn pack_checksum(self) -> ObjectId {
+        self.pack_checksum
+    }
+
+    /// Return the checksum of the canonical ordered index rows.
+    #[must_use]
+    pub const fn index_checksum(self) -> ObjectId {
+        self.index_checksum
+    }
+
+    /// Return the validated PACK entry count.
+    #[must_use]
+    pub const fn object_count(self) -> u32 {
+        self.object_count
+    }
+
+    /// Return whether every validation phase completed.
+    #[must_use]
+    pub const fn validation_complete(self) -> bool {
+        self.validation_complete
+    }
+
+    /// Return whether every dependency is contained in the PACK.
+    #[must_use]
+    pub const fn self_contained(self) -> bool {
+        self.self_contained
+    }
 }
 
 /// Point-in-time crash/retry metadata excluding the owner secret.
@@ -502,6 +567,13 @@ pub trait PackQuarantine: Send {
         manifest: QuarantineManifest,
     ) -> Result<QuarantineFence, QuarantineError>;
 
+    /// Upgrade a validated manifest with a completed incremental index attestation.
+    async fn attest_index(
+        &mut self,
+        fence: QuarantineFence,
+        attestation: QuarantineIndexAttestation,
+    ) -> Result<QuarantineFence, QuarantineError>;
+
     /// Atomically promote a validated manifest using a server-issued target identity.
     async fn promote(
         &mut self,
@@ -629,6 +701,8 @@ impl MemoryPackQuarantine {
         if manifest.hash_algo != self.checksum.hash_algo
             || manifest.pack_bytes != self.bytes
             || manifest.pack_checksum != expected_checksum
+            || manifest.self_contained
+            || manifest.index_checksum.is_some()
             || manifest.object_count > object_limit
             || manifest.metadata_bytes > ReceivePackLimits::HARD_MAX.max_metadata_memory_bytes
             || (empty && (expected_checksum.is_some() || manifest.object_count != 0))
@@ -795,6 +869,54 @@ impl PackQuarantine for MemoryPackQuarantine {
         Ok(self.fence())
     }
 
+    async fn attest_index(
+        &mut self,
+        fence: QuarantineFence,
+        attestation: QuarantineIndexAttestation,
+    ) -> Result<QuarantineFence, QuarantineError> {
+        self.authorize_identity(fence)?;
+        let Some(current) = self.manifest.as_ref() else {
+            return Err(QuarantineError::ManifestMismatch);
+        };
+        let matches_manifest = current.pack_checksum == Some(attestation.pack_checksum)
+            && current.object_count == attestation.object_count
+            && attestation.validation_complete
+            && attestation.pack_checksum.algo() == current.hash_algo
+            && attestation.index_checksum.algo() == current.hash_algo
+            && !attestation.index_checksum.is_zero();
+        if !matches_manifest {
+            return Err(QuarantineError::ManifestMismatch);
+        }
+        if current.index_checksum == Some(attestation.index_checksum) {
+            if current.self_contained != attestation.self_contained {
+                return Err(QuarantineError::ManifestMismatch);
+            }
+            let retry_generation = fence
+                .generation
+                .checked_add(1)
+                .is_some_and(|generation| generation == self.generation);
+            if fence.generation == self.generation || retry_generation {
+                return Ok(self.fence());
+            }
+            return Err(QuarantineError::StaleFence);
+        }
+        self.authorize_current(fence)?;
+        if self.state != QuarantineState::Validated || current.index_checksum.is_some() {
+            return Err(QuarantineError::InvalidState {
+                operation: QuarantineOperation::Finish,
+                state: self.state,
+            });
+        }
+        let next_generation = self.next_generation()?;
+        let Some(manifest) = self.manifest.as_mut() else {
+            return Err(QuarantineError::ManifestMismatch);
+        };
+        manifest.index_checksum = Some(attestation.index_checksum);
+        manifest.self_contained = attestation.self_contained;
+        self.generation = next_generation;
+        Ok(self.fence())
+    }
+
     async fn append(
         &mut self,
         fence: QuarantineFence,
@@ -945,7 +1067,7 @@ impl PackQuarantine for MemoryPackQuarantine {
         if self
             .manifest
             .as_ref()
-            .is_none_or(|manifest| !manifest.self_contained)
+            .is_none_or(|manifest| !manifest.self_contained || manifest.index_checksum.is_none())
         {
             return Err(QuarantineError::ManifestMismatch);
         }
@@ -1142,6 +1264,7 @@ where
             pack_checksum: report.pack_checksum,
             metadata_bytes: 0,
             self_contained: false,
+            index_checksum: None,
         };
         match self
             .quarantine
