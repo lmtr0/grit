@@ -13,7 +13,9 @@ use crate::error::{Error, Result};
 use crate::ids::{RepositoryId, TenantId};
 use crate::protocol::pg_pack_promotion::{
     PgPackPromotionInstallError, PgPackPromotionReceipt, PgPackPromotionStage,
+    PgPackPromotionStorage,
 };
+use crate::protocol::push_quarantine::QuarantineId;
 use crate::storage::{
     BrowseIndex, CommitGraphStore, ConfigStore, ImportPublication, ImportPublicationResult,
     ImportSession, ImportStateStore, ImportedPack, IndexedCommit, IndexedTreeEntry,
@@ -796,6 +798,10 @@ pub const MIGRATIONS: &[&str] = &[
         object_count bigint not null,
         size_bytes bigint not null,
         deduplicated boolean not null,
+        storage_backend text,
+        storage_key text,
+        storage_version bytea,
+        storage_checksum bytea,
         primary key (repository_pk, quarantine_id, quarantine_generation),
         constraint grit_push_pack_receipts_repository_fk foreign key (repository_pk)
             references grit_repositories (repository_pk) on delete cascade,
@@ -804,7 +810,79 @@ pub const MIGRATIONS: &[&str] = &[
         check (octet_length(prepared_fingerprint) in (20, 32)),
         check (octet_length(pack_checksum) = octet_length(prepared_fingerprint)),
         check (octet_length(index_checksum) = octet_length(prepared_fingerprint)),
-        check (object_count >= 0 and size_bytes >= 0)
+        check (object_count >= 0 and size_bytes >= 0),
+        constraint grit_push_pack_receipts_storage_shape check (
+            (storage_backend is null and storage_key is null and storage_version is null
+                    and storage_checksum is null)
+            or (storage_backend is not null and storage_key is not null
+                    and storage_version is not null and storage_checksum is not null)),
+        constraint grit_push_pack_receipts_storage_metadata check (
+            storage_backend is null or (
+                length(storage_backend) between 1 and 256
+                and length(storage_key) between 1 and 4096
+                and octet_length(storage_version) between 1 and 4096
+                and octet_length(storage_checksum) = octet_length(pack_checksum)))
+    )",
+    "alter table grit_push_pack_receipts add column if not exists storage_backend text",
+    "alter table grit_push_pack_receipts add column if not exists storage_key text",
+    "alter table grit_push_pack_receipts add column if not exists storage_version bytea",
+    "alter table grit_push_pack_receipts add column if not exists storage_checksum bytea",
+    "do $$ begin
+        if not exists (
+            select 1 from pg_constraint
+            where conrelid = 'grit_push_pack_receipts'::regclass
+              and conname = 'grit_push_pack_receipts_storage_shape'
+        ) then
+            alter table grit_push_pack_receipts
+                add constraint grit_push_pack_receipts_storage_shape check (
+                    (storage_backend is null and storage_key is null
+                        and storage_version is null and storage_checksum is null)
+                    or (storage_backend is not null and storage_key is not null
+                        and storage_version is not null and storage_checksum is not null));
+        end if;
+    end $$",
+    "do $$ begin
+        if not exists (
+            select 1 from pg_constraint
+            where conrelid = 'grit_push_pack_receipts'::regclass
+              and conname = 'grit_push_pack_receipts_storage_metadata'
+        ) then
+            alter table grit_push_pack_receipts
+                add constraint grit_push_pack_receipts_storage_metadata check (
+                    storage_backend is null or (
+                        length(storage_backend) between 1 and 256
+                        and length(storage_key) between 1 and 4096
+                        and octet_length(storage_version) between 1 and 4096
+                        and octet_length(storage_checksum) = octet_length(pack_checksum)));
+        end if;
+    end $$",
+    "create table if not exists grit_external_pack_promotion_orphans (
+        repository_pk bigint not null,
+        storage_backend text not null,
+        storage_key text not null,
+        quarantine_id bytea not null,
+        quarantine_generation bigint not null,
+        prepared_fingerprint bytea not null,
+        pack_checksum bytea not null,
+        size_bytes bigint not null,
+        storage_version bytea,
+        storage_checksum bytea,
+        not_before timestamptz not null,
+        primary key (repository_pk, storage_backend, storage_key, quarantine_id,
+            quarantine_generation),
+        constraint grit_external_pack_promotion_orphans_repository_fk foreign key (repository_pk)
+            references grit_repositories (repository_pk) on delete cascade,
+        check (octet_length(quarantine_id) = 32),
+        check (quarantine_generation > 0),
+        check (octet_length(prepared_fingerprint) in (20, 32)),
+        check (octet_length(pack_checksum) = octet_length(prepared_fingerprint)),
+        check (size_bytes >= 0),
+        check (length(storage_backend) between 1 and 256),
+        check (length(storage_key) between 1 and 4096),
+        check ((storage_version is null) = (storage_checksum is null)),
+        check (storage_version is null or octet_length(storage_version) between 1 and 4096),
+        check (storage_checksum is null
+            or octet_length(storage_checksum) = octet_length(pack_checksum))
     )",
     "create or replace function grit_assign_repository_pk()
      returns trigger language plpgsql as $$
@@ -2158,6 +2236,40 @@ impl PgServerStorage {
         stage: PgPackPromotionStage,
     ) -> std::result::Result<PgPackPromotionReceipt, PgPackPromotionInstallError> {
         install_promoted_push_pack(&self.pool, stage).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn register_external_promotion_orphan(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        backend_name: &str,
+        storage_key: &str,
+        quarantine_id: QuarantineId,
+        quarantine_generation: u64,
+        prepared_fingerprint: ObjectId,
+        pack_checksum: ObjectId,
+        size_bytes: u64,
+        storage_version: Option<&[u8]>,
+        storage_checksum: Option<ObjectId>,
+        not_before: OffsetDateTime,
+    ) -> std::result::Result<(), PgPackPromotionInstallError> {
+        register_external_promotion_orphan(
+            &self.pool,
+            tenant,
+            repository,
+            backend_name,
+            storage_key,
+            quarantine_id,
+            quarantine_generation,
+            prepared_fingerprint,
+            pack_checksum,
+            size_bytes,
+            storage_version,
+            storage_checksum,
+            not_before,
+        )
+        .await
     }
 
     /// Resolve the newest packed representation for each requested object in one set query.
@@ -9345,7 +9457,8 @@ async fn install_promoted_push_pack(
 
     let existing_receipt = sqlx::query(
         "select repository_generation, prepared_fingerprint, pack_checksum, index_checksum,
-                object_count, size_bytes, deduplicated
+                object_count, size_bytes, deduplicated, storage_backend, storage_key,
+                storage_version, storage_checksum
          from grit_push_pack_receipts
          where repository_pk = $1 and quarantine_id = $2 and quarantine_generation = $3",
     )
@@ -9382,7 +9495,8 @@ async fn install_promoted_push_pack(
             && pack_checksum == stage.pack_checksum.as_bytes()
             && index_checksum == stage.index_checksum.as_bytes()
             && u32::try_from(object_count).ok() == Some(stage.pack.metadata.object_count)
-            && u64::try_from(size_bytes).ok() == Some(stage.pack.metadata.size_bytes);
+            && u64::try_from(size_bytes).ok() == Some(stage.pack.metadata.size_bytes)
+            && promotion_receipt_storage_matches(&row, &stage.storage)?;
         if !exact {
             return Err(PgPackPromotionInstallError::Collision);
         }
@@ -9423,10 +9537,24 @@ async fn install_promoted_push_pack(
         let size_bytes: i64 = row
             .try_get("size_bytes")
             .map_err(|_| PgPackPromotionInstallError::Backend)?;
+        let storage_matches = match &stage.storage {
+            PgPackPromotionStorage::Database => {
+                data.as_deref() == Some(stage.pack.data.as_slice())
+                    && backend == "database"
+                    && storage_key.is_none()
+            }
+            PgPackPromotionStorage::External {
+                backend_name,
+                storage_key: expected_key,
+                ..
+            } => {
+                data.is_none()
+                    && backend == *backend_name
+                    && storage_key.as_deref() == Some(expected_key.as_str())
+            }
+        };
         if index_checksum != stage.index_checksum.to_hex()
-            || data.as_deref() != Some(stage.pack.data.as_slice())
-            || backend != "database"
-            || storage_key.is_some()
+            || !storage_matches
             || u32::try_from(object_count).ok() != Some(stage.pack.metadata.object_count)
             || u64::try_from(size_bytes).ok() != Some(stage.pack.metadata.size_bytes)
         {
@@ -9455,23 +9583,51 @@ async fn install_promoted_push_pack(
             return Err(PgPackPromotionInstallError::Collision);
         }
     } else {
-        let values = prepare_pack_values(
-            &stage.pack.metadata,
-            stage.pack.data.len(),
-            &stage.pack.index,
-        )
-        .map_err(|_| PgPackPromotionInstallError::Backend)?;
-        install_database_pack_in_transaction(
-            &mut tx,
-            &stage.tenant,
-            &stage.repository,
-            &stage.pack.metadata,
-            stage.pack.data.as_slice(),
-            &stage.pack.index,
-            &values,
-        )
-        .await
-        .map_err(|_| PgPackPromotionInstallError::Backend)?;
+        match &stage.storage {
+            PgPackPromotionStorage::Database => {
+                let values = prepare_pack_values(
+                    &stage.pack.metadata,
+                    stage.pack.data.len(),
+                    &stage.pack.index,
+                )
+                .map_err(|_| PgPackPromotionInstallError::Backend)?;
+                install_database_pack_in_transaction(
+                    &mut tx,
+                    &stage.tenant,
+                    &stage.repository,
+                    &stage.pack.metadata,
+                    stage.pack.data.as_slice(),
+                    &stage.pack.index,
+                    &values,
+                )
+                .await
+                .map_err(|_| PgPackPromotionInstallError::Backend)?;
+            }
+            PgPackPromotionStorage::External {
+                backend_name,
+                storage_key,
+                ..
+            } => {
+                let values = prepare_pack_values_for_size(
+                    &stage.pack.metadata,
+                    stage.pack.metadata.size_bytes,
+                    &stage.pack.index,
+                )
+                .map_err(|_| PgPackPromotionInstallError::Backend)?;
+                install_external_pack_in_transaction(
+                    &mut tx,
+                    &stage.tenant,
+                    &stage.repository,
+                    &stage.pack.metadata,
+                    &stage.pack.index,
+                    &values,
+                    backend_name,
+                    storage_key,
+                )
+                .await
+                .map_err(|_| PgPackPromotionInstallError::Backend)?;
+            }
+        }
     }
 
     if retry_deduplicated.is_none() {
@@ -9479,8 +9635,8 @@ async fn install_promoted_push_pack(
             "insert into grit_push_pack_receipts
             (repository_pk, quarantine_id, quarantine_generation, repository_generation,
              prepared_fingerprint, pack_checksum, index_checksum, object_count, size_bytes,
-             deduplicated)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+             deduplicated, storage_backend, storage_key, storage_version, storage_checksum)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
         )
         .bind(repository_pk)
         .bind(stage.quarantine_id.as_bytes().as_slice())
@@ -9501,9 +9657,50 @@ async fn install_promoted_push_pack(
                 .map_err(|_| PgPackPromotionInstallError::Backend)?,
         )
         .bind(pack_deduplicated)
+        .bind(stage.storage.backend_name())
+        .bind(stage.storage.storage_key())
+        .bind(stage.storage.storage_version())
+        .bind(stage.storage.storage_checksum())
         .execute(&mut *tx)
         .await
         .map_err(|_| PgPackPromotionInstallError::Backend)?;
+    }
+    if let PgPackPromotionStorage::External {
+        backend_name,
+        storage_key,
+        storage_version,
+        storage_checksum,
+    } = &stage.storage
+    {
+        let deleted = sqlx::query(
+            "delete from grit_external_pack_promotion_orphans
+             where repository_pk = $1 and storage_backend = $2 and storage_key = $3
+               and quarantine_id = $4 and quarantine_generation = $5
+               and prepared_fingerprint = $6 and pack_checksum = $7 and size_bytes = $8
+               and storage_version = $9 and storage_checksum = $10",
+        )
+        .bind(repository_pk)
+        .bind(backend_name)
+        .bind(storage_key)
+        .bind(stage.quarantine_id.as_bytes().as_slice())
+        .bind(
+            i64::try_from(stage.quarantine_generation)
+                .map_err(|_| PgPackPromotionInstallError::Backend)?,
+        )
+        .bind(stage.prepared_fingerprint.as_bytes())
+        .bind(stage.pack_checksum.as_bytes())
+        .bind(
+            i64::try_from(stage.pack.metadata.size_bytes)
+                .map_err(|_| PgPackPromotionInstallError::Backend)?,
+        )
+        .bind(storage_version)
+        .bind(storage_checksum.as_bytes())
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| PgPackPromotionInstallError::Backend)?;
+        if deleted.rows_affected() != 1 {
+            return Err(PgPackPromotionInstallError::Collision);
+        }
     }
     let receipt_deduplicated = retry_deduplicated.unwrap_or(pack_deduplicated);
     tx.commit()
@@ -9522,6 +9719,130 @@ async fn install_promoted_push_pack(
         stage.pack.metadata.size_bytes,
         receipt_deduplicated,
     ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn register_external_promotion_orphan(
+    pool: &PgPool,
+    tenant: &TenantId,
+    repository: &RepositoryId,
+    backend_name: &str,
+    storage_key: &str,
+    quarantine_id: QuarantineId,
+    quarantine_generation: u64,
+    prepared_fingerprint: ObjectId,
+    pack_checksum: ObjectId,
+    size_bytes: u64,
+    storage_version: Option<&[u8]>,
+    storage_checksum: Option<ObjectId>,
+    not_before: OffsetDateTime,
+) -> std::result::Result<(), PgPackPromotionInstallError> {
+    if backend_name.is_empty()
+        || storage_key.is_empty()
+        || storage_version.is_some() != storage_checksum.is_some()
+    {
+        return Err(PgPackPromotionInstallError::Backend);
+    }
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|_| PgPackPromotionInstallError::Backend)?;
+    lock_import_repository(&mut tx, tenant, repository)
+        .await
+        .map_err(|_| PgPackPromotionInstallError::Backend)?;
+    let repository_pk: Option<i64> = sqlx::query_scalar(
+        "select repository_pk from grit_repositories
+         where tenant_id = $1 and repository_id = $2 and deleted_at is null",
+    )
+    .bind(tenant.as_str())
+    .bind(repository.as_str())
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| PgPackPromotionInstallError::Backend)?;
+    let repository_pk = repository_pk.ok_or(PgPackPromotionInstallError::StaleGeneration)?;
+    let row = sqlx::query(
+        "insert into grit_external_pack_promotion_orphans
+            (repository_pk, storage_backend, storage_key, quarantine_id,
+             quarantine_generation, prepared_fingerprint, pack_checksum, size_bytes,
+             storage_version, storage_checksum, not_before)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         on conflict (repository_pk, storage_backend, storage_key, quarantine_id,
+                      quarantine_generation)
+         do update set storage_version = coalesce(
+                           grit_external_pack_promotion_orphans.storage_version,
+                           excluded.storage_version),
+                       storage_checksum = coalesce(
+                           grit_external_pack_promotion_orphans.storage_checksum,
+                           excluded.storage_checksum),
+                       not_before = greatest(
+                           grit_external_pack_promotion_orphans.not_before,
+                           excluded.not_before)
+         where grit_external_pack_promotion_orphans.prepared_fingerprint
+                    = excluded.prepared_fingerprint
+           and grit_external_pack_promotion_orphans.pack_checksum = excluded.pack_checksum
+           and grit_external_pack_promotion_orphans.size_bytes = excluded.size_bytes
+           and (excluded.storage_version is null
+                or grit_external_pack_promotion_orphans.storage_version is null
+                or (grit_external_pack_promotion_orphans.storage_version
+                        = excluded.storage_version
+                    and grit_external_pack_promotion_orphans.storage_checksum
+                        = excluded.storage_checksum))
+         returning repository_pk",
+    )
+    .bind(repository_pk)
+    .bind(backend_name)
+    .bind(storage_key)
+    .bind(quarantine_id.as_bytes().as_slice())
+    .bind(i64::try_from(quarantine_generation).map_err(|_| PgPackPromotionInstallError::Backend)?)
+    .bind(prepared_fingerprint.as_bytes())
+    .bind(pack_checksum.as_bytes())
+    .bind(i64::try_from(size_bytes).map_err(|_| PgPackPromotionInstallError::Backend)?)
+    .bind(storage_version)
+    .bind(storage_checksum.as_ref().map(ObjectId::as_bytes))
+    .bind(not_before)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| PgPackPromotionInstallError::Backend)?;
+    if row.is_none() {
+        return Err(PgPackPromotionInstallError::Collision);
+    }
+    tx.commit()
+        .await
+        .map_err(|_| PgPackPromotionInstallError::Backend)
+}
+
+fn promotion_receipt_storage_matches(
+    row: &sqlx::postgres::PgRow,
+    storage: &PgPackPromotionStorage,
+) -> std::result::Result<bool, PgPackPromotionInstallError> {
+    let backend: Option<String> = row
+        .try_get("storage_backend")
+        .map_err(|_| PgPackPromotionInstallError::Backend)?;
+    let key: Option<String> = row
+        .try_get("storage_key")
+        .map_err(|_| PgPackPromotionInstallError::Backend)?;
+    let version: Option<Vec<u8>> = row
+        .try_get("storage_version")
+        .map_err(|_| PgPackPromotionInstallError::Backend)?;
+    let checksum: Option<Vec<u8>> = row
+        .try_get("storage_checksum")
+        .map_err(|_| PgPackPromotionInstallError::Backend)?;
+    Ok(match storage {
+        PgPackPromotionStorage::Database => {
+            backend.is_none() && key.is_none() && version.is_none() && checksum.is_none()
+        }
+        PgPackPromotionStorage::External {
+            backend_name,
+            storage_key,
+            storage_version,
+            storage_checksum,
+        } => {
+            backend.as_deref() == Some(backend_name)
+                && key.as_deref() == Some(storage_key)
+                && version.as_deref() == Some(storage_version)
+                && checksum.as_deref() == Some(storage_checksum.as_bytes())
+        }
+    })
 }
 
 fn hash_algo_name(hash_algo: HashAlgo) -> &'static str {
@@ -9687,12 +10008,22 @@ pub(crate) fn prepare_pack_values(
     data_len: usize,
     index_rows: &[PackObjectIndex],
 ) -> Result<PgPackValues> {
+    let data_len = u64::try_from(data_len)
+        .map_err(|_| Error::Backend("pack byte length exceeds u64".to_owned()))?;
+    prepare_pack_values_for_size(metadata, data_len, index_rows)
+}
+
+pub(crate) fn prepare_pack_values_for_size(
+    metadata: &PackMetadata,
+    data_len: u64,
+    index_rows: &[PackObjectIndex],
+) -> Result<PgPackValues> {
     if usize::try_from(metadata.object_count).ok() != Some(index_rows.len()) {
         return Err(Error::Protocol(
             "pack metadata object count does not match its index".to_owned(),
         ));
     }
-    if u64::try_from(data_len).ok() != Some(metadata.size_bytes) {
+    if data_len != metadata.size_bytes {
         return Err(Error::Protocol(
             "pack metadata size does not match its bytes".to_owned(),
         ));

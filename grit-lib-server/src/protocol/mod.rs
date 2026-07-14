@@ -5,6 +5,8 @@ pub mod canonical_clone_serve;
 pub mod clone_admission;
 pub mod clone_metrics;
 pub mod delta_pack;
+#[cfg(feature = "externalized-postgres")]
+pub mod external_pack_promotion;
 pub mod memory_pack_promotion;
 pub mod negotiation;
 pub mod pack_entry_reuse;

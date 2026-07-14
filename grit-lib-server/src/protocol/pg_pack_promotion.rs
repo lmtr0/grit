@@ -264,6 +264,51 @@ pub(crate) struct PgPackPromotionStage {
     pub(crate) pack_checksum: ObjectId,
     pub(crate) index_checksum: ObjectId,
     pub(crate) pack: StoredPack,
+    pub(crate) storage: PgPackPromotionStorage,
+}
+
+pub(crate) enum PgPackPromotionStorage {
+    Database,
+    External {
+        backend_name: String,
+        storage_key: String,
+        storage_version: Vec<u8>,
+        storage_checksum: ObjectId,
+    },
+}
+
+impl PgPackPromotionStorage {
+    pub(crate) fn backend_name(&self) -> Option<&str> {
+        match self {
+            Self::Database => None,
+            Self::External { backend_name, .. } => Some(backend_name),
+        }
+    }
+
+    pub(crate) fn storage_key(&self) -> Option<&str> {
+        match self {
+            Self::Database => None,
+            Self::External { storage_key, .. } => Some(storage_key),
+        }
+    }
+
+    pub(crate) fn storage_version(&self) -> Option<&[u8]> {
+        match self {
+            Self::Database => None,
+            Self::External {
+                storage_version, ..
+            } => Some(storage_version),
+        }
+    }
+
+    pub(crate) fn storage_checksum(&self) -> Option<&[u8]> {
+        match self {
+            Self::Database => None,
+            Self::External {
+                storage_checksum, ..
+            } => Some(storage_checksum.as_bytes()),
+        }
+    }
 }
 
 pub(crate) enum PgPackPromotionInstallError {
@@ -478,6 +523,7 @@ where
             pack_checksum,
             index_checksum,
             pack,
+            storage: PgPackPromotionStorage::Database,
         })
         .await
         .map_err(Into::into)

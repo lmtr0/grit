@@ -130,7 +130,7 @@ impl<B> PgExternalizedStorage<B> {
         )
     }
 
-    fn pack_key(
+    pub(crate) fn pack_key(
         &self,
         tenant: &TenantId,
         repository: &RepositoryId,
@@ -1310,8 +1310,8 @@ fn scoped_key(
 ) -> String {
     let key = format!(
         "tenants/{}/repositories/{}/{}/{}/{}",
-        tenant.as_str(),
-        repository.as_str(),
+        encode_key_component(tenant.as_str()),
+        encode_key_component(repository.as_str()),
         category,
         algo_name,
         name
@@ -1321,6 +1321,25 @@ fn scoped_key(
     } else {
         format!("{}/{key}", prefix.trim_matches('/'))
     }
+}
+
+fn encode_key_component(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(value.len());
+    let dot_segment = matches!(value, "." | "..");
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'_')
+            || (byte == b'.' && !dot_segment)
+        {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    encoded
 }
 
 fn name_to_kind(name: &str) -> Result<ObjectKind> {

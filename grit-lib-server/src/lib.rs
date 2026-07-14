@@ -111,6 +111,14 @@ pub mod prelude {
         GeneratedDeltaPlan, MAX_DELTA_CANDIDATE_COMPARISONS, MAX_DELTA_DEPTH,
         MAX_DELTA_RETAINED_BASE_BYTES, MAX_DELTA_WINDOW, MAX_GENERATED_DELTA_INSTRUCTION_BYTES,
     };
+    #[cfg(feature = "externalized-postgres")]
+    pub use crate::protocol::external_pack_promotion::{
+        promote_external_push_pack, ExternalPackObject, ExternalPackObjectVersion,
+        ExternalPackPart, ExternalPackPromotionBegin, ExternalPackPromotionControl,
+        ExternalPackPromotionError, ExternalPackPromotionLimits, ExternalPackPromotionObservation,
+        ExternalPackPromotionStore, ExternalPackPromotionUpload, ExternalPackPromotionWork,
+        ExternalPackPromotionWorkLimit, ExternalPackProviderError, ExternalPackUploadPlan,
+    };
     pub use crate::protocol::memory_pack_promotion::{
         promote_memory_push_pack, MemoryPackPromotionError, MemoryPackPromotionLimits,
         MemoryPackPromotionReceipt,
