@@ -49,8 +49,8 @@ pub mod prelude {
         import_repository, import_repository_with_execution_options,
         import_repository_with_options, ImportCheckpoint, ImportDestinationMetrics,
         ImportExecutionOptions, ImportMetrics, ImportObjectKindMetrics, ImportObjectMetrics,
-        ImportOptions, ImportPhase, ImportProgressEvent, ImportReport, ImportSourceMetrics,
-        NativePackImportMode,
+        ImportOptions, ImportPhase, ImportProgressEvent, ImportProgressSnapshot, ImportReport,
+        ImportSourceMetrics, NativePackImportMode,
     };
     pub use crate::layered::LayeredCache;
     pub use crate::maintenance::{

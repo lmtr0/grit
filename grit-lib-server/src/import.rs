@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use grit_lib::config::ConfigSet;
 use grit_lib::objects::{
@@ -278,6 +278,18 @@ pub struct ImportDestinationMetrics {
     pub completion_markers: u64,
 }
 
+impl ImportDestinationMetrics {
+    /// Returns payload bytes submitted through the disjoint loose-object and retained-pack paths.
+    ///
+    /// This counts bytes written to destination storage, not decoded source bytes. A caller-provided
+    /// total used with [`ImportMetrics::progress_snapshot`] must use the same accounting basis.
+    #[must_use]
+    pub fn transferred_payload_bytes(&self) -> u64 {
+        self.loose_object_write_bytes
+            .saturating_add(self.retained_pack_bytes)
+    }
+}
+
 /// Stable source and destination counters for one import run.
 ///
 /// Counters saturate at [`u64::MAX`] rather than wrapping.
@@ -287,6 +299,89 @@ pub struct ImportMetrics {
     pub source: ImportSourceMetrics,
     /// Destination storage calls and durable volumes.
     pub destination: ImportDestinationMetrics,
+}
+
+impl ImportMetrics {
+    /// Builds a point-in-time transfer progress estimate without reading a clock.
+    ///
+    /// `phase` identifies the import phase represented by this metrics snapshot. `elapsed` is the
+    /// caller-measured duration for the import, and `total_bytes` is an optional caller-provided
+    /// estimate of the destination payload bytes expected for the complete import. It must use the
+    /// same accounting basis as [`ImportDestinationMetrics::transferred_payload_bytes`]. The
+    /// returned completed byte count includes each loose-object or retained-pack destination write
+    /// exactly once.
+    ///
+    /// `total_bytes` is raised to the completed count when a stale estimate is lower, which keeps
+    /// the exposed progress bounds internally consistent. Rate and duration calculations saturate
+    /// at their respective maximum values instead of wrapping.
+    #[must_use]
+    pub fn progress_snapshot(
+        &self,
+        phase: ImportPhase,
+        elapsed: Duration,
+        total_bytes: Option<u64>,
+    ) -> ImportProgressSnapshot {
+        let completed_bytes = self.destination.transferred_payload_bytes();
+        let total_bytes = total_bytes.map(|total| total.max(completed_bytes));
+        let elapsed_nanos = elapsed.as_nanos();
+        let average_bytes_per_second = if elapsed_nanos == 0 {
+            0
+        } else {
+            let rate = u128::from(completed_bytes)
+                .saturating_mul(Duration::from_secs(1).as_nanos())
+                .checked_div(elapsed_nanos)
+                .unwrap_or(0);
+            u64::try_from(rate).unwrap_or(u64::MAX)
+        };
+        let estimated_remaining = total_bytes.and_then(|total| {
+            if total <= completed_bytes {
+                return Some(Duration::ZERO);
+            }
+            if completed_bytes == 0 || elapsed_nanos == 0 {
+                return None;
+            }
+            let remaining_nanos = u128::from(total.saturating_sub(completed_bytes))
+                .checked_mul(elapsed_nanos)
+                .and_then(|value| value.checked_div(u128::from(completed_bytes)))
+                .unwrap_or(u128::MAX);
+            Some(duration_from_nanos_saturating(remaining_nanos))
+        });
+
+        ImportProgressSnapshot {
+            phase,
+            completed_bytes,
+            total_bytes,
+            elapsed,
+            average_bytes_per_second,
+            estimated_remaining,
+        }
+    }
+}
+
+/// Point-in-time import transfer progress derived from explicit metrics and elapsed time.
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImportProgressSnapshot {
+    /// Import phase represented by this snapshot.
+    pub phase: ImportPhase,
+    /// Loose-object and retained-pack payload bytes submitted to destination storage.
+    pub completed_bytes: u64,
+    /// Optional estimate of total destination payload bytes, clamped to `completed_bytes`.
+    pub total_bytes: Option<u64>,
+    /// Caller-measured time elapsed since the start of the import.
+    pub elapsed: Duration,
+    /// Lifetime-average destination payload bytes per second, truncated to a whole byte.
+    ///
+    /// This is zero when no time has elapsed and saturates at [`u64::MAX`] when the rate cannot be
+    /// represented. The calculation retains subsecond precision before truncation.
+    pub average_bytes_per_second: u64,
+    /// Projected time remaining at the lifetime-average rate.
+    ///
+    /// This is `None` when there is no total or no nonzero progress over nonzero elapsed time. It is
+    /// zero when the completed count meets or exceeds the estimated total and saturates at
+    /// [`Duration::MAX`] when the projection cannot be represented. This is a point projection, not
+    /// an absolute completion timestamp or a statistical ETA range.
+    pub estimated_remaining: Option<Duration>,
 }
 
 /// Stable phases emitted around the major import pipeline boundaries.
@@ -2411,6 +2506,18 @@ fn usize_to_u64(value: usize) -> u64 {
         Ok(value) => value,
         Err(_) => u64::MAX,
     }
+}
+
+fn duration_from_nanos_saturating(nanos: u128) -> Duration {
+    let nanos_per_second = Duration::from_secs(1).as_nanos();
+    let seconds = nanos / nanos_per_second;
+    let Ok(seconds) = u64::try_from(seconds) else {
+        return Duration::MAX;
+    };
+    let Ok(subsec_nanos) = u32::try_from(nanos % nanos_per_second) else {
+        return Duration::MAX;
+    };
+    Duration::new(seconds, subsec_nanos)
 }
 
 fn merge_parsed_tree(
