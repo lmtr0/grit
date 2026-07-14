@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use grit_lib::objects::{HashAlgo, ObjectId, ObjectKind};
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
 use std::collections::{HashMap, HashSet};
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 
 use crate::error::{Error, Result};
 use crate::ids::{RepositoryId, TenantId};
@@ -636,6 +636,88 @@ pub const MIGRATIONS: &[&str] = &[
         owned by grit_migration_verification_reports.report_id",
     "create index if not exists grit_migration_verification_reports_migration_idx
         on grit_migration_verification_reports (migration_id, report_id desc)",
+    "create sequence if not exists grit_pack_maintenance_job_id_seq",
+    "create sequence if not exists grit_pack_maintenance_fencing_token_seq",
+    "create table if not exists grit_pack_maintenance_jobs (
+        job_id bigint primary key default nextval('grit_pack_maintenance_job_id_seq'),
+        repository_pk bigint not null,
+        ref_generation bigint not null,
+        history_generation bigint not null,
+        phase smallint not null,
+        min_pack_count integer not null,
+        max_loose_count bigint not null,
+        min_fragmented_bytes bigint not null,
+        grace_seconds bigint not null,
+        replacement_pack_checksum bytea,
+        prune_after timestamptz,
+        claimed_by text,
+        fencing_token bigint not null default 0,
+        lease_expires_at timestamptz,
+        attempt_count integer not null default 0,
+        failure_reason text,
+        created_at timestamptz not null,
+        updated_at timestamptz not null,
+        constraint grit_pack_maintenance_repository_fk foreign key (repository_pk)
+            references grit_repositories (repository_pk) on delete cascade,
+        check (job_id > 0 and ref_generation >= 0 and history_generation >= 0),
+        check (phase between 1 and 6),
+        check (min_pack_count > 0 and max_loose_count >= 0 and min_fragmented_bytes >= 0),
+        check (grace_seconds >= 0 and fencing_token >= 0 and attempt_count >= 0),
+        check ((claimed_by is null) = (lease_expires_at is null)),
+        check (claimed_by is null or fencing_token > 0),
+        check ((phase = 6 and failure_reason is not null) or (phase <> 6 and failure_reason is null)),
+        check ((phase = 1 and replacement_pack_checksum is null and prune_after is null)
+            or phase = 6
+            or (phase between 2 and 5 and replacement_pack_checksum is not null
+                and prune_after is not null)),
+        check (updated_at >= created_at)
+    )",
+    "create table if not exists grit_pack_maintenance_superseded (
+        job_id bigint not null,
+        pack_checksum bytea not null,
+        index_checksum bytea not null,
+        storage_backend text not null,
+        storage_key text,
+        object_count integer not null,
+        size_bytes bigint not null,
+        primary key (job_id, pack_checksum),
+        constraint grit_pack_maintenance_superseded_job_fk foreign key (job_id)
+            references grit_pack_maintenance_jobs (job_id) on delete cascade,
+        check (object_count >= 0 and size_bytes >= 0),
+        check ((storage_backend = 'database' and storage_key is null)
+            or (storage_backend <> 'database' and storage_key is not null))
+    )",
+    "alter table grit_pack_maintenance_superseded
+        add column if not exists index_checksum bytea",
+    "alter table grit_pack_maintenance_superseded
+        add column if not exists object_count integer",
+    "create table if not exists grit_pack_maintenance_objects (
+        job_id bigint not null,
+        oid bytea not null,
+        primary key (job_id, oid),
+        constraint grit_pack_maintenance_object_job_fk foreign key (job_id)
+            references grit_pack_maintenance_jobs (job_id) on delete cascade,
+        check (octet_length(oid) in (20, 32))
+    )",
+    "create table if not exists grit_repository_retention_holds (
+        repository_pk bigint not null,
+        hold_key text not null,
+        reason text not null,
+        expires_at timestamptz not null,
+        created_at timestamptz not null,
+        primary key (repository_pk, hold_key),
+        constraint grit_repository_retention_hold_repository_fk foreign key (repository_pk)
+            references grit_repositories (repository_pk) on delete cascade,
+        check (length(hold_key) between 1 and 256),
+        check (length(reason) between 1 and 2048),
+        check (expires_at > created_at)
+    )",
+    "alter sequence grit_pack_maintenance_job_id_seq
+        owned by grit_pack_maintenance_jobs.job_id",
+    "create index if not exists grit_pack_maintenance_claim_idx
+        on grit_pack_maintenance_jobs (phase, lease_expires_at, job_id)",
+    "create index if not exists grit_pack_maintenance_repository_idx
+        on grit_pack_maintenance_jobs (repository_pk, job_id desc)",
     "create table if not exists grit_import_trusted_objects (
         tenant_id text not null,
         repository_id text not null,
@@ -1377,6 +1459,164 @@ pub enum PgMigrationRouteOutcome {
     /// The claim, verification report, source position, or rollback window is no longer valid.
     PreconditionsChanged,
 }
+
+/// Durable phase of a PostgreSQL pack-maintenance job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PgPackMaintenancePhase {
+    /// Candidate packs were selected; no replacement is published.
+    Planned,
+    /// A durable replacement covers every superseded indexed object.
+    ReplacementPublished,
+    /// Superseded SQL metadata was removed after its grace period.
+    MetadataSwept,
+    /// External bytes remain registered for the orphan sweeper.
+    ExternalSweepPending,
+    /// All job-owned maintenance work is complete.
+    Complete,
+    /// The job stopped with a durable failure reason.
+    Failed,
+}
+
+impl PgPackMaintenancePhase {
+    fn from_code(code: i16) -> Result<Self> {
+        match code {
+            1 => Ok(Self::Planned),
+            2 => Ok(Self::ReplacementPublished),
+            3 => Ok(Self::MetadataSwept),
+            4 => Ok(Self::ExternalSweepPending),
+            5 => Ok(Self::Complete),
+            6 => Ok(Self::Failed),
+            _ => Err(Error::Backend(format!(
+                "invalid pack-maintenance phase {code}"
+            ))),
+        }
+    }
+}
+
+/// Explicit fragmentation policy captured by a maintenance job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PgPackMaintenancePolicy {
+    /// Minimum pack count needed for selection.
+    pub min_pack_count: u32,
+    /// Largest acceptable loose-object count.
+    pub max_loose_count: u64,
+    /// Minimum total fragmented pack bytes.
+    pub min_fragmented_bytes: u64,
+}
+
+/// Bounded repository-level fragmentation summary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgPackMaintenanceCandidate {
+    /// Candidate repository identity.
+    pub repository: RepositoryPk,
+    /// Number of packs.
+    pub pack_count: u64,
+    /// Number of loose object rows.
+    pub loose_count: u64,
+    /// Total pack bytes.
+    pub pack_bytes: u64,
+}
+
+/// Durable pack-maintenance job state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgPackMaintenanceJob {
+    /// Database-assigned job identity.
+    pub job_id: u64,
+    /// Repository owned by the job.
+    pub repository: RepositoryPk,
+    /// Ref generation captured at planning.
+    pub ref_generation: u64,
+    /// History generation captured at planning.
+    pub history_generation: u64,
+    /// Current durable phase.
+    pub phase: PgPackMaintenancePhase,
+    /// Captured selection policy.
+    pub policy: PgPackMaintenancePolicy,
+    /// Grace interval applied when replacement is published.
+    pub grace: Duration,
+    /// Durable replacement checksum, when published.
+    pub replacement: Option<ObjectId>,
+    /// Earliest metadata prune time.
+    pub prune_after: Option<OffsetDateTime>,
+    /// Current worker, if leased.
+    pub claimed_by: Option<String>,
+    /// Current fencing token.
+    pub fencing_token: u64,
+    /// Lease expiry.
+    pub lease_expires_at: Option<OffsetDateTime>,
+    /// Claim attempts.
+    pub attempt_count: u32,
+    /// Last durable state-transition timestamp.
+    pub updated_at: OffsetDateTime,
+}
+
+/// Explicit inputs for creating one generation-bound maintenance job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PgPackMaintenanceCreateOptions {
+    /// Repository to maintain.
+    pub repository: RepositoryPk,
+    /// Captured fragmentation policy.
+    pub policy: PgPackMaintenancePolicy,
+    /// Nonnegative superseded-pack grace interval.
+    pub grace: Duration,
+    /// Caller-supplied creation timestamp.
+    pub created_at: OffsetDateTime,
+}
+
+/// Explicit worker lease inputs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgPackMaintenanceClaimOptions {
+    /// Stable worker identity.
+    pub worker_id: String,
+    /// Caller-observed reclaim time.
+    pub observed_at: OffsetDateTime,
+    /// Exclusive new lease expiry.
+    pub lease_expires_at: OffsetDateTime,
+    /// Maximum jobs, bounded to [`MAX_PACK_MAINTENANCE_BATCH`].
+    pub max_jobs: usize,
+}
+
+/// Fenced maintenance job lease.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgPackMaintenanceClaim {
+    /// Claimed job snapshot.
+    pub job: PgPackMaintenanceJob,
+    /// Owning worker identity.
+    pub worker_id: String,
+    /// Fresh fencing token.
+    pub fencing_token: u64,
+    /// Exclusive lease expiry.
+    pub lease_expires_at: OffsetDateTime,
+}
+
+/// Typed publication or prune result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PgPackMaintenanceOutcome {
+    /// State and metadata changed atomically.
+    Applied,
+    /// The requested phase was already reached.
+    AlreadyApplied,
+    /// A newer worker owns the job.
+    ClaimLost,
+    /// Retention or rollback policy currently blocks pruning.
+    Blocked { reason: String },
+    /// Pack/index metadata is inconsistent or replacement coverage is incomplete.
+    Corrupt { detail: String },
+}
+
+/// Metadata-only consistency probe for one pack.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgPackConsistencyProbe {
+    /// Pack checksum.
+    pub checksum: ObjectId,
+    /// Whether object-count and index binding agree.
+    pub index_binding_valid: bool,
+    /// Whether external storage metadata has a non-empty key.
+    pub external_key_metadata_valid: bool,
+}
+
+/// Maximum candidates, claims, or superseded packs accepted by one call.
+pub const MAX_PACK_MAINTENANCE_BATCH: usize = 512;
 
 /// Maximum operations returned by one catch-up planning call.
 pub const MAX_MIGRATION_CATCH_UP_BATCH: usize = 512;
@@ -3404,6 +3644,964 @@ impl PgServerStorage {
         }
         tx.commit().await?;
         Ok(PgMigrationRouteOutcome::Applied)
+    }
+
+    /// Select bounded repository fragmentation candidates without loading object rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Backend`] for invalid policy or bounds and propagates SQLx failures.
+    pub async fn pack_maintenance_candidates(
+        &self,
+        policy: PgPackMaintenancePolicy,
+        max_candidates: usize,
+    ) -> Result<Vec<PgPackMaintenanceCandidate>> {
+        validate_pack_maintenance_policy(policy)?;
+        if max_candidates == 0 || max_candidates > MAX_PACK_MAINTENANCE_BATCH {
+            return Err(Error::Backend(
+                "invalid maintenance candidate bound".to_owned(),
+            ));
+        }
+        let rows = sqlx::query(
+            "select repository.repository_pk,
+                    coalesce(packs.pack_count, 0) as pack_count,
+                    coalesce(loose.loose_count, 0) as loose_count,
+                    coalesce(packs.pack_bytes, 0) as pack_bytes
+             from grit_repositories repository
+             left join lateral (
+                 select count(*) as pack_count, coalesce(sum(size_bytes), 0) as pack_bytes
+                 from grit_packs where repository_pk = repository.repository_pk
+             ) packs on true
+             left join lateral (
+                 select count(*) as loose_count from grit_objects
+                 where repository_pk = repository.repository_pk
+             ) loose on true
+             where repository.deleted_at is null
+               and (coalesce(packs.pack_count, 0) >= $1
+                    or coalesce(loose.loose_count, 0) > $2)
+               and coalesce(packs.pack_bytes, 0) >= $3
+             order by coalesce(packs.pack_count, 0) desc,
+                      coalesce(loose.loose_count, 0) desc, repository.repository_pk
+             limit $4",
+        )
+        .bind(i64::from(policy.min_pack_count))
+        .bind(i64::try_from(policy.max_loose_count).map_err(|_| {
+            Error::Backend("maintenance loose-object threshold exceeds i64".to_owned())
+        })?)
+        .bind(
+            i64::try_from(policy.min_fragmented_bytes)
+                .map_err(|_| Error::Backend("maintenance byte threshold exceeds i64".to_owned()))?,
+        )
+        .bind(
+            i64::try_from(max_candidates).map_err(|_| {
+                Error::Backend("maintenance candidate bound exceeds i64".to_owned())
+            })?,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(PgPackMaintenanceCandidate {
+                    repository: RepositoryPk::try_from(row.try_get::<i64, _>("repository_pk")?)
+                        .map_err(|error| Error::Backend(error.to_string()))?,
+                    pack_count: nonnegative_i64_to_u64(
+                        row.try_get("pack_count")?,
+                        "maintenance pack count",
+                    )?,
+                    loose_count: nonnegative_i64_to_u64(
+                        row.try_get("loose_count")?,
+                        "maintenance loose count",
+                    )?,
+                    pack_bytes: nonnegative_i64_to_u64(
+                        row.try_get("pack_bytes")?,
+                        "maintenance pack bytes",
+                    )?,
+                })
+            })
+            .collect()
+    }
+
+    /// Create a generation-bound pack-maintenance job.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation errors or SQLx failures.
+    pub async fn create_pack_maintenance_job(
+        &self,
+        options: PgPackMaintenanceCreateOptions,
+    ) -> Result<PgPackMaintenanceJob> {
+        validate_pack_maintenance_policy(options.policy)?;
+        let grace_seconds = options.grace.whole_seconds();
+        if options.grace.is_negative() {
+            return Err(Error::Backend(
+                "maintenance grace must be nonnegative".to_owned(),
+            ));
+        }
+        let row = sqlx::query(
+            "insert into grit_pack_maintenance_jobs
+                (repository_pk, ref_generation, history_generation, phase, min_pack_count,
+                 max_loose_count, min_fragmented_bytes, grace_seconds, created_at, updated_at)
+             select repository_pk, ref_generation, history_generation, 1, $2, $3, $4, $5, $6, $6
+             from grit_repositories where repository_pk = $1 and deleted_at is null
+             returning *",
+        )
+        .bind(options.repository.get())
+        .bind(
+            i32::try_from(options.policy.min_pack_count)
+                .map_err(|_| Error::Backend("maintenance pack threshold exceeds i32".to_owned()))?,
+        )
+        .bind(
+            i64::try_from(options.policy.max_loose_count).map_err(|_| {
+                Error::Backend("maintenance loose threshold exceeds i64".to_owned())
+            })?,
+        )
+        .bind(
+            i64::try_from(options.policy.min_fragmented_bytes)
+                .map_err(|_| Error::Backend("maintenance byte threshold exceeds i64".to_owned()))?,
+        )
+        .bind(grace_seconds)
+        .bind(options.created_at)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| Error::Backend("maintenance repository does not exist".to_owned()))?;
+        row_to_pack_maintenance_job(&row)
+    }
+
+    /// Claim a bounded batch of resumable maintenance jobs with fresh fencing tokens.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation errors or SQLx failures.
+    pub async fn claim_pack_maintenance_jobs(
+        &self,
+        options: PgPackMaintenanceClaimOptions,
+    ) -> Result<Vec<PgPackMaintenanceClaim>> {
+        if options.worker_id.trim().is_empty()
+            || options.worker_id.len() > 256
+            || options.max_jobs == 0
+            || options.max_jobs > MAX_PACK_MAINTENANCE_BATCH
+            || options.lease_expires_at <= options.observed_at
+        {
+            return Err(Error::Backend(
+                "invalid maintenance claim options".to_owned(),
+            ));
+        }
+        let rows = sqlx::query(
+            "with candidates as (
+                 select job_id from grit_pack_maintenance_jobs
+                 where phase between 1 and 4 and updated_at <= $2
+                   and (claimed_by is null or lease_expires_at <= $2)
+                   and attempt_count < 2147483647
+                 order by phase, job_id limit $4 for update skip locked
+             ) update grit_pack_maintenance_jobs job
+               set claimed_by = $1,
+                   fencing_token = nextval('grit_pack_maintenance_fencing_token_seq'),
+                   lease_expires_at = $3, attempt_count = job.attempt_count + 1,
+                   updated_at = $2
+             from candidates where job.job_id = candidates.job_id returning job.*",
+        )
+        .bind(&options.worker_id)
+        .bind(options.observed_at)
+        .bind(options.lease_expires_at)
+        .bind(
+            i64::try_from(options.max_jobs)
+                .map_err(|_| Error::Backend("maintenance claim bound exceeds i64".to_owned()))?,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                let job = row_to_pack_maintenance_job(row)?;
+                Ok(PgPackMaintenanceClaim {
+                    worker_id: job.claimed_by.clone().ok_or_else(|| {
+                        Error::Backend("claimed maintenance job has no worker".to_owned())
+                    })?,
+                    fencing_token: job.fencing_token,
+                    lease_expires_at: job.lease_expires_at.ok_or_else(|| {
+                        Error::Backend("claimed maintenance job has no lease".to_owned())
+                    })?,
+                    job,
+                })
+            })
+            .collect()
+    }
+
+    /// Create or replace a time-bounded repository retention hold.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation errors or propagates SQLx failures.
+    pub async fn set_pack_retention_hold(
+        &self,
+        repository: RepositoryPk,
+        hold_key: &str,
+        reason: &str,
+        created_at: OffsetDateTime,
+        expires_at: OffsetDateTime,
+    ) -> Result<()> {
+        if hold_key.is_empty()
+            || hold_key.len() > 256
+            || reason.is_empty()
+            || reason.len() > 2048
+            || expires_at <= created_at
+        {
+            return Err(Error::Backend("invalid pack retention hold".to_owned()));
+        }
+        let (tenant, repository_id) = repository_identity_by_pk(&self.pool, repository).await?;
+        let mut tx = self.pool.begin().await?;
+        if !lock_expected_repository(&mut tx, repository, &tenant, &repository_id).await? {
+            tx.rollback().await?;
+            return Err(Error::Backend(
+                "retention-hold repository identity changed".to_owned(),
+            ));
+        }
+        sqlx::query(
+            "insert into grit_repository_retention_holds
+                (repository_pk, hold_key, reason, expires_at, created_at)
+             values ($1, $2, $3, $4, $5)
+             on conflict (repository_pk, hold_key) do update
+             set reason = excluded.reason, expires_at = excluded.expires_at,
+                 created_at = excluded.created_at",
+        )
+        .bind(repository.get())
+        .bind(hold_key)
+        .bind(reason)
+        .bind(expires_at)
+        .bind(created_at)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Release one repository retention hold, returning whether it existed.
+    ///
+    /// # Errors
+    ///
+    /// Propagates SQLx failures.
+    pub async fn release_pack_retention_hold(
+        &self,
+        repository: RepositoryPk,
+        hold_key: &str,
+    ) -> Result<bool> {
+        if hold_key.is_empty() || hold_key.len() > 256 {
+            return Err(Error::Backend("invalid pack retention hold key".to_owned()));
+        }
+        let (tenant, repository_id) = repository_identity_by_pk(&self.pool, repository).await?;
+        let mut tx = self.pool.begin().await?;
+        if !lock_expected_repository(&mut tx, repository, &tenant, &repository_id).await? {
+            tx.rollback().await?;
+            return Err(Error::Backend(
+                "retention-hold repository identity changed".to_owned(),
+            ));
+        }
+        let deleted = sqlx::query(
+            "delete from grit_repository_retention_holds
+             where repository_pk = $1 and hold_key = $2",
+        )
+        .bind(repository.get())
+        .bind(hold_key)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+        tx.commit().await?;
+        Ok(deleted)
+    }
+
+    /// Publish an already-durable replacement and atomically snapshot superseded packs.
+    ///
+    /// This method never constructs a pack or deletes bytes. The replacement and all superseded
+    /// packs must already be durable in the same repository, and the replacement index must cover
+    /// every object indexed by the superseded set.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation errors or propagates SQLx failures.
+    pub async fn publish_pack_maintenance_replacement(
+        &self,
+        claim: &PgPackMaintenanceClaim,
+        replacement: &ObjectId,
+        superseded: &[ObjectId],
+        observed_at: OffsetDateTime,
+    ) -> Result<PgPackMaintenanceOutcome> {
+        validate_pack_maintenance_claim(claim, observed_at)?;
+        let superseded_bytes = validate_superseded_packs(replacement, superseded)?;
+        let (tenant, repository) =
+            repository_identity_by_pk(&self.pool, claim.job.repository).await?;
+        let mut tx = self.pool.begin().await?;
+        if !lock_expected_repository(&mut tx, claim.job.repository, &tenant, &repository).await? {
+            tx.rollback().await?;
+            return Ok(PgPackMaintenanceOutcome::ClaimLost);
+        }
+        let row =
+            sqlx::query("select * from grit_pack_maintenance_jobs where job_id = $1 for update")
+                .bind(
+                    i64::try_from(claim.job.job_id)
+                        .map_err(|_| Error::Backend("maintenance job id exceeds i64".to_owned()))?,
+                )
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(row) = row else {
+            tx.rollback().await?;
+            return Ok(PgPackMaintenanceOutcome::ClaimLost);
+        };
+        let job = row_to_pack_maintenance_job(&row)?;
+        if job.phase != PgPackMaintenancePhase::Planned {
+            tx.rollback().await?;
+            return Ok(if job.replacement.as_ref() == Some(replacement) {
+                PgPackMaintenanceOutcome::AlreadyApplied
+            } else {
+                PgPackMaintenanceOutcome::Corrupt {
+                    detail: "maintenance job has a different replacement".to_owned(),
+                }
+            });
+        }
+        if !maintenance_claim_matches(&job, claim, observed_at) {
+            tx.rollback().await?;
+            return Ok(PgPackMaintenanceOutcome::ClaimLost);
+        }
+        let repository_row = sqlx::query(
+            "select hash_algo, ref_generation, history_generation
+             from grit_repositories where repository_pk = $1",
+        )
+        .bind(claim.job.repository.get())
+        .fetch_one(&mut *tx)
+        .await?;
+        let hash_algo_name: String = repository_row.try_get("hash_algo")?;
+        let hash_algo = HashAlgo::from_name(&hash_algo_name)
+            .ok_or_else(|| Error::Backend("invalid repository hash algorithm".to_owned()))?;
+        if replacement.algo() != hash_algo || superseded.iter().any(|oid| oid.algo() != hash_algo) {
+            tx.rollback().await?;
+            return Ok(PgPackMaintenanceOutcome::Corrupt {
+                detail: "pack checksum algorithm does not match repository".to_owned(),
+            });
+        }
+        let ref_generation = nonnegative_i64_to_u64(
+            repository_row.try_get("ref_generation")?,
+            "maintenance ref generation",
+        )?;
+        let history_generation = nonnegative_i64_to_u64(
+            repository_row.try_get("history_generation")?,
+            "maintenance history generation",
+        )?;
+        if ref_generation != job.ref_generation || history_generation != job.history_generation {
+            tx.rollback().await?;
+            return Ok(PgPackMaintenanceOutcome::Blocked {
+                reason: "repository generations changed after maintenance planning".to_owned(),
+            });
+        }
+        let replacement_exists: bool = sqlx::query_scalar(
+            "select exists(select 1 from grit_packs
+             where repository_pk = $1 and pack_checksum_bytes = $2)",
+        )
+        .bind(claim.job.repository.get())
+        .bind(replacement.as_bytes())
+        .fetch_one(&mut *tx)
+        .await?;
+        let superseded_count: i64 = sqlx::query_scalar(
+            "select count(*) from grit_packs
+             where repository_pk = $1 and pack_checksum_bytes = any($2::bytea[])",
+        )
+        .bind(claim.job.repository.get())
+        .bind(&superseded_bytes)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !replacement_exists || superseded_count != superseded_bytes.len() as i64 {
+            tx.rollback().await?;
+            return Ok(PgPackMaintenanceOutcome::Corrupt {
+                detail: "replacement or superseded pack metadata is missing".to_owned(),
+            });
+        }
+        let mut validated_packs = superseded_bytes.clone();
+        validated_packs.push(replacement.as_bytes().to_vec());
+        if !pack_indexes_match_metadata(&mut tx, job.repository, &validated_packs).await? {
+            tx.rollback().await?;
+            return Ok(PgPackMaintenanceOutcome::Corrupt {
+                detail: "pack object counts disagree with their indexes".to_owned(),
+            });
+        }
+        if !pack_replacement_covers(
+            &mut tx,
+            claim.job.repository,
+            replacement,
+            &superseded_bytes,
+        )
+        .await?
+        {
+            tx.rollback().await?;
+            return Ok(PgPackMaintenanceOutcome::Corrupt {
+                detail: "replacement index does not cover the superseded pack set".to_owned(),
+            });
+        }
+        let prune_after = observed_at
+            .checked_add(job.grace)
+            .ok_or_else(|| Error::Backend("maintenance prune timestamp overflow".to_owned()))?;
+        let inserted = sqlx::query(
+            "insert into grit_pack_maintenance_superseded
+                (job_id, pack_checksum, index_checksum, storage_backend, storage_key,
+                 object_count, size_bytes)
+             select $1, pack_checksum_bytes, index_checksum_bytes, storage_backend, storage_key,
+                    object_count, size_bytes
+             from grit_packs where repository_pk = $2
+               and pack_checksum_bytes = any($3::bytea[])
+             on conflict (job_id, pack_checksum) do nothing",
+        )
+        .bind(
+            i64::try_from(job.job_id)
+                .map_err(|_| Error::Backend("maintenance job id exceeds i64".to_owned()))?,
+        )
+        .bind(job.repository.get())
+        .bind(&superseded_bytes)
+        .execute(&mut *tx)
+        .await?;
+        if inserted.rows_affected() != superseded_bytes.len() as u64 {
+            tx.rollback().await?;
+            return Ok(PgPackMaintenanceOutcome::Corrupt {
+                detail: "superseded pack snapshot was incomplete".to_owned(),
+            });
+        }
+        sqlx::query(
+            "insert into grit_pack_maintenance_objects (job_id, oid)
+             select distinct $1, oid_bytes from grit_pack_objects
+             where repository_pk = $2 and pack_checksum_bytes = any($3::bytea[])
+             on conflict (job_id, oid) do nothing",
+        )
+        .bind(
+            i64::try_from(job.job_id)
+                .map_err(|_| Error::Backend("maintenance job id exceeds i64".to_owned()))?,
+        )
+        .bind(job.repository.get())
+        .bind(&superseded_bytes)
+        .execute(&mut *tx)
+        .await?;
+        if !pack_replacement_covers_snapshot(&mut tx, job.job_id, job.repository, replacement)
+            .await?
+        {
+            tx.rollback().await?;
+            return Ok(PgPackMaintenanceOutcome::Corrupt {
+                detail: "replacement does not cover the persisted object snapshot".to_owned(),
+            });
+        }
+        let changed = sqlx::query(
+            "update grit_pack_maintenance_jobs
+             set phase = 2, replacement_pack_checksum = $2, prune_after = $3, updated_at = $4
+             where job_id = $1 and phase = 1 and claimed_by = $5 and fencing_token = $6
+               and lease_expires_at > $4",
+        )
+        .bind(
+            i64::try_from(job.job_id)
+                .map_err(|_| Error::Backend("maintenance job id exceeds i64".to_owned()))?,
+        )
+        .bind(replacement.as_bytes())
+        .bind(prune_after)
+        .bind(observed_at)
+        .bind(&claim.worker_id)
+        .bind(
+            i64::try_from(claim.fencing_token)
+                .map_err(|_| Error::Backend("maintenance fencing token exceeds i64".to_owned()))?,
+        )
+        .execute(&mut *tx)
+        .await?;
+        if changed.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(PgPackMaintenanceOutcome::ClaimLost);
+        }
+        tx.commit().await?;
+        Ok(PgPackMaintenanceOutcome::Applied)
+    }
+
+    /// Prune superseded SQL metadata after grace and revalidation.
+    ///
+    /// External bytes are only registered as orphan candidates; this method performs no external
+    /// I/O and never runs database-wide maintenance such as `VACUUM`.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation errors or propagates SQLx failures.
+    pub async fn prune_pack_maintenance_job(
+        &self,
+        claim: &PgPackMaintenanceClaim,
+        observed_at: OffsetDateTime,
+    ) -> Result<PgPackMaintenanceOutcome> {
+        validate_pack_maintenance_claim(claim, observed_at)?;
+        let (tenant, repository) =
+            repository_identity_by_pk(&self.pool, claim.job.repository).await?;
+        let mut tx = self.pool.begin().await?;
+        if !lock_expected_repository(&mut tx, claim.job.repository, &tenant, &repository).await? {
+            tx.rollback().await?;
+            return Ok(PgPackMaintenanceOutcome::ClaimLost);
+        }
+        let row =
+            sqlx::query("select * from grit_pack_maintenance_jobs where job_id = $1 for update")
+                .bind(
+                    i64::try_from(claim.job.job_id)
+                        .map_err(|_| Error::Backend("maintenance job id exceeds i64".to_owned()))?,
+                )
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(row) = row else {
+            tx.rollback().await?;
+            return Ok(PgPackMaintenanceOutcome::ClaimLost);
+        };
+        let job = row_to_pack_maintenance_job(&row)?;
+        if matches!(
+            job.phase,
+            PgPackMaintenancePhase::MetadataSwept
+                | PgPackMaintenancePhase::ExternalSweepPending
+                | PgPackMaintenancePhase::Complete
+        ) {
+            tx.rollback().await?;
+            return Ok(PgPackMaintenanceOutcome::AlreadyApplied);
+        }
+        if job.phase != PgPackMaintenancePhase::ReplacementPublished
+            || !maintenance_claim_matches(&job, claim, observed_at)
+        {
+            tx.rollback().await?;
+            return Ok(PgPackMaintenanceOutcome::ClaimLost);
+        }
+        let prune_after = job.prune_after.ok_or_else(|| {
+            Error::Backend("published maintenance job has no prune time".to_owned())
+        })?;
+        if observed_at < prune_after {
+            tx.rollback().await?;
+            return Ok(PgPackMaintenanceOutcome::Blocked {
+                reason: "superseded pack grace period is active".to_owned(),
+            });
+        }
+        let generations: Option<(i64, i64)> = sqlx::query_as(
+            "select ref_generation, history_generation from grit_repositories
+             where repository_pk = $1 and deleted_at is null",
+        )
+        .bind(job.repository.get())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let expected_generations = (
+            i64::try_from(job.ref_generation)
+                .map_err(|_| Error::Backend("maintenance ref generation exceeds i64".to_owned()))?,
+            i64::try_from(job.history_generation).map_err(|_| {
+                Error::Backend("maintenance history generation exceeds i64".to_owned())
+            })?,
+        );
+        if generations != Some(expected_generations) {
+            tx.rollback().await?;
+            return Ok(PgPackMaintenanceOutcome::Blocked {
+                reason: "repository generations changed after maintenance planning".to_owned(),
+            });
+        }
+        let active_hold: bool = sqlx::query_scalar(
+            "select exists(select 1 from grit_repository_retention_holds
+             where repository_pk = $1 and expires_at > $2)",
+        )
+        .bind(job.repository.get())
+        .bind(observed_at)
+        .fetch_one(&mut *tx)
+        .await?;
+        let active_rollback: bool = sqlx::query_scalar(
+            "select exists(select 1 from grit_repository_routes
+             where (source_repository_pk = $1 or destination_repository_pk = $1)
+               and active_repository_pk = destination_repository_pk
+               and rolled_back_at is null and rollback_deadline > $2)",
+        )
+        .bind(job.repository.get())
+        .bind(observed_at)
+        .fetch_one(&mut *tx)
+        .await?;
+        if active_hold || active_rollback {
+            tx.rollback().await?;
+            return Ok(PgPackMaintenanceOutcome::Blocked {
+                reason: if active_hold {
+                    "an unexpired repository retention hold blocks pruning"
+                } else {
+                    "an active migration rollback window blocks pruning"
+                }
+                .to_owned(),
+            });
+        }
+        let superseded_rows = sqlx::query(
+            "select snapshot.pack_checksum, snapshot.storage_backend, snapshot.storage_key,
+                    snapshot.size_bytes,
+                    (pack.pack_checksum_bytes is not null) as pack_exists,
+                    (pack.index_checksum_bytes is not distinct from snapshot.index_checksum
+                     and pack.storage_backend is not distinct from snapshot.storage_backend
+                     and pack.storage_key is not distinct from snapshot.storage_key
+                     and pack.object_count is not distinct from snapshot.object_count
+                     and pack.size_bytes is not distinct from snapshot.size_bytes)
+                        as metadata_matches
+             from grit_pack_maintenance_superseded snapshot
+             left join grit_packs pack on pack.repository_pk = $2
+               and pack.pack_checksum_bytes = snapshot.pack_checksum
+             where snapshot.job_id = $1 order by snapshot.pack_checksum",
+        )
+        .bind(
+            i64::try_from(job.job_id)
+                .map_err(|_| Error::Backend("maintenance job id exceeds i64".to_owned()))?,
+        )
+        .bind(job.repository.get())
+        .fetch_all(&mut *tx)
+        .await?;
+        let snapshots_match = superseded_rows.iter().try_fold(true, |matches, row| {
+            Ok::<_, sqlx::Error>(
+                matches
+                    && row.try_get::<bool, _>("pack_exists")?
+                    && row.try_get::<bool, _>("metadata_matches")?,
+            )
+        })?;
+        if superseded_rows.is_empty() || !snapshots_match {
+            tx.rollback().await?;
+            return Ok(PgPackMaintenanceOutcome::Corrupt {
+                detail: "superseded pack metadata changed before pruning".to_owned(),
+            });
+        }
+        let superseded_bytes = superseded_rows
+            .iter()
+            .map(|row| row.try_get::<Vec<u8>, _>("pack_checksum"))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let replacement = job.replacement.ok_or_else(|| {
+            Error::Backend("published maintenance job has no replacement".to_owned())
+        })?;
+        if !pack_indexes_match_metadata(&mut tx, job.repository, &superseded_bytes).await?
+            || !pack_snapshot_matches_live_superseded(
+                &mut tx,
+                job.job_id,
+                job.repository,
+                &superseded_bytes,
+            )
+            .await?
+            || !pack_replacement_covers_snapshot(&mut tx, job.job_id, job.repository, &replacement)
+                .await?
+        {
+            tx.rollback().await?;
+            return Ok(PgPackMaintenanceOutcome::Corrupt {
+                detail: "replacement coverage changed before pruning".to_owned(),
+            });
+        }
+        sqlx::query(
+            "insert into grit_external_orphan_candidates
+                (tenant_id, repository_id, storage_backend, storage_key,
+                 size_bytes, first_observed_at)
+             select $2, $3, storage_backend, storage_key, size_bytes, $4
+             from grit_pack_maintenance_superseded
+             where job_id = $1 and storage_backend <> 'database'
+             on conflict (tenant_id, repository_id, storage_backend, storage_key) do update
+             set size_bytes = excluded.size_bytes,
+                 first_observed_at = coalesce(
+                    grit_external_orphan_candidates.first_observed_at,
+                    excluded.first_observed_at)",
+        )
+        .bind(
+            i64::try_from(job.job_id)
+                .map_err(|_| Error::Backend("maintenance job id exceeds i64".to_owned()))?,
+        )
+        .bind(tenant.as_str())
+        .bind(repository.as_str())
+        .bind(observed_at)
+        .execute(&mut *tx)
+        .await?;
+        let checksums = superseded_bytes
+            .iter()
+            .map(|checksum| bytes_to_hex(checksum))
+            .collect::<Vec<_>>();
+        let expected_index_rows: i64 = sqlx::query_scalar(
+            "select count(*) from grit_pack_objects
+             where repository_pk = $1 and pack_checksum_bytes = any($2::bytea[])",
+        )
+        .bind(job.repository.get())
+        .bind(&superseded_bytes)
+        .fetch_one(&mut *tx)
+        .await?;
+        let deleted_indexes = sqlx::query(
+            "delete from grit_pack_objects
+             where repository_pk = $1 and pack_checksum = any($2::text[])",
+        )
+        .bind(job.repository.get())
+        .bind(&checksums)
+        .execute(&mut *tx)
+        .await?;
+        if i64::try_from(deleted_indexes.rows_affected()).ok() != Some(expected_index_rows) {
+            tx.rollback().await?;
+            return Ok(PgPackMaintenanceOutcome::Corrupt {
+                detail: "superseded pack index deletion was incomplete".to_owned(),
+            });
+        }
+        let deleted_packs = sqlx::query(
+            "delete from grit_packs
+             where repository_pk = $1 and pack_checksum = any($2::text[])",
+        )
+        .bind(job.repository.get())
+        .bind(&checksums)
+        .execute(&mut *tx)
+        .await?;
+        if deleted_packs.rows_affected() != superseded_rows.len() as u64 {
+            tx.rollback().await?;
+            return Ok(PgPackMaintenanceOutcome::Corrupt {
+                detail: "superseded pack deletion was incomplete".to_owned(),
+            });
+        }
+        let has_external = superseded_rows
+            .iter()
+            .try_fold(false, |has_external, row| {
+                Ok::<_, sqlx::Error>(
+                    has_external || row.try_get::<String, _>("storage_backend")? != "database",
+                )
+            })?;
+        let changed = sqlx::query(
+            "update grit_pack_maintenance_jobs set phase = $2, updated_at = $3,
+                    claimed_by = null, lease_expires_at = null
+             where job_id = $1 and phase = 2 and claimed_by = $4 and fencing_token = $5
+               and lease_expires_at > $3",
+        )
+        .bind(
+            i64::try_from(job.job_id)
+                .map_err(|_| Error::Backend("maintenance job id exceeds i64".to_owned()))?,
+        )
+        .bind(if has_external { 4_i16 } else { 5_i16 })
+        .bind(observed_at)
+        .bind(&claim.worker_id)
+        .bind(
+            i64::try_from(claim.fencing_token)
+                .map_err(|_| Error::Backend("maintenance fencing token exceeds i64".to_owned()))?,
+        )
+        .execute(&mut *tx)
+        .await?;
+        if changed.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(PgPackMaintenanceOutcome::ClaimLost);
+        }
+        tx.commit().await?;
+        Ok(PgPackMaintenanceOutcome::Applied)
+    }
+
+    /// Complete a metadata-swept job after any external orphan candidates are removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation errors or propagates SQLx failures.
+    pub async fn complete_pack_maintenance_job(
+        &self,
+        claim: &PgPackMaintenanceClaim,
+        observed_at: OffsetDateTime,
+    ) -> Result<PgPackMaintenanceOutcome> {
+        validate_pack_maintenance_claim(claim, observed_at)?;
+        let (tenant, repository) =
+            repository_identity_by_pk(&self.pool, claim.job.repository).await?;
+        let mut tx = self.pool.begin().await?;
+        if !lock_expected_repository(&mut tx, claim.job.repository, &tenant, &repository).await? {
+            tx.rollback().await?;
+            return Ok(PgPackMaintenanceOutcome::ClaimLost);
+        }
+        let job_id = i64::try_from(claim.job.job_id)
+            .map_err(|_| Error::Backend("maintenance job id exceeds i64".to_owned()))?;
+        let row =
+            sqlx::query("select * from grit_pack_maintenance_jobs where job_id = $1 for update")
+                .bind(job_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(row) = row else {
+            tx.rollback().await?;
+            return Ok(PgPackMaintenanceOutcome::ClaimLost);
+        };
+        let job = row_to_pack_maintenance_job(&row)?;
+        if job.phase == PgPackMaintenancePhase::Complete {
+            tx.rollback().await?;
+            return Ok(PgPackMaintenanceOutcome::AlreadyApplied);
+        }
+        if !matches!(
+            job.phase,
+            PgPackMaintenancePhase::MetadataSwept | PgPackMaintenancePhase::ExternalSweepPending
+        ) || !maintenance_claim_matches(&job, claim, observed_at)
+        {
+            tx.rollback().await?;
+            return Ok(PgPackMaintenanceOutcome::ClaimLost);
+        }
+        if job.phase == PgPackMaintenancePhase::ExternalSweepPending {
+            let pending: bool = sqlx::query_scalar(
+                "select exists(
+                     select 1 from grit_pack_maintenance_superseded snapshot
+                     join grit_external_orphan_candidates candidate
+                       on candidate.tenant_id = $2 and candidate.repository_id = $3
+                      and candidate.storage_backend = snapshot.storage_backend
+                      and candidate.storage_key = snapshot.storage_key
+                     where snapshot.job_id = $1 and snapshot.storage_backend <> 'database')",
+            )
+            .bind(job_id)
+            .bind(tenant.as_str())
+            .bind(repository.as_str())
+            .fetch_one(&mut *tx)
+            .await?;
+            if pending {
+                tx.rollback().await?;
+                return Ok(PgPackMaintenanceOutcome::Blocked {
+                    reason: "external orphan candidates are still pending".to_owned(),
+                });
+            }
+        }
+        let changed = sqlx::query(
+            "update grit_pack_maintenance_jobs
+             set phase = 5, claimed_by = null, lease_expires_at = null, updated_at = $4
+             where job_id = $1 and phase in (3, 4) and claimed_by = $2
+               and fencing_token = $3 and lease_expires_at > $4",
+        )
+        .bind(job_id)
+        .bind(&claim.worker_id)
+        .bind(
+            i64::try_from(claim.fencing_token)
+                .map_err(|_| Error::Backend("maintenance fencing token exceeds i64".to_owned()))?,
+        )
+        .bind(observed_at)
+        .execute(&mut *tx)
+        .await?;
+        if changed.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(PgPackMaintenanceOutcome::ClaimLost);
+        }
+        tx.commit().await?;
+        Ok(PgPackMaintenanceOutcome::Applied)
+    }
+
+    /// Release a live maintenance claim without changing its phase.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation errors or propagates SQLx failures.
+    pub async fn release_pack_maintenance_claim(
+        &self,
+        claim: &PgPackMaintenanceClaim,
+        observed_at: OffsetDateTime,
+    ) -> Result<PgPackMaintenanceOutcome> {
+        validate_pack_maintenance_claim(claim, observed_at)?;
+        let changed = sqlx::query(
+            "update grit_pack_maintenance_jobs
+             set claimed_by = null, lease_expires_at = null, updated_at = $4
+             where job_id = $1 and phase between 1 and 4 and claimed_by = $2
+               and fencing_token = $3 and lease_expires_at > $4",
+        )
+        .bind(
+            i64::try_from(claim.job.job_id)
+                .map_err(|_| Error::Backend("maintenance job id exceeds i64".to_owned()))?,
+        )
+        .bind(&claim.worker_id)
+        .bind(
+            i64::try_from(claim.fencing_token)
+                .map_err(|_| Error::Backend("maintenance fencing token exceeds i64".to_owned()))?,
+        )
+        .bind(observed_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(if changed.rows_affected() == 1 {
+            PgPackMaintenanceOutcome::Applied
+        } else {
+            PgPackMaintenanceOutcome::ClaimLost
+        })
+    }
+
+    /// Stop a live maintenance job with a durable failure reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation errors or propagates SQLx failures.
+    pub async fn fail_pack_maintenance_job(
+        &self,
+        claim: &PgPackMaintenanceClaim,
+        reason: &str,
+        observed_at: OffsetDateTime,
+    ) -> Result<PgPackMaintenanceOutcome> {
+        validate_pack_maintenance_claim(claim, observed_at)?;
+        if reason.trim().is_empty() || reason.len() > 2048 {
+            return Err(Error::Backend(
+                "invalid maintenance failure reason".to_owned(),
+            ));
+        }
+        let changed = sqlx::query(
+            "update grit_pack_maintenance_jobs
+             set phase = 6, failure_reason = $4, claimed_by = null,
+                 lease_expires_at = null, updated_at = $5
+             where job_id = $1 and phase between 1 and 4 and claimed_by = $2
+               and fencing_token = $3 and lease_expires_at > $5",
+        )
+        .bind(
+            i64::try_from(claim.job.job_id)
+                .map_err(|_| Error::Backend("maintenance job id exceeds i64".to_owned()))?,
+        )
+        .bind(&claim.worker_id)
+        .bind(
+            i64::try_from(claim.fencing_token)
+                .map_err(|_| Error::Backend("maintenance fencing token exceeds i64".to_owned()))?,
+        )
+        .bind(reason)
+        .bind(observed_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(if changed.rows_affected() == 1 {
+            PgPackMaintenanceOutcome::Applied
+        } else {
+            PgPackMaintenanceOutcome::ClaimLost
+        })
+    }
+
+    /// Probe bounded pack/index and external-key metadata without fetching pack bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation errors, corrupt stored identifiers, or SQLx failures.
+    pub async fn probe_pack_consistency(
+        &self,
+        repository: RepositoryPk,
+        checksums: &[ObjectId],
+    ) -> Result<Vec<PgPackConsistencyProbe>> {
+        if checksums.is_empty() || checksums.len() > MAX_PACK_MAINTENANCE_BATCH {
+            return Err(Error::Backend(
+                "invalid pack consistency probe bound".to_owned(),
+            ));
+        }
+        let mut unique = HashSet::with_capacity(checksums.len());
+        if checksums
+            .iter()
+            .any(|checksum| !unique.insert(checksum.as_bytes().to_vec()))
+        {
+            return Err(Error::Backend(
+                "duplicate pack consistency checksum".to_owned(),
+            ));
+        }
+        let values = checksums
+            .iter()
+            .map(|checksum| checksum.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        let rows = sqlx::query(
+            "select pack.pack_checksum_bytes, pack.object_count,
+                    count(indexed.oid_bytes) as indexed_count,
+                    pack.storage_backend, pack.storage_key
+             from grit_packs pack
+             left join grit_pack_objects indexed on indexed.repository_pk = pack.repository_pk
+               and indexed.pack_checksum_bytes = pack.pack_checksum_bytes
+             where pack.repository_pk = $1 and pack.pack_checksum_bytes = any($2::bytea[])
+             group by pack.pack_checksum_bytes, pack.object_count,
+                      pack.storage_backend, pack.storage_key
+             order by pack.pack_checksum_bytes",
+        )
+        .bind(repository.get())
+        .bind(&values)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                let object_count: i32 = row.try_get("object_count")?;
+                let indexed_count: i64 = row.try_get("indexed_count")?;
+                let backend: String = row.try_get("storage_backend")?;
+                let storage_key: Option<String> = row.try_get("storage_key")?;
+                Ok(PgPackConsistencyProbe {
+                    checksum: ObjectId::from_bytes(
+                        &row.try_get::<Vec<u8>, _>("pack_checksum_bytes")?,
+                    )?,
+                    index_binding_valid: i64::from(object_count) == indexed_count,
+                    external_key_metadata_valid: if backend == "database" {
+                        storage_key.is_none()
+                    } else {
+                        storage_key.is_some_and(|key| !key.is_empty())
+                    },
+                })
+            })
+            .collect()
     }
 
     /// Claim a bounded oldest-first batch of durable cache invalidation events.
@@ -5998,6 +7196,210 @@ async fn bump_repository_generation_at(
     enqueue_cache_invalidation_in_transaction(tx, repository_pk, tenant, repository, &event).await
 }
 
+fn validate_pack_maintenance_policy(policy: PgPackMaintenancePolicy) -> Result<()> {
+    if policy.min_pack_count == 0
+        || i32::try_from(policy.min_pack_count).is_err()
+        || i64::try_from(policy.max_loose_count).is_err()
+        || i64::try_from(policy.min_fragmented_bytes).is_err()
+    {
+        return Err(Error::Backend("invalid pack maintenance policy".to_owned()));
+    }
+    Ok(())
+}
+
+fn validate_pack_maintenance_claim(
+    claim: &PgPackMaintenanceClaim,
+    observed_at: OffsetDateTime,
+) -> Result<()> {
+    if claim.job.job_id == 0
+        || claim.worker_id.trim().is_empty()
+        || claim.worker_id.len() > 256
+        || claim.fencing_token == 0
+        || claim.job.fencing_token != claim.fencing_token
+        || claim.job.claimed_by.as_deref() != Some(claim.worker_id.as_str())
+        || claim.job.lease_expires_at != Some(claim.lease_expires_at)
+        || observed_at < claim.job.updated_at
+        || observed_at >= claim.lease_expires_at
+    {
+        return Err(Error::Backend("invalid pack maintenance claim".to_owned()));
+    }
+    Ok(())
+}
+
+fn maintenance_claim_matches(
+    job: &PgPackMaintenanceJob,
+    claim: &PgPackMaintenanceClaim,
+    observed_at: OffsetDateTime,
+) -> bool {
+    job.repository == claim.job.repository
+        && job.claimed_by.as_deref() == Some(claim.worker_id.as_str())
+        && job.fencing_token == claim.fencing_token
+        && job.lease_expires_at == Some(claim.lease_expires_at)
+        && observed_at < claim.lease_expires_at
+}
+
+fn validate_superseded_packs(
+    replacement: &ObjectId,
+    superseded: &[ObjectId],
+) -> Result<Vec<Vec<u8>>> {
+    if superseded.is_empty() || superseded.len() > MAX_PACK_MAINTENANCE_BATCH {
+        return Err(Error::Backend("invalid superseded pack bound".to_owned()));
+    }
+    let mut unique = HashSet::with_capacity(superseded.len());
+    let values = superseded
+        .iter()
+        .map(|checksum| checksum.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    if values.iter().any(|checksum| {
+        checksum.as_slice() == replacement.as_bytes() || !unique.insert(checksum.clone())
+    }) {
+        return Err(Error::Backend("invalid superseded pack set".to_owned()));
+    }
+    Ok(values)
+}
+
+async fn pack_replacement_covers(
+    tx: &mut Transaction<'static, Postgres>,
+    repository: RepositoryPk,
+    replacement: &ObjectId,
+    superseded: &[Vec<u8>],
+) -> Result<bool> {
+    let missing: i64 = sqlx::query_scalar(
+        "select count(*) from (
+             select distinct oid_bytes from grit_pack_objects
+             where repository_pk = $1 and pack_checksum_bytes = any($2::bytea[])
+             except select oid_bytes from grit_pack_objects
+             where repository_pk = $1 and pack_checksum_bytes = $3
+         ) missing",
+    )
+    .bind(repository.get())
+    .bind(superseded)
+    .bind(replacement.as_bytes())
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(missing == 0)
+}
+
+async fn pack_indexes_match_metadata(
+    tx: &mut Transaction<'static, Postgres>,
+    repository: RepositoryPk,
+    checksums: &[Vec<u8>],
+) -> Result<bool> {
+    let mismatches: i64 = sqlx::query_scalar(
+        "select count(*) from grit_packs pack
+         where pack.repository_pk = $1 and pack.pack_checksum_bytes = any($2::bytea[])
+           and pack.object_count <> (
+               select count(*) from grit_pack_objects indexed
+               where indexed.repository_pk = pack.repository_pk
+                 and indexed.pack_checksum_bytes = pack.pack_checksum_bytes)",
+    )
+    .bind(repository.get())
+    .bind(checksums)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(mismatches == 0)
+}
+
+async fn pack_replacement_covers_snapshot(
+    tx: &mut Transaction<'static, Postgres>,
+    job_id: u64,
+    repository: RepositoryPk,
+    replacement: &ObjectId,
+) -> Result<bool> {
+    let missing: i64 = sqlx::query_scalar(
+        "select count(*) from (
+             select oid from grit_pack_maintenance_objects where job_id = $1
+             except select oid_bytes from grit_pack_objects
+             where repository_pk = $2 and pack_checksum_bytes = $3
+         ) missing",
+    )
+    .bind(
+        i64::try_from(job_id)
+            .map_err(|_| Error::Backend("maintenance job id exceeds i64".to_owned()))?,
+    )
+    .bind(repository.get())
+    .bind(replacement.as_bytes())
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(missing == 0)
+}
+
+async fn pack_snapshot_matches_live_superseded(
+    tx: &mut Transaction<'static, Postgres>,
+    job_id: u64,
+    repository: RepositoryPk,
+    superseded: &[Vec<u8>],
+) -> Result<bool> {
+    let job_id = i64::try_from(job_id)
+        .map_err(|_| Error::Backend("maintenance job id exceeds i64".to_owned()))?;
+    let mismatches: i64 = sqlx::query_scalar(
+        "select count(*) from (
+             (select oid from grit_pack_maintenance_objects where job_id = $1
+              except select distinct oid_bytes from grit_pack_objects
+              where repository_pk = $2 and pack_checksum_bytes = any($3::bytea[]))
+             union all
+             (select distinct oid_bytes from grit_pack_objects
+              where repository_pk = $2 and pack_checksum_bytes = any($3::bytea[])
+              except select oid from grit_pack_maintenance_objects where job_id = $1)
+         ) mismatches",
+    )
+    .bind(job_id)
+    .bind(repository.get())
+    .bind(superseded)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(mismatches == 0)
+}
+
+fn row_to_pack_maintenance_job(row: &sqlx::postgres::PgRow) -> Result<PgPackMaintenanceJob> {
+    let replacement = row
+        .try_get::<Option<Vec<u8>>, _>("replacement_pack_checksum")?
+        .map(|bytes| ObjectId::from_bytes(&bytes))
+        .transpose()?;
+    let grace_seconds: i64 = row.try_get("grace_seconds")?;
+    if grace_seconds < 0 {
+        return Err(Error::Backend("negative maintenance grace".to_owned()));
+    }
+    Ok(PgPackMaintenanceJob {
+        job_id: nonnegative_i64_to_u64(row.try_get("job_id")?, "maintenance job id")?,
+        repository: RepositoryPk::try_from(row.try_get::<i64, _>("repository_pk")?)
+            .map_err(|error| Error::Backend(error.to_string()))?,
+        ref_generation: nonnegative_i64_to_u64(
+            row.try_get("ref_generation")?,
+            "maintenance ref generation",
+        )?,
+        history_generation: nonnegative_i64_to_u64(
+            row.try_get("history_generation")?,
+            "maintenance history generation",
+        )?,
+        phase: PgPackMaintenancePhase::from_code(row.try_get("phase")?)?,
+        policy: PgPackMaintenancePolicy {
+            min_pack_count: u32::try_from(row.try_get::<i32, _>("min_pack_count")?)
+                .map_err(|_| Error::Backend("invalid maintenance pack threshold".to_owned()))?,
+            max_loose_count: nonnegative_i64_to_u64(
+                row.try_get("max_loose_count")?,
+                "maintenance loose threshold",
+            )?,
+            min_fragmented_bytes: nonnegative_i64_to_u64(
+                row.try_get("min_fragmented_bytes")?,
+                "maintenance byte threshold",
+            )?,
+        },
+        grace: Duration::seconds(grace_seconds),
+        replacement,
+        prune_after: row.try_get("prune_after")?,
+        claimed_by: row.try_get("claimed_by")?,
+        fencing_token: nonnegative_i64_to_u64(
+            row.try_get("fencing_token")?,
+            "maintenance fencing token",
+        )?,
+        lease_expires_at: row.try_get("lease_expires_at")?,
+        attempt_count: u32::try_from(row.try_get::<i32, _>("attempt_count")?)
+            .map_err(|_| Error::Backend("invalid maintenance attempt count".to_owned()))?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
 fn validate_migration_create_options(options: &PgMigrationCreateOptions) -> Result<()> {
     if options.idempotency_key.trim().is_empty() || options.idempotency_key.len() > 256 {
         return Err(Error::Backend(
@@ -6704,6 +8106,24 @@ async fn repository_identity_by_pk(
         TenantId::new(row.try_get::<String, _>("tenant_id")?)?,
         RepositoryId::new(row.try_get::<String, _>("repository_id")?)?,
     ))
+}
+
+async fn lock_expected_repository(
+    tx: &mut Transaction<'static, Postgres>,
+    expected_pk: RepositoryPk,
+    tenant: &TenantId,
+    repository: &RepositoryId,
+) -> Result<bool> {
+    lock_import_repository(tx, tenant, repository).await?;
+    let actual_pk: Option<i64> = sqlx::query_scalar(
+        "select repository_pk from grit_repositories
+         where tenant_id = $1 and repository_id = $2 and deleted_at is null",
+    )
+    .bind(tenant.as_str())
+    .bind(repository.as_str())
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(actual_pk == Some(expected_pk.get()))
 }
 
 async fn lock_migration_repository_pair(
