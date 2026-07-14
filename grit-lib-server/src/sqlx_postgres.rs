@@ -44,6 +44,20 @@ pub const MIGRATIONS: &[&str] = &[
         add column if not exists deleted_at timestamptz",
     "alter table grit_repositories
         add column if not exists updated_at timestamptz not null default now()",
+    "alter table grit_repositories
+        add column if not exists ref_generation bigint not null default 0",
+    "do $$ begin
+        if not exists (
+            select 1 from pg_constraint
+            where conrelid = 'grit_repositories'::regclass
+              and conname = 'grit_repositories_ref_generation_nonnegative'
+        ) then
+            alter table grit_repositories
+                add constraint grit_repositories_ref_generation_nonnegative
+                check (ref_generation >= 0) not valid;
+        end if;
+     end $$",
+    "alter table grit_repositories validate constraint grit_repositories_ref_generation_nonnegative",
     "create sequence if not exists grit_repository_pk_seq",
     "alter table grit_repositories add column if not exists repository_pk bigint",
     "alter sequence grit_repository_pk_seq
@@ -136,6 +150,33 @@ pub const MIGRATIONS: &[&str] = &[
         check (octet_length(tree_oid) in (20, 32)),
         check (format_version between 1 and 255),
         check (entry_count between 0 and 4294967295)
+    )",
+    "create table if not exists grit_repository_summaries (
+        repository_pk bigint not null,
+        ref_generation bigint not null,
+        hash_algo text not null,
+        repository_created_at timestamptz not null,
+        default_branch_refname text,
+        default_branch_target bytea,
+        refs_count bigint not null,
+        branch_count bigint not null,
+        tag_count bigint not null,
+        latest_commit_oid bytea,
+        latest_commit_tree_oid bytea,
+        latest_commit_time bigint,
+        latest_commit_generation integer,
+        primary key (repository_pk, ref_generation),
+        constraint grit_repository_summaries_repository_fk foreign key (repository_pk)
+            references grit_repositories (repository_pk) on delete cascade,
+        check (ref_generation >= 0),
+        check (refs_count >= 0 and branch_count >= 0 and tag_count >= 0),
+        check ((default_branch_refname is null) = (default_branch_target is null)),
+        check ((latest_commit_oid is null) = (latest_commit_tree_oid is null)
+            and (latest_commit_oid is null) = (latest_commit_time is null)
+            and (latest_commit_oid is null) = (latest_commit_generation is null)),
+        check (default_branch_target is null or octet_length(default_branch_target) in (20, 32)),
+        check (latest_commit_oid is null or octet_length(latest_commit_oid) in (20, 32)),
+        check (latest_commit_tree_oid is null or octet_length(latest_commit_tree_oid) in (20, 32))
     )",
     "create table if not exists grit_commits (
         tenant_id text not null,
@@ -416,6 +457,8 @@ pub struct PgRepositoryRow {
     pub repository: RepositoryId,
     /// Object hash algorithm used by the repository.
     pub hash_algo: HashAlgo,
+    /// Durable generation advanced by visible ref mutations.
+    pub ref_generation: u64,
     /// Timestamp when the repository row was created.
     pub created_at: OffsetDateTime,
     /// Timestamp when repository metadata was last changed.
@@ -424,6 +467,89 @@ pub struct PgRepositoryRow {
     pub archived_at: Option<OffsetDateTime>,
     /// Timestamp when the repository was soft-deleted, if retained.
     pub deleted_at: Option<OffsetDateTime>,
+}
+
+/// Resolved default branch stored in a generation-scoped repository summary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgSummaryBranch {
+    /// Full branch ref name.
+    pub refname: String,
+    /// Object id reached by resolving the branch.
+    pub target: ObjectId,
+}
+
+/// Commit-graph metadata stored for the commit resolved from `HEAD`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgSummaryCommit {
+    /// Commit object id.
+    pub oid: ObjectId,
+    /// Root tree object id.
+    pub tree: ObjectId,
+    /// Commit timestamp from the indexed commit row.
+    pub commit_time: i64,
+    /// Commit-graph generation number.
+    pub generation: u32,
+}
+
+/// Durable, generation-scoped repository summary used by bounded landing-page reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgRepositorySummary {
+    /// Immutable numeric repository identity.
+    pub repository_pk: RepositoryPk,
+    /// Ref generation represented by this summary.
+    pub ref_generation: u64,
+    /// Repository object hash algorithm.
+    pub hash_algo: HashAlgo,
+    /// Repository creation timestamp.
+    pub created_at: OffsetDateTime,
+    /// Resolved default branch, or explicit absence for detached, unborn, or missing `HEAD`.
+    pub default_branch: Option<PgSummaryBranch>,
+    /// Count of all refs, including `HEAD`.
+    pub refs_count: u64,
+    /// Count of refs below `refs/heads/`.
+    pub branch_count: u64,
+    /// Count of refs below `refs/tags/`.
+    pub tag_count: u64,
+    /// Indexed commit metadata reached from `HEAD`, when available.
+    pub latest_commit: Option<PgSummaryCommit>,
+}
+
+/// Result of reading the one bounded summary row nearest the current ref generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PgRepositorySummaryRead {
+    /// A summary exactly matches the repository's current ref generation.
+    Hit(PgRepositorySummary),
+    /// No summary has been installed for this repository.
+    Miss {
+        /// Current ref generation that a builder should target.
+        current_generation: u64,
+    },
+    /// Only an older summary exists and must not be served as current.
+    Stale {
+        /// Current ref generation that a builder should target.
+        current_generation: u64,
+        /// Newest cached generation observed by the bounded read.
+        cached_generation: u64,
+    },
+}
+
+/// Explicit limits for deterministic repository-summary recomputation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PgRepositorySummaryOptions {
+    /// Maximum number of symbolic ref links followed while resolving `HEAD`.
+    pub max_symbolic_depth: u32,
+}
+
+/// Result of a recompute-and-install attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PgRepositorySummaryInstall {
+    /// The summary was installed while its observed generation remained current.
+    Installed(PgRepositorySummary),
+    /// A concurrent ref mutation advanced the generation, so no stale row was published.
+    Stale {
+        /// Generation used to build the rejected summary.
+        observed_generation: u64,
+    },
 }
 
 /// Compact-tree read behavior selected for one repository cohort.
@@ -595,6 +721,191 @@ impl PgServerStorage {
     #[must_use]
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Read at most one cached summary and validate it against the durable ref generation.
+    ///
+    /// This path does not list or recount refs and never returns an older generation as a hit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::RepositoryNotFound`] when the repository is absent, [`Error::Backend`]
+    /// for invalid cached metadata, or SQLx errors from PostgreSQL.
+    pub async fn read_repository_summary(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+    ) -> Result<PgRepositorySummaryRead> {
+        let row = sqlx::query(
+            "select repository.repository_pk,
+                    repository.ref_generation as current_generation,
+                    summary.ref_generation as cached_generation,
+                    summary.hash_algo, summary.repository_created_at,
+                    summary.default_branch_refname, summary.default_branch_target,
+                    summary.refs_count, summary.branch_count, summary.tag_count,
+                    summary.latest_commit_oid,
+                    summary.latest_commit_tree_oid, summary.latest_commit_time,
+                    summary.latest_commit_generation
+             from grit_repositories repository
+             left join lateral (
+                 select * from grit_repository_summaries cached
+                 where cached.repository_pk = repository.repository_pk
+                 order by cached.ref_generation desc
+                 limit 1
+             ) summary on true
+             where repository.tenant_id = $1 and repository.repository_id = $2
+               and repository.deleted_at is null",
+        )
+        .bind(tenant.as_str())
+        .bind(repository.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Err(Error::RepositoryNotFound(repository_key(
+                tenant, repository,
+            )));
+        };
+        let current_generation =
+            nonnegative_i64_to_u64(row.try_get("current_generation")?, "current ref generation")?;
+        let Some(cached_generation) = row.try_get::<Option<i64>, _>("cached_generation")? else {
+            return Ok(PgRepositorySummaryRead::Miss { current_generation });
+        };
+        let cached_generation = nonnegative_i64_to_u64(cached_generation, "cached ref generation")?;
+        if cached_generation != current_generation {
+            return Ok(PgRepositorySummaryRead::Stale {
+                current_generation,
+                cached_generation,
+            });
+        }
+        Ok(PgRepositorySummaryRead::Hit(row_to_repository_summary(
+            &row,
+        )?))
+    }
+
+    /// Recompute a summary with fixed set-based queries and install it if its generation is current.
+    ///
+    /// `options.max_symbolic_depth` bounds recursive `HEAD` resolution. Ref counts are computed by
+    /// a PostgreSQL aggregate and are never materialized into process memory. A final repository-row
+    /// lock prevents a builder from publishing after a concurrent ref mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::RepositoryNotFound`] when the repository is absent, [`Error::Backend`]
+    /// when limits or stored metadata are invalid, or SQLx errors from PostgreSQL.
+    pub async fn recompute_repository_summary(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        options: PgRepositorySummaryOptions,
+    ) -> Result<PgRepositorySummaryInstall> {
+        if options.max_symbolic_depth == 0 || options.max_symbolic_depth > 64 {
+            return Err(Error::Backend(
+                "summary symbolic-ref depth must be between 1 and 64".to_owned(),
+            ));
+        }
+        let repository_row = self.require_repository(tenant, repository).await?;
+        let depth = i32::try_from(options.max_symbolic_depth)
+            .map_err(|_| Error::Backend("symbolic-ref depth exceeds i32".to_owned()))?;
+        let aggregate = sqlx::query(
+            "with recursive head_chain(depth, refname, target_oid, symbolic_target, seen) as (
+                 select 0, ref.refname, ref.target_oid, ref.symbolic_target, array[ref.refname]
+                 from grit_refs ref
+                 where ref.repository_pk = $1 and ref.refname = 'HEAD'
+                 union all
+                 select chain.depth + 1, ref.refname, ref.target_oid, ref.symbolic_target,
+                        chain.seen || ref.refname
+                 from head_chain chain
+                 join grit_refs ref
+                   on ref.repository_pk = $1 and ref.refname = chain.symbolic_target
+                 where chain.symbolic_target is not null and chain.depth < $2
+                   and not ref.refname = any(chain.seen)
+             ), resolution as (
+                 select depth, refname, target_oid, symbolic_target, seen
+                 from head_chain
+                 order by depth desc
+                 limit 1
+             ), ref_counts as (
+                 select count(*) as refs_count,
+                        count(*) filter (where refname like 'refs/heads/%') as branch_count,
+                        count(*) filter (where refname like 'refs/tags/%') as tag_count
+                 from grit_refs where repository_pk = $1
+             )
+             select ref_counts.refs_count, ref_counts.branch_count, ref_counts.tag_count,
+                    resolution.refname as resolved_refname,
+                    resolution.target_oid as resolved_head_oid,
+                    coalesce(
+                        resolution.symbolic_target = any(resolution.seen), false
+                    ) as cycle_detected,
+                    coalesce(
+                        resolution.symbolic_target is not null
+                        and resolution.depth >= $2
+                        and exists (
+                            select 1 from grit_refs next_ref
+                            where next_ref.repository_pk = $1
+                              and next_ref.refname = resolution.symbolic_target
+                        ), false
+                    ) as depth_exhausted
+             from ref_counts left join resolution on true",
+        )
+        .bind(repository_row.repository_pk.get())
+        .bind(depth)
+        .fetch_one(&self.pool)
+        .await?;
+        if aggregate.try_get::<bool, _>("cycle_detected")? {
+            return Err(Error::Backend(
+                "symbolic HEAD resolution contains a cycle".to_owned(),
+            ));
+        }
+        if aggregate.try_get::<bool, _>("depth_exhausted")? {
+            return Err(Error::Backend(format!(
+                "symbolic HEAD resolution exceeds the configured depth {}",
+                options.max_symbolic_depth
+            )));
+        }
+        let resolved_head_oid = aggregate
+            .try_get::<Option<String>, _>("resolved_head_oid")?
+            .map(|oid| ObjectId::from_hex(&oid))
+            .transpose()?;
+        if resolved_head_oid
+            .as_ref()
+            .is_some_and(|oid| oid.algo() != repository_row.hash_algo)
+        {
+            return Err(Error::Backend(
+                "resolved HEAD object id has the wrong hash algorithm".to_owned(),
+            ));
+        }
+        let latest_oid = resolved_head_oid;
+        let default_branch = match (
+            aggregate.try_get::<Option<String>, _>("resolved_refname")?,
+            resolved_head_oid,
+        ) {
+            (Some(refname), Some(target)) if refname.starts_with("refs/heads/") => {
+                Some(PgSummaryBranch { refname, target })
+            }
+            _ => None,
+        };
+        let latest_commit = match latest_oid {
+            Some(oid) => {
+                self.read_summary_commit(repository_row.repository_pk, oid)
+                    .await?
+            }
+            None => None,
+        };
+        let summary = PgRepositorySummary {
+            repository_pk: repository_row.repository_pk,
+            ref_generation: repository_row.ref_generation,
+            hash_algo: repository_row.hash_algo,
+            created_at: repository_row.created_at,
+            default_branch,
+            refs_count: nonnegative_i64_to_u64(aggregate.try_get("refs_count")?, "ref count")?,
+            branch_count: nonnegative_i64_to_u64(
+                aggregate.try_get("branch_count")?,
+                "branch count",
+            )?,
+            tag_count: nonnegative_i64_to_u64(aggregate.try_get("tag_count")?, "tag count")?,
+            latest_commit,
+        };
+        self.install_repository_summary(summary).await
     }
 
     /// Apply the built-in schema migrations.
@@ -892,6 +1203,138 @@ impl PgServerStorage {
         })
     }
 
+    async fn read_summary_commit(
+        &self,
+        repository_pk: RepositoryPk,
+        oid: ObjectId,
+    ) -> Result<Option<PgSummaryCommit>> {
+        let row = sqlx::query(
+            "select tree_oid, commit_time, generation
+             from grit_commits
+             where repository_pk = $1 and commit_oid = $2",
+        )
+        .bind(repository_pk.get())
+        .bind(oid.to_hex())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            let tree: String = row.try_get("tree_oid")?;
+            let tree = ObjectId::from_hex(&tree)?;
+            let generation: i32 = row.try_get("generation")?;
+            Ok(PgSummaryCommit {
+                oid,
+                tree,
+                commit_time: row.try_get("commit_time")?,
+                generation: u32::try_from(generation).map_err(|_| {
+                    Error::Backend("summary commit generation is negative".to_owned())
+                })?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn install_repository_summary(
+        &self,
+        summary: PgRepositorySummary,
+    ) -> Result<PgRepositorySummaryInstall> {
+        let observed_generation = i64::try_from(summary.ref_generation)
+            .map_err(|_| Error::Backend("ref generation exceeds i64".to_owned()))?;
+        let mut tx = self.pool.begin().await?;
+        let current: Option<i64> = sqlx::query_scalar(
+            "select ref_generation from grit_repositories
+             where repository_pk = $1 and deleted_at is null
+             for update",
+        )
+        .bind(summary.repository_pk.get())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(current) = current else {
+            return Err(Error::RepositoryNotFound(format!(
+                "repository pk {}",
+                summary.repository_pk.get()
+            )));
+        };
+        if current != observed_generation {
+            return Ok(PgRepositorySummaryInstall::Stale {
+                observed_generation: summary.ref_generation,
+            });
+        }
+        let (default_branch_refname, default_branch_target) = summary
+            .default_branch
+            .as_ref()
+            .map(|branch| {
+                (
+                    Some(branch.refname.as_str()),
+                    Some(branch.target.as_bytes()),
+                )
+            })
+            .unwrap_or((None, None));
+        let (latest_commit_oid, latest_commit_tree_oid, latest_commit_time, latest_generation) =
+            summary
+                .latest_commit
+                .as_ref()
+                .map(|commit| {
+                    (
+                        Some(commit.oid.as_bytes()),
+                        Some(commit.tree.as_bytes()),
+                        Some(commit.commit_time),
+                        i32::try_from(commit.generation).ok(),
+                    )
+                })
+                .unwrap_or((None, None, None, None));
+        if summary.latest_commit.is_some() && latest_generation.is_none() {
+            return Err(Error::Backend(
+                "summary commit generation exceeds i32".to_owned(),
+            ));
+        }
+        sqlx::query(
+            "insert into grit_repository_summaries
+                (repository_pk, ref_generation, hash_algo, repository_created_at,
+                 default_branch_refname, default_branch_target, refs_count, branch_count, tag_count,
+                 latest_commit_oid, latest_commit_tree_oid, latest_commit_time,
+                 latest_commit_generation)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+             on conflict (repository_pk, ref_generation) do update
+             set hash_algo = excluded.hash_algo,
+                 repository_created_at = excluded.repository_created_at,
+                 default_branch_refname = excluded.default_branch_refname,
+                 default_branch_target = excluded.default_branch_target,
+                 refs_count = excluded.refs_count,
+                 branch_count = excluded.branch_count,
+                 tag_count = excluded.tag_count,
+                 latest_commit_oid = excluded.latest_commit_oid,
+                 latest_commit_tree_oid = excluded.latest_commit_tree_oid,
+                 latest_commit_time = excluded.latest_commit_time,
+                 latest_commit_generation = excluded.latest_commit_generation",
+        )
+        .bind(summary.repository_pk.get())
+        .bind(observed_generation)
+        .bind(summary.hash_algo.name())
+        .bind(summary.created_at)
+        .bind(default_branch_refname)
+        .bind(default_branch_target)
+        .bind(
+            i64::try_from(summary.refs_count)
+                .map_err(|_| Error::Backend("ref count exceeds i64".to_owned()))?,
+        )
+        .bind(
+            i64::try_from(summary.branch_count)
+                .map_err(|_| Error::Backend("branch count exceeds i64".to_owned()))?,
+        )
+        .bind(
+            i64::try_from(summary.tag_count)
+                .map_err(|_| Error::Backend("tag count exceeds i64".to_owned()))?,
+        )
+        .bind(latest_commit_oid)
+        .bind(latest_commit_tree_oid)
+        .bind(latest_commit_time)
+        .bind(latest_generation)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(PgRepositorySummaryInstall::Installed(summary))
+    }
+
     async fn require_repository(
         &self,
         tenant: &TenantId,
@@ -1073,7 +1516,7 @@ impl PgServerStorage {
                 (tenant_id, repository_id, hash_algo, created_at, updated_at)
              values ($1, $2, $3, now(), now())
              on conflict (tenant_id, repository_id) do nothing
-             returning repository_pk, tenant_id, repository_id, hash_algo, created_at, updated_at,
+             returning repository_pk, tenant_id, repository_id, hash_algo, ref_generation, created_at, updated_at,
                        archived_at, deleted_at",
         )
         .bind(tenant.as_str())
@@ -1104,7 +1547,7 @@ impl PgServerStorage {
         repository: &RepositoryId,
     ) -> Result<Option<PgRepositoryRow>> {
         let row = sqlx::query(
-            "select repository_pk, tenant_id, repository_id, hash_algo, created_at, updated_at,
+            "select repository_pk, tenant_id, repository_id, hash_algo, ref_generation, created_at, updated_at,
                     archived_at, deleted_at
              from grit_repositories
              where tenant_id = $1 and repository_id = $2 and deleted_at is null",
@@ -1124,7 +1567,7 @@ impl PgServerStorage {
     /// algorithm metadata.
     pub async fn list_repositories(&self, tenant: &TenantId) -> Result<Vec<PgRepositoryRow>> {
         let rows = sqlx::query(
-            "select repository_pk, tenant_id, repository_id, hash_algo, created_at, updated_at,
+            "select repository_pk, tenant_id, repository_id, hash_algo, ref_generation, created_at, updated_at,
                     archived_at, deleted_at
              from grit_repositories
              where tenant_id = $1 and deleted_at is null
@@ -1172,7 +1615,7 @@ impl PgServerStorage {
             "update grit_repositories
              set archived_at = coalesce(archived_at, now()), updated_at = now()
              where tenant_id = $1 and repository_id = $2 and deleted_at is null
-             returning repository_pk, tenant_id, repository_id, hash_algo, created_at, updated_at,
+             returning repository_pk, tenant_id, repository_id, hash_algo, ref_generation, created_at, updated_at,
                        archived_at, deleted_at",
         )
         .bind(tenant.as_str())
@@ -1232,10 +1675,13 @@ impl PgServerStorage {
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         lock_import_repository(&mut tx, tenant, repository).await?;
-        write_ref_with_reflog_in_transaction(
+        let changed = write_ref_with_reflog_in_transaction(
             &mut tx, tenant, repository, refname, value, expected, entry,
         )
         .await?;
+        if changed {
+            bump_ref_generation_in_transaction(&mut tx, tenant, repository).await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -1364,7 +1810,13 @@ impl PgServerStorageTransaction {
     ) -> Result<()> {
         self.bind_repository_scope(tenant, repository)?;
         lock_import_repository(&mut self.tx, tenant, repository).await?;
-        write_ref_in_transaction(&mut self.tx, tenant, repository, refname, value, expected).await
+        let changed =
+            write_ref_in_transaction(&mut self.tx, tenant, repository, refname, value, expected)
+                .await?;
+        if changed {
+            bump_ref_generation_in_transaction(&mut self.tx, tenant, repository).await?;
+        }
+        Ok(())
     }
 
     /// Delete a ref within the transaction using compare-and-swap semantics.
@@ -1382,7 +1834,12 @@ impl PgServerStorageTransaction {
     ) -> Result<()> {
         self.bind_repository_scope(tenant, repository)?;
         lock_import_repository(&mut self.tx, tenant, repository).await?;
-        delete_ref_in_transaction(&mut self.tx, tenant, repository, refname, expected).await
+        let changed =
+            delete_ref_in_transaction(&mut self.tx, tenant, repository, refname, expected).await?;
+        if changed {
+            bump_ref_generation_in_transaction(&mut self.tx, tenant, repository).await?;
+        }
+        Ok(())
     }
 
     /// Append a reflog entry within the transaction.
@@ -1417,7 +1874,7 @@ impl PgServerStorageTransaction {
     ) -> Result<()> {
         self.bind_repository_scope(tenant, repository)?;
         lock_import_repository(&mut self.tx, tenant, repository).await?;
-        write_ref_with_reflog_in_transaction(
+        let changed = write_ref_with_reflog_in_transaction(
             &mut self.tx,
             tenant,
             repository,
@@ -1426,7 +1883,11 @@ impl PgServerStorageTransaction {
             expected,
             entry,
         )
-        .await
+        .await?;
+        if changed {
+            bump_ref_generation_in_transaction(&mut self.tx, tenant, repository).await?;
+        }
+        Ok(())
     }
 
     /// Set or replace a config key within the transaction.
@@ -1545,15 +2006,91 @@ fn row_to_repository(row: &sqlx::postgres::PgRow) -> Result<PgRepositoryRow> {
     let hash_algo: String = row.try_get("hash_algo")?;
     let hash_algo = HashAlgo::from_name(&hash_algo)
         .ok_or_else(|| Error::Backend(format!("unknown hash algorithm '{hash_algo}'")))?;
+    let ref_generation: i64 = row.try_get("ref_generation")?;
     Ok(PgRepositoryRow {
         repository_pk,
         tenant: TenantId::new(tenant)?,
         repository: RepositoryId::new(repository)?,
         hash_algo,
+        ref_generation: u64::try_from(ref_generation)
+            .map_err(|_| Error::Backend("ref generation is negative".to_owned()))?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         archived_at: row.try_get("archived_at")?,
         deleted_at: row.try_get("deleted_at")?,
+    })
+}
+
+fn nonnegative_i64_to_u64(value: i64, field: &str) -> Result<u64> {
+    u64::try_from(value).map_err(|_| Error::Backend(format!("{field} is negative")))
+}
+
+fn row_to_repository_summary(row: &sqlx::postgres::PgRow) -> Result<PgRepositorySummary> {
+    let repository_pk = RepositoryPk::try_from(row.try_get::<i64, _>("repository_pk")?)
+        .map_err(|error| Error::Backend(error.to_string()))?;
+    let hash_algo_name: String = row.try_get("hash_algo")?;
+    let hash_algo = HashAlgo::from_name(&hash_algo_name).ok_or_else(|| {
+        Error::Backend(format!("unknown summary hash algorithm '{hash_algo_name}'"))
+    })?;
+    let default_branch = match (
+        row.try_get::<Option<String>, _>("default_branch_refname")?,
+        row.try_get::<Option<Vec<u8>>, _>("default_branch_target")?,
+    ) {
+        (Some(refname), Some(target)) => Some(PgSummaryBranch {
+            refname,
+            target: ObjectId::from_bytes(&target)?,
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(Error::Backend(
+                "summary default branch columns disagree".to_owned(),
+            ));
+        }
+    };
+    let latest_commit = match (
+        row.try_get::<Option<Vec<u8>>, _>("latest_commit_oid")?,
+        row.try_get::<Option<Vec<u8>>, _>("latest_commit_tree_oid")?,
+        row.try_get::<Option<i64>, _>("latest_commit_time")?,
+        row.try_get::<Option<i32>, _>("latest_commit_generation")?,
+    ) {
+        (Some(oid), Some(tree), Some(commit_time), Some(generation)) => Some(PgSummaryCommit {
+            oid: ObjectId::from_bytes(&oid)?,
+            tree: ObjectId::from_bytes(&tree)?,
+            commit_time,
+            generation: u32::try_from(generation)
+                .map_err(|_| Error::Backend("summary commit generation is negative".to_owned()))?,
+        }),
+        (None, None, None, None) => None,
+        _ => {
+            return Err(Error::Backend(
+                "summary latest commit columns disagree".to_owned(),
+            ));
+        }
+    };
+    if default_branch
+        .as_ref()
+        .is_some_and(|branch| branch.target.algo() != hash_algo)
+        || latest_commit
+            .as_ref()
+            .is_some_and(|commit| commit.oid.algo() != hash_algo || commit.tree.algo() != hash_algo)
+    {
+        return Err(Error::Backend(
+            "summary object id has the wrong hash algorithm".to_owned(),
+        ));
+    }
+    Ok(PgRepositorySummary {
+        repository_pk,
+        ref_generation: nonnegative_i64_to_u64(
+            row.try_get("cached_generation")?,
+            "cached ref generation",
+        )?,
+        hash_algo,
+        created_at: row.try_get("repository_created_at")?,
+        default_branch,
+        refs_count: nonnegative_i64_to_u64(row.try_get("refs_count")?, "ref count")?,
+        branch_count: nonnegative_i64_to_u64(row.try_get("branch_count")?, "branch count")?,
+        tag_count: nonnegative_i64_to_u64(row.try_get("tag_count")?, "tag count")?,
+        latest_commit,
     })
 }
 
@@ -1684,7 +2221,7 @@ async fn rename_repository_in_transaction(
         "update grit_repositories
          set repository_id = $3, updated_at = now()
          where tenant_id = $1 and repository_id = $2 and deleted_at is null
-         returning repository_pk, tenant_id, repository_id, hash_algo, created_at, updated_at,
+         returning repository_pk, tenant_id, repository_id, hash_algo, ref_generation, created_at, updated_at,
                    archived_at, deleted_at",
     )
     .bind(tenant.as_str())
@@ -2061,11 +2598,16 @@ async fn publish_import_in_transaction(
     } else {
         Vec::new()
     };
+    let mut refs_changed = false;
     for refname in &pruned_refs {
-        delete_ref_in_transaction(tx, tenant, repository, refname, None).await?;
+        refs_changed |= delete_ref_in_transaction(tx, tenant, repository, refname, None).await?;
     }
     for (refname, value) in &publication.refs {
-        write_ref_in_transaction(tx, tenant, repository, refname, value, None).await?;
+        refs_changed |=
+            write_ref_in_transaction(tx, tenant, repository, refname, value, None).await?;
+    }
+    if refs_changed {
+        bump_ref_generation_in_transaction(tx, tenant, repository).await?;
     }
 
     const POSTGRES_BIND_LIMIT: usize = 65_535;
@@ -2198,19 +2740,21 @@ async fn write_ref_in_transaction(
     refname: &str,
     value: &StoredRef,
     expected: Option<Option<StoredRef>>,
-) -> Result<()> {
+) -> Result<bool> {
     lock_import_repository(tx, tenant, repository).await?;
     let (target_oid, symbolic_target) = ref_columns(value);
     match expected {
         None => {
-            sqlx::query(
+            let rows = sqlx::query(
                 "insert into grit_refs
                     (tenant_id, repository_id, refname, target_oid, symbolic_target, updated_at)
                  values ($1, $2, $3, $4, $5, now())
                  on conflict (tenant_id, repository_id, refname)
                  do update set target_oid = excluded.target_oid,
                                symbolic_target = excluded.symbolic_target,
-                               updated_at = now()",
+                               updated_at = now()
+                 where grit_refs.target_oid is distinct from excluded.target_oid
+                    or grit_refs.symbolic_target is distinct from excluded.symbolic_target",
             )
             .bind(tenant.as_str())
             .bind(repository.as_str())
@@ -2219,7 +2763,7 @@ async fn write_ref_in_transaction(
             .bind(symbolic_target)
             .execute(&mut **tx)
             .await?;
-            Ok(())
+            Ok(rows.rows_affected() == 1)
         }
         Some(None) => {
             let rows = sqlx::query(
@@ -2236,12 +2780,13 @@ async fn write_ref_in_transaction(
             .execute(&mut **tx)
             .await?;
             if rows.rows_affected() == 1 {
-                Ok(())
+                Ok(true)
             } else {
                 Err(Error::RefConflict(refname.to_owned()))
             }
         }
         Some(Some(expected)) => {
+            let changed = expected != *value;
             let rows = match expected {
                 StoredRef::Direct(expected_oid) => {
                     sqlx::query(
@@ -2277,7 +2822,7 @@ async fn write_ref_in_transaction(
                 }
             };
             if rows.rows_affected() == 1 {
-                Ok(())
+                Ok(changed)
             } else {
                 Err(Error::RefConflict(refname.to_owned()))
             }
@@ -2291,7 +2836,7 @@ async fn delete_ref_in_transaction(
     repository: &RepositoryId,
     refname: &str,
     expected: Option<StoredRef>,
-) -> Result<()> {
+) -> Result<bool> {
     lock_import_repository(tx, tenant, repository).await?;
     let guarded = expected.is_some();
     let rows = match expected {
@@ -2336,6 +2881,28 @@ async fn delete_ref_in_transaction(
     if guarded && rows.rows_affected() != 1 {
         return Err(Error::RefConflict(refname.to_owned()));
     }
+    Ok(rows.rows_affected() == 1)
+}
+
+async fn bump_ref_generation_in_transaction(
+    tx: &mut Transaction<'static, Postgres>,
+    tenant: &TenantId,
+    repository: &RepositoryId,
+) -> Result<()> {
+    let rows = sqlx::query(
+        "update grit_repositories
+         set ref_generation = ref_generation + 1, updated_at = now()
+         where tenant_id = $1 and repository_id = $2 and deleted_at is null",
+    )
+    .bind(tenant.as_str())
+    .bind(repository.as_str())
+    .execute(&mut **tx)
+    .await?;
+    if rows.rows_affected() != 1 {
+        return Err(Error::RepositoryNotFound(repository_key(
+            tenant, repository,
+        )));
+    }
     Ok(())
 }
 
@@ -2372,7 +2939,7 @@ async fn write_ref_with_reflog_in_transaction(
     value: &StoredRef,
     expected: Option<Option<StoredRef>>,
     entry: &ReflogEntry,
-) -> Result<()> {
+) -> Result<bool> {
     if entry.refname != refname {
         return Err(Error::Backend(format!(
             "reflog entry ref '{}' does not match update ref '{refname}'",
@@ -2386,8 +2953,10 @@ async fn write_ref_with_reflog_in_transaction(
             )));
         }
     }
-    write_ref_in_transaction(tx, tenant, repository, refname, value, expected).await?;
-    append_reflog_in_transaction(tx, tenant, repository, entry).await
+    let changed =
+        write_ref_in_transaction(tx, tenant, repository, refname, value, expected).await?;
+    append_reflog_in_transaction(tx, tenant, repository, entry).await?;
+    Ok(changed)
 }
 
 async fn set_config_in_transaction(
@@ -3060,7 +3629,11 @@ impl RefStore for PgServerStorage {
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         lock_import_repository(&mut tx, tenant, repository).await?;
-        write_ref_in_transaction(&mut tx, tenant, repository, refname, value, expected).await?;
+        let changed =
+            write_ref_in_transaction(&mut tx, tenant, repository, refname, value, expected).await?;
+        if changed {
+            bump_ref_generation_in_transaction(&mut tx, tenant, repository).await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -3074,7 +3647,11 @@ impl RefStore for PgServerStorage {
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         lock_import_repository(&mut tx, tenant, repository).await?;
-        delete_ref_in_transaction(&mut tx, tenant, repository, refname, expected).await?;
+        let changed =
+            delete_ref_in_transaction(&mut tx, tenant, repository, refname, expected).await?;
+        if changed {
+            bump_ref_generation_in_transaction(&mut tx, tenant, repository).await?;
+        }
         tx.commit().await?;
         Ok(())
     }
