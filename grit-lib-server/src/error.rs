@@ -69,6 +69,24 @@ pub enum Error {
         /// Superseded repository-local import generation.
         generation: u64,
     },
+    /// A commit-history cursor belongs to a different immutable repository row.
+    #[error("history cursor belongs to repository {cursor_repository_pk}, not {repository_pk}")]
+    HistoryCursorRepositoryMismatch {
+        /// Repository identity encoded by the cursor.
+        cursor_repository_pk: i64,
+        /// Repository identity resolved for the request.
+        repository_pk: i64,
+    },
+    /// A commit-history cursor predates a commit-graph mutation.
+    #[error(
+        "history cursor generation {cursor_generation} is stale; current generation is {current_generation}"
+    )]
+    StaleHistoryCursor {
+        /// Commit-history generation encoded by the cursor.
+        cursor_generation: u64,
+        /// Current durable commit-history generation.
+        current_generation: u64,
+    },
     /// A push policy hook rejected a ref update.
     #[error("push policy rejected {refname}: {reason}")]
     PushPolicyRejected {

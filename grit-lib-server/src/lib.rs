@@ -84,9 +84,11 @@ pub mod prelude {
     pub use crate::s3_byte_store::{S3ByteStore, S3MultipartUploadOptions};
     #[cfg(feature = "sqlx-postgres")]
     pub use crate::sqlx_postgres::{
-        PgRepositoryRow, PgRepositorySummary, PgRepositorySummaryInstall,
-        PgRepositorySummaryOptions, PgRepositorySummaryRead, PgServerStorage,
-        PgServerStorageTransaction, PgSummaryBranch, PgSummaryCommit, RepositoryPk,
+        PgCommitHistoryCursor, PgCommitHistoryOptions, PgCommitHistoryPage, PgRepositoryRow,
+        PgRepositorySummary, PgRepositorySummaryInstall, PgRepositorySummaryOptions,
+        PgRepositorySummaryRead, PgServerStorage, PgServerStorageTransaction, PgSummaryBranch,
+        PgSummaryCommit, RepositoryPk, MAX_COMMIT_HISTORY_PAGE_SIZE,
+        MAX_COMMIT_HISTORY_PARENT_EDGES,
     };
     pub use crate::storage::{
         BrowseIndex, CommitGraphStore, ConfigStore, ImportPublication, ImportPublicationResult,

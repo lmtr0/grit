@@ -46,6 +46,8 @@ pub const MIGRATIONS: &[&str] = &[
         add column if not exists updated_at timestamptz not null default now()",
     "alter table grit_repositories
         add column if not exists ref_generation bigint not null default 0",
+    "alter table grit_repositories
+        add column if not exists history_generation bigint not null default 0",
     "do $$ begin
         if not exists (
             select 1 from pg_constraint
@@ -58,6 +60,18 @@ pub const MIGRATIONS: &[&str] = &[
         end if;
      end $$",
     "alter table grit_repositories validate constraint grit_repositories_ref_generation_nonnegative",
+    "do $$ begin
+        if not exists (
+            select 1 from pg_constraint
+            where conrelid = 'grit_repositories'::regclass
+              and conname = 'grit_repositories_history_generation_nonnegative'
+        ) then
+            alter table grit_repositories
+                add constraint grit_repositories_history_generation_nonnegative
+                check (history_generation >= 0) not valid;
+        end if;
+     end $$",
+    "alter table grit_repositories validate constraint grit_repositories_history_generation_nonnegative",
     "create sequence if not exists grit_repository_pk_seq",
     "alter table grit_repositories add column if not exists repository_pk bigint",
     "alter sequence grit_repository_pk_seq
@@ -404,6 +418,11 @@ pub const MIGRATIONS: &[&str] = &[
         on grit_tree_entries (tenant_id, repository_id, tree_oid, path text_pattern_ops)",
     "create index if not exists grit_commits_repo_time_idx
         on grit_commits (tenant_id, repository_id, commit_time desc, commit_oid)",
+    "create index if not exists grit_commits_repo_history_idx
+        on grit_commits (repository_pk, commit_time desc, commit_oid_bytes asc)",
+    "create index if not exists grit_commit_parents_repo_page_idx
+        on grit_commit_parents
+            (repository_pk, commit_oid_bytes, parent_order, parent_oid_bytes)",
     "create index if not exists grit_commit_parents_parent_idx
         on grit_commit_parents (tenant_id, repository_id, parent_oid, commit_oid)",
     "create index if not exists grit_pack_objects_oid_idx
@@ -459,6 +478,8 @@ pub struct PgRepositoryRow {
     pub hash_algo: HashAlgo,
     /// Durable generation advanced by visible ref mutations.
     pub ref_generation: u64,
+    /// Durable generation advanced by commit-index or parent-graph mutations.
+    pub history_generation: u64,
     /// Timestamp when the repository row was created.
     pub created_at: OffsetDateTime,
     /// Timestamp when repository metadata was last changed.
@@ -512,6 +533,54 @@ pub struct PgRepositorySummary {
     pub tag_count: u64,
     /// Indexed commit metadata reached from `HEAD`, when available.
     pub latest_commit: Option<PgSummaryCommit>,
+}
+
+/// Maximum number of commits returned by one PostgreSQL history-page request.
+pub const MAX_COMMIT_HISTORY_PAGE_SIZE: usize = 256;
+
+/// Maximum number of parent edges returned by one PostgreSQL history-page request.
+pub const MAX_COMMIT_HISTORY_PARENT_EDGES: usize = 8_192;
+
+/// Stable continuation key for repository-wide indexed-commit time pagination.
+///
+/// The cursor is bound to both an immutable repository row and the commit-history generation
+/// observed for the preceding page. It cannot be reused after repository deletion/recreation,
+/// against another repository, or after a commit-index or parent-graph mutation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgCommitHistoryCursor {
+    /// Immutable numeric repository identity observed by the page query.
+    pub repository_pk: RepositoryPk,
+    /// Durable commit-history generation observed by the page query.
+    pub history_generation: u64,
+    /// Commit time of the last item returned by the preceding page.
+    pub commit_time: i64,
+    /// Object ID of the last item returned by the preceding page.
+    pub oid: ObjectId,
+}
+
+/// Explicit bounds and continuation key for one PostgreSQL commit-history page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgCommitHistoryOptions {
+    /// Maximum commits returned, in `1..=`[`MAX_COMMIT_HISTORY_PAGE_SIZE`].
+    pub page_size: usize,
+    /// Maximum parent edges transferred, in `1..=`[`MAX_COMMIT_HISTORY_PARENT_EDGES`].
+    pub max_parent_edges: usize,
+    /// Exclusive continuation key returned by a preceding page.
+    pub cursor: Option<PgCommitHistoryCursor>,
+}
+
+/// One bounded page of repository-wide indexed commits ordered by committer time.
+///
+/// This is a time-keyset listing of every commit present in the repository index. It does not
+/// claim reachability from a ref or topological traversal semantics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgCommitHistoryPage {
+    /// Indexed commits ordered by `(commit_time DESC, raw_oid ASC)`.
+    pub commits: Vec<IndexedCommit>,
+    /// Exclusive key for the next page, or `None` when this page is exhausted.
+    pub next_cursor: Option<PgCommitHistoryCursor>,
+    /// Whether no later row exists after the commits in this page.
+    pub exhausted: bool,
 }
 
 /// Result of reading the one bounded summary row nearest the current ref generation.
@@ -780,6 +849,220 @@ impl PgServerStorage {
         Ok(PgRepositorySummaryRead::Hit(row_to_repository_summary(
             &row,
         )?))
+    }
+
+    /// List a bounded page of indexed commits with stable time-keyset pagination.
+    ///
+    /// Results contain every commit currently present in the repository commit index, ordered by
+    /// `(commit_time DESC, raw_oid ASC)`. This method does not perform a reachability walk and does
+    /// not promise topological ordering. It executes at most three queries: repository identity and
+    /// generation, bounded commit rows, then bounded parent edges for the selected object IDs. All
+    /// three execute in one read-only repeatable-read transaction, and the query never uses
+    /// `OFFSET`.
+    ///
+    /// The cursor is exclusive and bound to the repository's immutable numeric identity and
+    /// current commit-history generation. Callers must restart pagination when a commit-index or
+    /// parent-graph mutation makes a cursor stale. `page_size` and `max_parent_edges` are both
+    /// mandatory backend-work bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::RepositoryNotFound`] when the repository is absent,
+    /// [`Error::HistoryCursorRepositoryMismatch`] or [`Error::StaleHistoryCursor`] when a cursor
+    /// cannot continue this history, [`Error::Backend`] for invalid limits or stored graph data,
+    /// or SQLx errors from PostgreSQL.
+    pub async fn read_commit_history_page(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        options: PgCommitHistoryOptions,
+    ) -> Result<PgCommitHistoryPage> {
+        if options.page_size == 0 || options.page_size > MAX_COMMIT_HISTORY_PAGE_SIZE {
+            return Err(Error::Backend(format!(
+                "commit history page size must be between 1 and {MAX_COMMIT_HISTORY_PAGE_SIZE}"
+            )));
+        }
+        if options.max_parent_edges == 0
+            || options.max_parent_edges > MAX_COMMIT_HISTORY_PARENT_EDGES
+        {
+            return Err(Error::Backend(format!(
+                "commit history parent-edge limit must be between 1 and {MAX_COMMIT_HISTORY_PARENT_EDGES}"
+            )));
+        }
+
+        let mut tx = self
+            .pool
+            .begin_with("begin transaction isolation level repeatable read read only")
+            .await?;
+        let repository_row = sqlx::query(
+            "select repository_pk, hash_algo, history_generation
+             from grit_repositories
+             where tenant_id = $1 and repository_id = $2 and deleted_at is null",
+        )
+        .bind(tenant.as_str())
+        .bind(repository.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(repository_row) = repository_row else {
+            return Err(Error::RepositoryNotFound(repository_key(
+                tenant, repository,
+            )));
+        };
+        let repository_pk =
+            RepositoryPk::try_from(repository_row.try_get::<i64, _>("repository_pk")?)
+                .map_err(|error| Error::Backend(error.to_string()))?;
+        let hash_algo_name = repository_row.try_get::<String, _>("hash_algo")?;
+        let hash_algo = HashAlgo::from_name(&hash_algo_name)
+            .ok_or_else(|| Error::Backend(format!("unknown hash algorithm '{hash_algo_name}'")))?;
+        let history_generation = nonnegative_i64_to_u64(
+            repository_row.try_get("history_generation")?,
+            "history generation",
+        )?;
+        if let Some(cursor) = &options.cursor {
+            if cursor.repository_pk != repository_pk {
+                return Err(Error::HistoryCursorRepositoryMismatch {
+                    cursor_repository_pk: cursor.repository_pk.get(),
+                    repository_pk: repository_pk.get(),
+                });
+            }
+            if cursor.history_generation != history_generation {
+                return Err(Error::StaleHistoryCursor {
+                    cursor_generation: cursor.history_generation,
+                    current_generation: history_generation,
+                });
+            }
+            if cursor.oid.algo() != hash_algo {
+                return Err(Error::Backend(
+                    "commit history cursor object ID has the wrong hash algorithm".to_owned(),
+                ));
+            }
+        }
+
+        let row_limit = options
+            .page_size
+            .checked_add(1)
+            .and_then(|limit| i64::try_from(limit).ok())
+            .ok_or_else(|| Error::Backend("commit history row limit exceeds i64".to_owned()))?;
+        let mut rows = if let Some(cursor) = &options.cursor {
+            sqlx::query(
+                "select commit_oid_bytes, tree_oid_bytes, commit_time, generation
+                 from grit_commits
+                 where repository_pk = $1
+                   and (commit_time < $2
+                        or (commit_time = $2 and commit_oid_bytes > $3))
+                 order by commit_time desc, commit_oid_bytes asc
+                 limit $4",
+            )
+            .bind(repository_pk.get())
+            .bind(cursor.commit_time)
+            .bind(cursor.oid.as_bytes())
+            .bind(row_limit)
+            .fetch_all(&mut *tx)
+            .await?
+        } else {
+            sqlx::query(
+                "select commit_oid_bytes, tree_oid_bytes, commit_time, generation
+                 from grit_commits
+                 where repository_pk = $1
+                 order by commit_time desc, commit_oid_bytes asc
+                 limit $2",
+            )
+            .bind(repository_pk.get())
+            .bind(row_limit)
+            .fetch_all(&mut *tx)
+            .await?
+        };
+        let exhausted = rows.len() <= options.page_size;
+        rows.truncate(options.page_size);
+
+        let mut commits = rows
+            .iter()
+            .map(|row| row_to_history_commit(row, hash_algo))
+            .collect::<Result<Vec<_>>>()?;
+        if !commits.is_empty() {
+            let commit_indexes = commits
+                .iter()
+                .enumerate()
+                .map(|(index, commit)| (commit.oid, index))
+                .collect::<HashMap<_, _>>();
+            let commit_oids = commits
+                .iter()
+                .map(|commit| commit.oid.as_bytes().to_vec())
+                .collect::<Vec<_>>();
+            let edge_limit = options
+                .max_parent_edges
+                .checked_add(1)
+                .and_then(|limit| i64::try_from(limit).ok())
+                .ok_or_else(|| {
+                    Error::Backend("commit history parent-edge limit exceeds i64".to_owned())
+                })?;
+            let parent_rows = sqlx::query(
+                "select commit_oid_bytes, parent_oid_bytes, parent_order
+                 from grit_commit_parents
+                 where repository_pk = $1 and commit_oid_bytes = any($2::bytea[])
+                 order by commit_oid_bytes asc, parent_order asc
+                 limit $3",
+            )
+            .bind(repository_pk.get())
+            .bind(&commit_oids)
+            .bind(edge_limit)
+            .fetch_all(&mut *tx)
+            .await?;
+            if parent_rows.len() > options.max_parent_edges {
+                return Err(Error::Backend(format!(
+                    "commit history page exceeds the configured parent-edge limit {}",
+                    options.max_parent_edges
+                )));
+            }
+            for row in parent_rows {
+                let commit_oid =
+                    ObjectId::from_bytes(&row.try_get::<Vec<u8>, _>("commit_oid_bytes")?)?;
+                let parent_oid =
+                    ObjectId::from_bytes(&row.try_get::<Vec<u8>, _>("parent_oid_bytes")?)?;
+                if commit_oid.algo() != hash_algo || parent_oid.algo() != hash_algo {
+                    return Err(Error::Backend(
+                        "commit history parent edge has the wrong hash algorithm".to_owned(),
+                    ));
+                }
+                let commit_index = commit_indexes.get(&commit_oid).copied().ok_or_else(|| {
+                    Error::Backend(
+                        "commit history parent edge does not belong to the selected page"
+                            .to_owned(),
+                    )
+                })?;
+                let parent_order = usize::try_from(row.try_get::<i32, _>("parent_order")?)
+                    .map_err(|_| {
+                        Error::Backend("commit history parent order is negative".to_owned())
+                    })?;
+                if parent_order != commits[commit_index].parents.len() {
+                    return Err(Error::Backend(
+                        "commit history parent order is not contiguous".to_owned(),
+                    ));
+                }
+                commits[commit_index].parents.push(parent_oid);
+            }
+        }
+
+        let next_cursor = if exhausted {
+            None
+        } else {
+            let last = commits.last().ok_or_else(|| {
+                Error::Backend("non-exhausted commit history page is empty".to_owned())
+            })?;
+            Some(PgCommitHistoryCursor {
+                repository_pk,
+                history_generation,
+                commit_time: last.commit_time,
+                oid: last.oid,
+            })
+        };
+        let page = PgCommitHistoryPage {
+            commits,
+            next_cursor,
+            exhausted,
+        };
+        tx.commit().await?;
+        Ok(page)
     }
 
     /// Recompute a summary with fixed set-based queries and install it if its generation is current.
@@ -1516,7 +1799,8 @@ impl PgServerStorage {
                 (tenant_id, repository_id, hash_algo, created_at, updated_at)
              values ($1, $2, $3, now(), now())
              on conflict (tenant_id, repository_id) do nothing
-             returning repository_pk, tenant_id, repository_id, hash_algo, ref_generation, created_at, updated_at,
+             returning repository_pk, tenant_id, repository_id, hash_algo, ref_generation,
+                       history_generation, created_at, updated_at,
                        archived_at, deleted_at",
         )
         .bind(tenant.as_str())
@@ -1547,7 +1831,8 @@ impl PgServerStorage {
         repository: &RepositoryId,
     ) -> Result<Option<PgRepositoryRow>> {
         let row = sqlx::query(
-            "select repository_pk, tenant_id, repository_id, hash_algo, ref_generation, created_at, updated_at,
+            "select repository_pk, tenant_id, repository_id, hash_algo, ref_generation,
+                    history_generation, created_at, updated_at,
                     archived_at, deleted_at
              from grit_repositories
              where tenant_id = $1 and repository_id = $2 and deleted_at is null",
@@ -1567,7 +1852,8 @@ impl PgServerStorage {
     /// algorithm metadata.
     pub async fn list_repositories(&self, tenant: &TenantId) -> Result<Vec<PgRepositoryRow>> {
         let rows = sqlx::query(
-            "select repository_pk, tenant_id, repository_id, hash_algo, ref_generation, created_at, updated_at,
+            "select repository_pk, tenant_id, repository_id, hash_algo, ref_generation,
+                    history_generation, created_at, updated_at,
                     archived_at, deleted_at
              from grit_repositories
              where tenant_id = $1 and deleted_at is null
@@ -1615,7 +1901,8 @@ impl PgServerStorage {
             "update grit_repositories
              set archived_at = coalesce(archived_at, now()), updated_at = now()
              where tenant_id = $1 and repository_id = $2 and deleted_at is null
-             returning repository_pk, tenant_id, repository_id, hash_algo, ref_generation, created_at, updated_at,
+             returning repository_pk, tenant_id, repository_id, hash_algo, ref_generation,
+                       history_generation, created_at, updated_at,
                        archived_at, deleted_at",
         )
         .bind(tenant.as_str())
@@ -2007,6 +2294,7 @@ fn row_to_repository(row: &sqlx::postgres::PgRow) -> Result<PgRepositoryRow> {
     let hash_algo = HashAlgo::from_name(&hash_algo)
         .ok_or_else(|| Error::Backend(format!("unknown hash algorithm '{hash_algo}'")))?;
     let ref_generation: i64 = row.try_get("ref_generation")?;
+    let history_generation: i64 = row.try_get("history_generation")?;
     Ok(PgRepositoryRow {
         repository_pk,
         tenant: TenantId::new(tenant)?,
@@ -2014,6 +2302,8 @@ fn row_to_repository(row: &sqlx::postgres::PgRow) -> Result<PgRepositoryRow> {
         hash_algo,
         ref_generation: u64::try_from(ref_generation)
             .map_err(|_| Error::Backend("ref generation is negative".to_owned()))?,
+        history_generation: u64::try_from(history_generation)
+            .map_err(|_| Error::Backend("history generation is negative".to_owned()))?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         archived_at: row.try_get("archived_at")?,
@@ -2023,6 +2313,28 @@ fn row_to_repository(row: &sqlx::postgres::PgRow) -> Result<PgRepositoryRow> {
 
 fn nonnegative_i64_to_u64(value: i64, field: &str) -> Result<u64> {
     u64::try_from(value).map_err(|_| Error::Backend(format!("{field} is negative")))
+}
+
+fn row_to_history_commit(
+    row: &sqlx::postgres::PgRow,
+    hash_algo: HashAlgo,
+) -> Result<IndexedCommit> {
+    let oid = ObjectId::from_bytes(&row.try_get::<Vec<u8>, _>("commit_oid_bytes")?)?;
+    let tree = ObjectId::from_bytes(&row.try_get::<Vec<u8>, _>("tree_oid_bytes")?)?;
+    if oid.algo() != hash_algo || tree.algo() != hash_algo {
+        return Err(Error::Backend(
+            "commit history row has the wrong hash algorithm".to_owned(),
+        ));
+    }
+    let generation = u32::try_from(row.try_get::<i32, _>("generation")?)
+        .map_err(|_| Error::Backend("commit history generation is negative".to_owned()))?;
+    Ok(IndexedCommit {
+        oid,
+        tree,
+        parents: Vec::new(),
+        commit_time: row.try_get("commit_time")?,
+        generation,
+    })
 }
 
 fn row_to_repository_summary(row: &sqlx::postgres::PgRow) -> Result<PgRepositorySummary> {
@@ -2221,7 +2533,8 @@ async fn rename_repository_in_transaction(
         "update grit_repositories
          set repository_id = $3, updated_at = now()
          where tenant_id = $1 and repository_id = $2 and deleted_at is null
-         returning repository_pk, tenant_id, repository_id, hash_algo, ref_generation, created_at, updated_at,
+         returning repository_pk, tenant_id, repository_id, hash_algo, ref_generation,
+                   history_generation, created_at, updated_at,
                    archived_at, deleted_at",
     )
     .bind(tenant.as_str())
@@ -2892,6 +3205,28 @@ async fn bump_ref_generation_in_transaction(
     let rows = sqlx::query(
         "update grit_repositories
          set ref_generation = ref_generation + 1, updated_at = now()
+         where tenant_id = $1 and repository_id = $2 and deleted_at is null",
+    )
+    .bind(tenant.as_str())
+    .bind(repository.as_str())
+    .execute(&mut **tx)
+    .await?;
+    if rows.rows_affected() != 1 {
+        return Err(Error::RepositoryNotFound(repository_key(
+            tenant, repository,
+        )));
+    }
+    Ok(())
+}
+
+async fn bump_history_generation_in_transaction(
+    tx: &mut Transaction<'static, Postgres>,
+    tenant: &TenantId,
+    repository: &RepositoryId,
+) -> Result<()> {
+    let rows = sqlx::query(
+        "update grit_repositories
+         set history_generation = history_generation + 1, updated_at = now()
          where tenant_id = $1 and repository_id = $2 and deleted_at is null",
     )
     .bind(tenant.as_str())
@@ -4355,6 +4690,9 @@ impl CommitGraphStore for PgServerStorage {
                 &parent_edges,
             )
             .await?;
+        }
+        if !final_row_indexes.is_empty() {
+            bump_history_generation_in_transaction(&mut tx, tenant, repository).await?;
         }
         tx.commit().await?;
         Ok(())
