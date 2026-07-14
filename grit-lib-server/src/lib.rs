@@ -100,8 +100,12 @@ pub mod prelude {
     };
     pub use crate::protocol::upload_pack::{
         AdvertisedRef, FetchPackPlan, FetchPackResponse, GitProtocolVersion, RefAdvertisement,
-        UploadPackCapability, UploadPackRequest, UploadPackService, UploadPackStreamFailure,
+        UploadPackCapability, UploadPackRequest, UploadPackResponseStreamFailure,
+        UploadPackResponseStreamReport, UploadPackService, UploadPackStreamFailure,
         UploadPackStreamPreflightError, UploadPackStreamReport,
+    };
+    pub use crate::protocol::upload_pack_wire::{
+        UploadPackWireMode, UploadPackWireReport, UploadPackWireSink, UploadPackWireState,
     };
     #[cfg(feature = "redis")]
     pub use crate::redis_cache::{RedisCache, RedisCacheOptions};

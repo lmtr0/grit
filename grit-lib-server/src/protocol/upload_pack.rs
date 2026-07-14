@@ -16,6 +16,9 @@ use crate::protocol::pack_stream::{
 use crate::protocol::pack_writer::{
     IncrementalPackWriter, PackWriterError, PackWriterFailure, PackWriterReport,
 };
+use crate::protocol::upload_pack_wire::{
+    UploadPackWireMode, UploadPackWireReport, UploadPackWireSink,
+};
 use crate::repository::ServerRepository;
 use crate::storage::{ServerStorage, StoredRef};
 
@@ -292,6 +295,9 @@ pub enum UploadPackStreamPreflightError {
     /// Validated inputs could not construct the writer.
     #[error("incremental pack writer configuration failed: {0}")]
     WriterConfiguration(PackWriterError),
+    /// ACK/NAK, framing, or minimum wire output cannot fit validated limits.
+    #[error("upload-pack wire configuration failed: {0}")]
+    WireConfiguration(PackStreamError),
 }
 
 /// Raw streaming failure with post-start counters preserved.
@@ -311,6 +317,39 @@ pub enum UploadPackStreamFailure {
         source: Error,
         /// Writer and sink state after best-effort abort.
         report: PackWriterReport,
+    },
+}
+
+/// Successful negotiated streaming upload-pack response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UploadPackResponseStreamReport {
+    /// Logical PACK and clone metrics.
+    pub pack: UploadPackStreamReport,
+    /// Physical ACK/NAK, framing, flush, and downstream counters.
+    pub wire: UploadPackWireReport,
+}
+
+/// Negotiated streaming response failure with wire counters preserved.
+#[derive(Debug, thiserror::Error)]
+pub enum UploadPackResponseStreamFailure {
+    /// Validation failed before ACK/NAK or PACK bytes were sent.
+    #[error(transparent)]
+    Preflight(#[from] UploadPackStreamPreflightError),
+    /// Prelude framing or its downstream write failed.
+    #[error("upload-pack wire prelude failed: {source}")]
+    Wire {
+        /// Original stream boundary failure.
+        source: PackStreamError,
+        /// Physical counters after terminal propagation.
+        report: UploadPackWireReport,
+    },
+    /// Raw PACK streaming failed after the prelude.
+    #[error("upload-pack response streaming failed: {source}")]
+    Pack {
+        /// Existing typed raw stream failure.
+        source: UploadPackStreamFailure,
+        /// Physical counters after writer abort propagation.
+        wire: UploadPackWireReport,
     },
 }
 
@@ -724,6 +763,145 @@ where
         record_stream_metrics(recorder, &writer);
         let metrics = recorder.finish(CloneOutcome::Success);
         Ok(UploadPackStreamReport { writer, metrics })
+    }
+
+    /// Stream ACK/NAK and a negotiated raw or channel-1 sideband PACK response.
+    ///
+    /// `side-band-64k` takes precedence over `side-band`, which takes precedence over raw mode.
+    /// All request, plan, writer, fixed framing, and downstream-state checks complete before the
+    /// prelude. The raw writer hashes only logical PACK bytes and the decorator awaits downstream
+    /// backpressure for every physical frame without constructing a whole wire response. Variable
+    /// sideband overhead from compression chunking is checked before each atomic frame write.
+    ///
+    /// # Errors
+    ///
+    /// Returns preflight failures before output, a terminal wire failure for ACK/NAK emission, or
+    /// the original raw-pack failure plus physical counters after streaming began.
+    pub async fn stream_fetch_response<P: CancellationProbe>(
+        &self,
+        plan: FetchPackPlan,
+        downstream: &mut dyn PackChunkSink,
+        clone_limits: CloneLimits,
+        stream_limits: PackStreamLimits,
+        cancellation: P,
+        recorder: &mut CloneMetricsRecorder,
+    ) -> std::result::Result<UploadPackResponseStreamReport, UploadPackResponseStreamFailure> {
+        let clone_limits = match clone_limits.validate() {
+            Ok(limits) => limits,
+            Err(error) => {
+                let _ = recorder.finish(CloneOutcome::Rejected);
+                return Err(UploadPackStreamPreflightError::CloneLimits(error).into());
+            }
+        };
+        let stream_limits = match stream_limits.validate() {
+            Ok(limits) => limits,
+            Err(error) => {
+                let _ = recorder.finish(CloneOutcome::Rejected);
+                return Err(UploadPackStreamPreflightError::StreamLimits(error).into());
+            }
+        };
+        let request_shape_valid = clone_limits
+            .validate_request_shape(plan.request.wants.len(), plan.request.haves.len())
+            .is_ok();
+        let count_valid = u32::try_from(plan.objects.len()).is_ok();
+        let max_chunk = u64::try_from(stream_limits.max_chunk_bytes).ok();
+        let minimum_pack = 12_u64.checked_add(self.repo.hash_algo().len() as u64);
+        if !request_shape_valid {
+            let _ = recorder.finish(CloneOutcome::Rejected);
+            return Err(UploadPackStreamPreflightError::RequestShape.into());
+        }
+        if plan.objects.len() > clone_limits.max_selected_objects {
+            let _ = recorder.finish(CloneOutcome::Rejected);
+            return Err(UploadPackStreamPreflightError::SelectedObjects.into());
+        }
+        if !count_valid {
+            let _ = recorder.finish(CloneOutcome::Rejected);
+            return Err(UploadPackStreamPreflightError::ObjectCount.into());
+        }
+        if max_chunk.is_none_or(|chunk| chunk > clone_limits.encoded_bytes_in_flight)
+            || minimum_pack.is_none_or(|minimum| {
+                minimum
+                    > stream_limits
+                        .max_total_bytes
+                        .min(clone_limits.max_output_bytes)
+            })
+        {
+            let _ = recorder.finish(CloneOutcome::Rejected);
+            return Err(UploadPackStreamPreflightError::WriterConfiguration(
+                PackWriterError::InvalidLimits,
+            )
+            .into());
+        }
+
+        let mode = UploadPackWireMode::negotiate(&plan.request.capabilities);
+        let common = plan.common_haves.last().copied();
+        if let Err(error) = UploadPackWireSink::validate_response(
+            common.as_ref(),
+            mode,
+            stream_limits,
+            self.repo.hash_algo().len(),
+            plan.objects.len(),
+        ) {
+            let _ = recorder.finish(CloneOutcome::Rejected);
+            return Err(UploadPackStreamPreflightError::WireConfiguration(error).into());
+        }
+        let logical_pack_budget = match UploadPackWireSink::logical_pack_budget(
+            common.as_ref(),
+            mode,
+            stream_limits,
+            plan.objects.len(),
+        ) {
+            Ok(budget) => budget,
+            Err(error) => {
+                let _ = recorder.finish(CloneOutcome::Rejected);
+                return Err(UploadPackStreamPreflightError::WireConfiguration(error).into());
+            }
+        };
+        let mut writer_stream_limits = stream_limits;
+        writer_stream_limits.max_chunk_bytes =
+            mode.max_pack_chunk_bytes(stream_limits.max_chunk_bytes);
+        writer_stream_limits.max_total_bytes = logical_pack_budget;
+        let mut wire = match UploadPackWireSink::new(downstream, mode, stream_limits) {
+            Ok(wire) => wire,
+            Err(source) => {
+                let _ = recorder.finish(CloneOutcome::Rejected);
+                return Err(UploadPackResponseStreamFailure::Wire {
+                    source,
+                    report: UploadPackWireReport {
+                        mode,
+                        ..UploadPackWireReport::default()
+                    },
+                });
+            }
+        };
+        if let Err(source) = wire.write_prelude(common.as_ref()).await {
+            let _ = recorder.finish(CloneOutcome::ProtocolFailure);
+            return Err(UploadPackResponseStreamFailure::Wire {
+                source,
+                report: wire.wire_report(),
+            });
+        }
+        let pack = self
+            .stream_raw_fetch_pack(
+                plan,
+                &mut wire,
+                clone_limits,
+                writer_stream_limits,
+                cancellation,
+                recorder,
+            )
+            .await;
+        let wire_report = wire.wire_report();
+        match pack {
+            Ok(pack) => Ok(UploadPackResponseStreamReport {
+                pack,
+                wire: wire_report,
+            }),
+            Err(source) => Err(UploadPackResponseStreamFailure::Pack {
+                source,
+                wire: wire_report,
+            }),
+        }
     }
 
     async fn common_haves(&self, haves: &[ObjectId]) -> Result<Vec<ObjectId>> {
