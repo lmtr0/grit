@@ -1,10 +1,12 @@
 //! PostgreSQL metadata storage with externalized immutable object bytes.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use grit_lib::objects::{ObjectId, ObjectKind};
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
+use time::OffsetDateTime;
 
 use crate::error::{Error, Result};
 use crate::external::ExternalByteStore;
@@ -34,6 +36,25 @@ pub struct ExternalStorageOptions {
     pub write_packs_externally: bool,
 }
 
+/// Result counters from one repository-scoped external orphan sweep.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExternalOrphanSweepReport {
+    /// Candidates whose first observation timestamp was recorded by this sweep.
+    pub newly_observed: u64,
+    /// Expired candidates examined after the grace period.
+    pub examined: u64,
+    /// Expected bytes represented by expired candidates examined by this sweep.
+    pub examined_bytes: u64,
+    /// Candidate rows cleared because live SQL metadata references their key.
+    pub live_cleared: u64,
+    /// Candidate rows cleared because the external value was already missing.
+    pub missing_cleared: u64,
+    /// Unreferenced external values deleted by this sweep.
+    pub deleted: u64,
+    /// Bytes deleted, based on metadata-only size reads immediately before deletion.
+    pub deleted_bytes: u64,
+}
+
 impl Default for ExternalStorageOptions {
     fn default() -> Self {
         Self {
@@ -57,6 +78,11 @@ struct StoredBytes {
     data: Option<Vec<u8>>,
     storage_backend: String,
     storage_key: Option<String>,
+}
+
+struct ExternalOrphanCandidate {
+    storage_key: String,
+    size_bytes: u64,
 }
 
 impl<B> PgExternalizedStorage<B> {
@@ -325,6 +351,192 @@ where
         .fetch_optional(self.pool())
         .await?;
         row.as_ref().map(stored_bytes_from_row).transpose()
+    }
+
+    /// Sweep expired external-pack orphan candidates for one repository.
+    ///
+    /// A candidate without an observation timestamp is only marked as first seen during this
+    /// call. Candidates observed by earlier calls are eligible once `grace_period` has elapsed.
+    /// Every decision is made under the repository mutation lock and live pack and loose-object
+    /// metadata are rechecked immediately before an external deletion.
+    ///
+    /// # Parameters
+    ///
+    /// - `tenant`: Tenant whose candidate namespace is swept.
+    /// - `repository`: Repository whose candidate namespace is swept.
+    /// - `observed_at`: Explicit wall-clock observation time used for both first sightings and the
+    ///   grace-period cutoff.
+    /// - `grace_period`: Minimum time a candidate must remain observed before deletion.
+    ///
+    /// # Returns
+    ///
+    /// Returns counters for observations, live/missing cleanup, and deleted external bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns SQL, external byte-store, duration conversion, or timestamp range errors. A failed
+    /// external deletion leaves the candidate registered for a retry. If SQL commit fails after a
+    /// successful deletion, the next sweep idempotently clears the now-missing candidate. Loose
+    /// object publication does not yet register candidates and is outside this sweeper's scope.
+    pub async fn sweep_external_orphans(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        observed_at: OffsetDateTime,
+        grace_period: Duration,
+    ) -> Result<ExternalOrphanSweepReport> {
+        let grace_period = time::Duration::try_from(grace_period)
+            .map_err(|err| Error::Backend(format!("external orphan grace period: {err}")))?;
+        let cutoff = observed_at.checked_sub(grace_period).ok_or_else(|| {
+            Error::Backend("external orphan grace cutoff exceeds timestamp range".to_owned())
+        })?;
+
+        let mut tx = self.pool().begin().await?;
+        lock_import_repository(&mut tx, tenant, repository).await?;
+        let rows = sqlx::query(
+            "select storage_key, size_bytes
+             from grit_external_orphan_candidates
+             where tenant_id = $1 and repository_id = $2 and storage_backend = $3
+               and first_observed_at is not null and first_observed_at <= $4
+             order by storage_key",
+        )
+        .bind(tenant.as_str())
+        .bind(repository.as_str())
+        .bind(&self.options.backend_name)
+        .bind(cutoff)
+        .fetch_all(&mut *tx)
+        .await?;
+        let candidates = rows
+            .into_iter()
+            .map(|row| {
+                let size_bytes: i64 = row.try_get("size_bytes")?;
+                Ok(ExternalOrphanCandidate {
+                    storage_key: row.try_get("storage_key")?,
+                    size_bytes: u64::try_from(size_bytes).map_err(|_| {
+                        Error::Backend("external orphan candidate has negative size".to_owned())
+                    })?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let newly_observed = sqlx::query(
+            "update grit_external_orphan_candidates
+             set first_observed_at = $4
+             where tenant_id = $1 and repository_id = $2 and storage_backend = $3
+               and first_observed_at is null",
+        )
+        .bind(tenant.as_str())
+        .bind(repository.as_str())
+        .bind(&self.options.backend_name)
+        .bind(observed_at)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        let examined = u64::try_from(candidates.len()).map_err(|_| {
+            Error::Backend("external orphan candidate count exceeds u64".to_owned())
+        })?;
+        let mut report = ExternalOrphanSweepReport {
+            newly_observed,
+            examined,
+            examined_bytes: candidates.iter().fold(0_u64, |sum, candidate| {
+                sum.saturating_add(candidate.size_bytes)
+            }),
+            ..ExternalOrphanSweepReport::default()
+        };
+        for candidate in candidates {
+            if external_key_is_live(
+                &mut tx,
+                tenant,
+                repository,
+                &self.options.backend_name,
+                &candidate.storage_key,
+            )
+            .await?
+            {
+                clear_external_orphan_candidate(
+                    &mut tx,
+                    tenant,
+                    repository,
+                    &self.options.backend_name,
+                    &candidate.storage_key,
+                )
+                .await?;
+                report.live_cleared = report.live_cleared.saturating_add(1);
+                continue;
+            }
+
+            let Some(size_bytes) = self.bytes.content_length(&candidate.storage_key).await? else {
+                clear_external_orphan_candidate(
+                    &mut tx,
+                    tenant,
+                    repository,
+                    &self.options.backend_name,
+                    &candidate.storage_key,
+                )
+                .await?;
+                report.missing_cleared = report.missing_cleared.saturating_add(1);
+                continue;
+            };
+            self.bytes.delete(&candidate.storage_key).await?;
+            clear_external_orphan_candidate(
+                &mut tx,
+                tenant,
+                repository,
+                &self.options.backend_name,
+                &candidate.storage_key,
+            )
+            .await?;
+            report.deleted = report.deleted.saturating_add(1);
+            report.deleted_bytes = report.deleted_bytes.saturating_add(size_bytes);
+        }
+        tx.commit().await?;
+        Ok(report)
+    }
+
+    async fn register_external_orphan_candidates(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        candidates: &[(String, u64)],
+    ) -> Result<()> {
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let candidates = candidates
+            .iter()
+            .map(|(storage_key, size_bytes)| {
+                i64::try_from(*size_bytes)
+                    .map(|size_bytes| (storage_key, size_bytes))
+                    .map_err(|_| Error::Backend("external orphan size exceeds i64".to_owned()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut tx = self.pool().begin().await?;
+        lock_import_repository(&mut tx, tenant, repository).await?;
+        const POSTGRES_BIND_LIMIT: usize = 65_535;
+        const BINDS_PER_ROW: usize = 6;
+        for chunk in candidates.chunks(POSTGRES_BIND_LIMIT / BINDS_PER_ROW) {
+            let mut query = QueryBuilder::<Postgres>::new(
+                "insert into grit_external_orphan_candidates
+                    (tenant_id, repository_id, storage_backend, storage_key, size_bytes,
+                     first_observed_at) ",
+            );
+            query.push_values(chunk, |mut row, (storage_key, size_bytes)| {
+                row.push_bind(tenant.as_str())
+                    .push_bind(repository.as_str())
+                    .push_bind(&self.options.backend_name)
+                    .push_bind(storage_key)
+                    .push_bind(*size_bytes)
+                    .push_bind(Option::<OffsetDateTime>::None);
+            });
+            query.push(
+                " on conflict (tenant_id, repository_id, storage_backend, storage_key)
+                  do update set size_bytes = excluded.size_bytes, first_observed_at = null",
+            );
+            query.build().persistent(false).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 }
 
@@ -630,18 +842,38 @@ where
                 &pack.metadata.pack_checksum,
                 validated_pack_algo_name(&pack.metadata, &pack.index),
             );
-            self.bytes
-                .put_large_if_absent(&key, pack.data.as_slice())
-                .await?;
             storage_keys.push(key);
         }
+        let candidates = prepared
+            .iter()
+            .zip(&storage_keys)
+            .map(|(prepared_pack, key)| (key.clone(), prepared_pack.pack.metadata.size_bytes))
+            .collect::<Vec<_>>();
+        self.register_external_orphan_candidates(tenant, repository, &candidates)
+            .await?;
+        for (prepared_pack, key) in prepared.iter().zip(&storage_keys) {
+            self.bytes
+                .put_large_if_absent(key, prepared_pack.pack.data.as_slice())
+                .await?;
+        }
+        // Refresh registration after potentially long uploads. This recreates a candidate that a
+        // concurrent sweep may have cleared while bytes were still in flight.
+        self.register_external_orphan_candidates(tenant, repository, &candidates)
+            .await?;
 
         // SQL is the visibility boundary. A later transaction failure may leave immutable,
         // content-addressed bytes for the orphan sweeper, but cannot expose partial pack rows.
         let mut tx = self.pool().begin().await?;
         lock_import_repository(&mut tx, tenant, repository).await?;
         let mut unique_metadata = Vec::with_capacity(prepared.len());
+        let mut live_storage_keys = Vec::with_capacity(storage_keys.len());
         for (prepared_pack, storage_key) in prepared.iter().zip(&storage_keys) {
+            verify_external_pack_size(
+                self.bytes.as_ref(),
+                storage_key,
+                prepared_pack.pack.metadata.size_bytes,
+            )
+            .await?;
             unique_metadata.push(
                 install_external_pack_in_transaction(
                     &mut tx,
@@ -655,7 +887,26 @@ where
                 )
                 .await?,
             );
+            if external_key_is_live(
+                &mut tx,
+                tenant,
+                repository,
+                &self.options.backend_name,
+                storage_key,
+            )
+            .await?
+            {
+                live_storage_keys.push(storage_key.clone());
+            }
         }
+        clear_external_orphan_candidates(
+            &mut tx,
+            tenant,
+            repository,
+            &self.options.backend_name,
+            &live_storage_keys,
+        )
+        .await?;
         tx.commit().await?;
 
         Ok(result_indexes
@@ -681,9 +932,22 @@ where
             &pack.metadata.pack_checksum,
             validated_pack_algo_name(&pack.metadata, &pack.index),
         );
+        self.register_external_orphan_candidates(
+            tenant,
+            repository,
+            &[(key.clone(), pack.metadata.size_bytes)],
+        )
+        .await?;
         self.bytes.put_large_if_absent(&key, &pack.data).await?;
+        self.register_external_orphan_candidates(
+            tenant,
+            repository,
+            &[(key.clone(), pack.metadata.size_bytes)],
+        )
+        .await?;
         let mut tx = self.pool().begin().await?;
         lock_import_repository(&mut tx, tenant, repository).await?;
+        verify_external_pack_size(self.bytes.as_ref(), &key, pack.metadata.size_bytes).await?;
         let metadata = install_external_pack_in_transaction(
             &mut tx,
             tenant,
@@ -695,6 +959,24 @@ where
             &key,
         )
         .await?;
+        if external_key_is_live(
+            &mut tx,
+            tenant,
+            repository,
+            &self.options.backend_name,
+            &key,
+        )
+        .await?
+        {
+            clear_external_orphan_candidate(
+                &mut tx,
+                tenant,
+                repository,
+                &self.options.backend_name,
+                &key,
+            )
+            .await?;
+        }
         tx.commit().await?;
         Ok(metadata)
     }
@@ -798,6 +1080,104 @@ where
             .list_pack_objects(tenant, repository, pack_checksum)
             .await
     }
+}
+
+async fn verify_external_pack_size<B>(bytes: &B, storage_key: &str, expected: u64) -> Result<()>
+where
+    B: ExternalByteStore,
+{
+    let actual = bytes.content_length(storage_key).await?.ok_or_else(|| {
+        Error::Backend(format!(
+            "uploaded external pack is missing at {storage_key}"
+        ))
+    })?;
+    if actual != expected {
+        return Err(Error::Backend(format!(
+            "uploaded external pack at {storage_key} has length {actual}, expected {expected}"
+        )));
+    }
+    Ok(())
+}
+
+async fn external_key_is_live(
+    tx: &mut Transaction<'static, Postgres>,
+    tenant: &TenantId,
+    repository: &RepositoryId,
+    backend_name: &str,
+    storage_key: &str,
+) -> Result<bool> {
+    sqlx::query_scalar(
+        "select exists(
+            select 1 from grit_packs
+            where tenant_id = $1 and repository_id = $2
+              and storage_backend = $3 and storage_key = $4
+            union all
+            select 1 from grit_objects
+            where tenant_id = $1 and repository_id = $2
+              and storage_backend = $3 and storage_key = $4
+         )",
+    )
+    .bind(tenant.as_str())
+    .bind(repository.as_str())
+    .bind(backend_name)
+    .bind(storage_key)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(Into::into)
+}
+
+async fn clear_external_orphan_candidate(
+    tx: &mut Transaction<'static, Postgres>,
+    tenant: &TenantId,
+    repository: &RepositoryId,
+    backend_name: &str,
+    storage_key: &str,
+) -> Result<()> {
+    sqlx::query(
+        "delete from grit_external_orphan_candidates
+         where tenant_id = $1 and repository_id = $2 and storage_backend = $3
+           and storage_key = $4",
+    )
+    .bind(tenant.as_str())
+    .bind(repository.as_str())
+    .bind(backend_name)
+    .bind(storage_key)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn clear_external_orphan_candidates(
+    tx: &mut Transaction<'static, Postgres>,
+    tenant: &TenantId,
+    repository: &RepositoryId,
+    backend_name: &str,
+    storage_keys: &[String],
+) -> Result<()> {
+    const POSTGRES_BIND_LIMIT: usize = 65_535;
+    const FIXED_BINDS: usize = 3;
+    for keys in storage_keys.chunks(POSTGRES_BIND_LIMIT - FIXED_BINDS) {
+        if keys.is_empty() {
+            continue;
+        }
+        let mut query = QueryBuilder::<Postgres>::new(
+            "delete from grit_external_orphan_candidates where tenant_id = ",
+        );
+        query
+            .push_bind(tenant.as_str())
+            .push(" and repository_id = ")
+            .push_bind(repository.as_str())
+            .push(" and storage_backend = ")
+            .push_bind(backend_name)
+            .push(" and storage_key in (");
+        let mut separated = query.separated(", ");
+        for key in keys {
+            separated.push_bind(key);
+        }
+        separated.push_unseparated(")");
+        query.build().persistent(false).execute(&mut **tx).await?;
+    }
+    Ok(())
 }
 
 fn validated_pack_algo_name(metadata: &PackMetadata, index: &[PackObjectIndex]) -> &'static str {

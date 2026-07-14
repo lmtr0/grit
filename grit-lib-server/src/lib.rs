@@ -43,7 +43,9 @@ pub mod prelude {
         ContentUrlSigner, ExternalByteStore, MemoryByteStore, StaticContentUrlSigner,
     };
     #[cfg(feature = "externalized-postgres")]
-    pub use crate::externalized::{ExternalStorageOptions, PgExternalizedStorage};
+    pub use crate::externalized::{
+        ExternalOrphanSweepReport, ExternalStorageOptions, PgExternalizedStorage,
+    };
     pub use crate::ids::{RepositoryId, TenantId};
     pub use crate::import::{
         import_repository, import_repository_with_execution_options,

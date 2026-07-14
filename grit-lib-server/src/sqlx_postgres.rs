@@ -155,6 +155,16 @@ pub const MIGRATIONS: &[&str] = &[
         add column if not exists storage_backend text not null default 'database'",
     "alter table grit_packs
         add column if not exists storage_key text",
+    "create table if not exists grit_external_orphan_candidates (
+        tenant_id text not null,
+        repository_id text not null,
+        storage_backend text not null,
+        storage_key text not null,
+        size_bytes bigint not null,
+        first_observed_at timestamptz,
+        primary key (tenant_id, repository_id, storage_backend, storage_key),
+        check (size_bytes >= 0)
+    )",
     "create table if not exists grit_pack_objects (
         tenant_id text not null,
         repository_id text not null,
@@ -869,6 +879,7 @@ async fn rename_repository_in_transaction(
         "grit_import_trusted_objects",
         "grit_packs",
         "grit_pack_objects",
+        "grit_external_orphan_candidates",
     ] {
         let sql = format!(
             "update {table}
@@ -938,6 +949,7 @@ async fn delete_repository_in_transaction(
         "grit_import_state",
         "grit_packs",
         "grit_pack_objects",
+        "grit_external_orphan_candidates",
     ] {
         let sql = format!("delete from {table} where tenant_id = $1 and repository_id = $2");
         sqlx::query(&sql)

@@ -299,6 +299,20 @@ impl S3ByteStore {
     }
 
     async fn existing_object_matches(&self, key: &str, expected_len: usize) -> Result<bool> {
+        let Some(actual_len) = self.head_content_length(key).await? else {
+            return Ok(false);
+        };
+        let expected_len = u64::try_from(expected_len)
+            .map_err(|_| Error::Backend("s3 object length exceeds u64".to_owned()))?;
+        if actual_len != expected_len {
+            return Err(Error::Backend(format!(
+                "existing s3 object {key} has length {actual_len}, expected {expected_len}"
+            )));
+        }
+        Ok(true)
+    }
+
+    async fn head_content_length(&self, key: &str) -> Result<Option<u64>> {
         let output = match self
             .client
             .head_object()
@@ -308,22 +322,17 @@ impl S3ByteStore {
             .await
         {
             Ok(output) => output,
-            Err(err) if is_missing_object_error(&err) => return Ok(false),
+            Err(err) if is_missing_object_error(&err) => return Ok(None),
             Err(err) => return Err(Error::Backend(format!("head s3 object {key}: {err}"))),
         };
-        let expected_len = i64::try_from(expected_len)
-            .map_err(|_| Error::Backend("s3 object length exceeds i64".to_owned()))?;
         let actual_len = output.content_length().ok_or_else(|| {
             Error::Backend(format!(
                 "head s3 object {key}: response omitted content length"
             ))
         })?;
-        if actual_len != expected_len {
-            return Err(Error::Backend(format!(
-                "existing s3 object {key} has length {actual_len}, expected {expected_len}"
-            )));
-        }
-        Ok(true)
+        u64::try_from(actual_len)
+            .map(Some)
+            .map_err(|_| Error::Backend(format!("head s3 object {key}: negative content length")))
     }
 
     async fn abort_multipart_upload(&self, key: &str, upload_id: &str) -> Result<()> {
@@ -391,6 +400,10 @@ impl ExternalByteStore for S3ByteStore {
             .await
             .map_err(|err| Error::Backend(format!("read s3 object body {key}: {err}")))?;
         Ok(Some(bytes.to_vec()))
+    }
+
+    async fn content_length(&self, key: &str) -> Result<Option<u64>> {
+        self.head_content_length(key).await
     }
 
     async fn get_range(&self, key: &str, start: u64, len: u64) -> Result<Option<Vec<u8>>> {

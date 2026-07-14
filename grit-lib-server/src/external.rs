@@ -43,6 +43,26 @@ pub trait ExternalByteStore: Send + Sync {
     /// Returns backend errors from the external byte store.
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
 
+    /// Return the stored byte length for `key` without changing its contents.
+    ///
+    /// The backward-compatible default reads the value and reports its length. Remote backends
+    /// should override this method with a metadata-only request so callers can verify large values
+    /// without downloading them.
+    ///
+    /// # Errors
+    ///
+    /// Returns backend errors from the external byte store or a conversion error if the stored
+    /// length exceeds `u64`.
+    async fn content_length(&self, key: &str) -> Result<Option<u64>> {
+        self.get(key)
+            .await?
+            .map(|bytes| {
+                u64::try_from(bytes.len())
+                    .map_err(|_| Error::Backend("external byte length exceeds u64".to_owned()))
+            })
+            .transpose()
+    }
+
     /// Read a byte range from `key`.
     ///
     /// The default implementation reads the full value and slices it locally. Backends with native
@@ -163,6 +183,18 @@ impl ExternalByteStore for MemoryByteStore {
             .read()
             .map(|stored| stored.get(key).cloned())
             .map_err(|_| Error::Backend("memory byte store lock poisoned".to_owned()))
+    }
+
+    async fn content_length(&self, key: &str) -> Result<Option<u64>> {
+        self.bytes
+            .read()
+            .map_err(|_| Error::Backend("memory byte store lock poisoned".to_owned()))?
+            .get(key)
+            .map(|bytes| {
+                u64::try_from(bytes.len())
+                    .map_err(|_| Error::Backend("memory byte length exceeds u64".to_owned()))
+            })
+            .transpose()
     }
 
     async fn get_range(&self, key: &str, start: u64, len: u64) -> Result<Option<Vec<u8>>> {
