@@ -1,5 +1,6 @@
 //! PostgreSQL metadata storage with externalized immutable object bytes.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,9 +19,9 @@ use crate::sqlx_postgres::{
 };
 use crate::storage::{
     BrowseIndex, CommitGraphStore, ConfigStore, ImportPublication, ImportPublicationResult,
-    ImportSession, ImportStateStore, ImportedPack, IndexedCommit, IndexedTreeEntry, ObjectStore,
-    PackMetadata, PackObjectIndex, PackStore, RefStore, ReflogEntry, ReflogStore, StoredObject,
-    StoredPack, StoredRef,
+    ImportSession, ImportStateStore, ImportedPack, IndexedCommit, IndexedTreeEntry,
+    ObjectReadResult, ObjectStore, PackMetadata, PackObjectIndex, PackStore, RefStore, ReflogEntry,
+    ReflogStore, StoredObject, StoredPack, StoredRef,
 };
 
 /// Configuration for a PostgreSQL-backed repository that externalizes immutable bytes.
@@ -177,6 +178,104 @@ where
                 .map(Some);
         }
         self.read_packed_object(tenant, repository, oid).await
+    }
+
+    async fn read_objects_batch(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        oids: &[ObjectId],
+    ) -> Result<Vec<ObjectReadResult>> {
+        crate::storage::validate_object_read_batch(oids)?;
+        let mut oid_bytes = Vec::new();
+        oid_bytes
+            .try_reserve_exact(oids.len())
+            .map_err(|_| Error::Backend("cannot reserve externalized object batch".to_owned()))?;
+        oid_bytes.extend(oids.iter().map(|oid| oid.as_bytes().to_vec()));
+        let rows = sqlx::query(
+            "select o.oid_bytes, o.kind, o.data, o.storage_backend, o.storage_key
+             from grit_repositories r
+             join grit_objects o on o.repository_pk = r.repository_pk
+             where r.tenant_id = $1 and r.repository_id = $2
+               and o.oid_bytes = any($3::bytea[])
+               and octet_length(o.oid_bytes) = case r.hash_algo
+                   when 'sha1' then 20 when 'sha256' then 32 else -1 end",
+        )
+        .bind(tenant.as_str())
+        .bind(repository.as_str())
+        .bind(&oid_bytes)
+        .fetch_all(self.pool())
+        .await?;
+        let mut loose = HashMap::new();
+        loose
+            .try_reserve(rows.len())
+            .map_err(|_| Error::Backend("cannot reserve externalized object batch".to_owned()))?;
+        for row in rows {
+            let oid = ObjectId::from_bytes(&row.try_get::<Vec<u8>, _>("oid_bytes")?)?;
+            let kind: String = row.try_get("kind")?;
+            let stored = stored_bytes_from_row(&row)?;
+            let object = self
+                .read_stored_object_bytes(&oid, name_to_kind(&kind)?, stored)
+                .await?;
+            loose.insert(oid, object);
+        }
+
+        let mut missing = Vec::new();
+        missing
+            .try_reserve(oids.len())
+            .map_err(|_| Error::Backend("cannot reserve externalized object batch".to_owned()))?;
+        let mut seen_missing = HashSet::new();
+        seen_missing
+            .try_reserve(oids.len())
+            .map_err(|_| Error::Backend("cannot reserve externalized object batch".to_owned()))?;
+        for oid in oids {
+            if !loose.contains_key(oid) && seen_missing.insert(*oid) {
+                missing.push(*oid);
+            }
+        }
+        let packed = self
+            .sql
+            .find_packed_objects_batch_map(tenant, repository, &missing)
+            .await?;
+        let mut pack_data = HashMap::new();
+        pack_data
+            .try_reserve(packed.len())
+            .map_err(|_| Error::Backend("cannot reserve externalized object batch".to_owned()))?;
+        for (metadata, _) in packed.values() {
+            if pack_data.contains_key(&metadata.pack_checksum) {
+                continue;
+            }
+            let data = self
+                .read_pack_data(tenant, repository, &metadata.pack_checksum)
+                .await?
+                .ok_or_else(|| {
+                    Error::Backend("pack index points at missing pack data".to_owned())
+                })?;
+            pack_data.insert(metadata.pack_checksum.clone(), data);
+        }
+
+        let mut results = Vec::new();
+        results
+            .try_reserve_exact(oids.len())
+            .map_err(|_| Error::Backend("cannot reserve externalized object batch".to_owned()))?;
+        for oid in oids {
+            let object = if let Some(object) = loose.get(oid) {
+                Some(object.clone())
+            } else if let Some((metadata, index)) = packed.get(oid) {
+                let data = pack_data.get(&metadata.pack_checksum).ok_or_else(|| {
+                    Error::Backend("pack index points at missing pack data".to_owned())
+                })?;
+                Some(crate::packfile::read_object_at_offset(
+                    data,
+                    index.offset,
+                    oid.algo(),
+                )?)
+            } else {
+                None
+            };
+            results.push(ObjectReadResult { oid: *oid, object });
+        }
+        Ok(results)
     }
 
     async fn write_object(

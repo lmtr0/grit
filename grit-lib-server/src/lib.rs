@@ -145,9 +145,9 @@ pub mod prelude {
     };
     pub use crate::storage::{
         BrowseIndex, CommitGraphStore, ConfigStore, ImportPublication, ImportPublicationResult,
-        ImportSession, ImportStateStore, ImportedPack, IndexedCommit, ObjectStore, PackMetadata,
-        PackObjectIndex, PackStore, PackedObject, RefStore, ReflogEntry, ReflogStore, RepackPlan,
-        StoredObject, StoredPack, StoredRef,
+        ImportSession, ImportStateStore, ImportedPack, IndexedCommit, ObjectReadResult,
+        ObjectStore, PackMetadata, PackObjectIndex, PackStore, PackedObject, RefStore, ReflogEntry,
+        ReflogStore, RepackPlan, StoredObject, StoredPack, StoredRef, MAX_OBJECT_READ_BATCH,
     };
     pub use crate::tree_block::{
         decode_tree_block, encode_tree_block, find_tree_block_entry, tree_block_prefix_range,

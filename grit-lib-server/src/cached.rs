@@ -1,5 +1,6 @@
 //! Read-through cache wrapper for server storage backends.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -11,9 +12,9 @@ use crate::error::{Error, Result};
 use crate::ids::{RepositoryId, TenantId};
 use crate::storage::{
     BrowseIndex, CommitGraphStore, ConfigStore, ImportPublication, ImportPublicationResult,
-    ImportSession, ImportStateStore, ImportedPack, IndexedCommit, IndexedTreeEntry, ObjectStore,
-    PackMetadata, PackObjectIndex, PackStore, RefStore, ReflogEntry, ReflogStore, StoredObject,
-    StoredPack, StoredRef,
+    ImportSession, ImportStateStore, ImportedPack, IndexedCommit, IndexedTreeEntry,
+    ObjectReadResult, ObjectStore, PackMetadata, PackObjectIndex, PackStore, RefStore, ReflogEntry,
+    ReflogStore, StoredObject, StoredPack, StoredRef,
 };
 
 /// Storage wrapper that caches immutable repository data.
@@ -111,6 +112,77 @@ where
                 .await?;
         }
         Ok(object)
+    }
+
+    async fn read_objects_batch(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        oids: &[ObjectId],
+    ) -> Result<Vec<ObjectReadResult>> {
+        crate::storage::validate_object_read_batch(oids)?;
+        let mut resolved = HashMap::new();
+        let mut seen = HashSet::new();
+        let mut misses = Vec::new();
+        resolved
+            .try_reserve(oids.len())
+            .map_err(|_| Error::Cache("cannot reserve cached object batch".to_owned()))?;
+        seen.try_reserve(oids.len())
+            .map_err(|_| Error::Cache("cannot reserve cached object batch".to_owned()))?;
+        misses
+            .try_reserve(oids.len())
+            .map_err(|_| Error::Cache("cannot reserve cached object batch".to_owned()))?;
+        for oid in oids {
+            if !seen.insert(*oid) {
+                continue;
+            }
+            let key = CacheKey::Object(oid.to_hex());
+            if let Some(value) = self.cache.get(tenant, repository, &key).await? {
+                resolved.insert(*oid, Some(decode_object(&value)?));
+            } else {
+                misses.push(*oid);
+            }
+        }
+        if !misses.is_empty() {
+            let fetched = self
+                .storage
+                .read_objects_batch(tenant, repository, &misses)
+                .await?;
+            if fetched.len() != misses.len()
+                || fetched
+                    .iter()
+                    .zip(&misses)
+                    .any(|(entry, expected)| entry.oid != *expected)
+            {
+                return Err(Error::Cache(
+                    "backend object batch violated positional contract".to_owned(),
+                ));
+            }
+            for entry in fetched {
+                if let Some(object) = entry.object.as_ref() {
+                    self.cache
+                        .put(
+                            tenant,
+                            repository,
+                            &CacheKey::Object(entry.oid.to_hex()),
+                            CacheValue::typed(CacheValueKind::Object, encode_object(object)?),
+                        )
+                        .await?;
+                }
+                resolved.insert(entry.oid, entry.object);
+            }
+        }
+        let mut results = Vec::new();
+        results
+            .try_reserve_exact(oids.len())
+            .map_err(|_| Error::Cache("cannot reserve cached object batch".to_owned()))?;
+        for oid in oids {
+            results.push(ObjectReadResult {
+                oid: *oid,
+                object: resolved.get(oid).cloned().flatten(),
+            });
+        }
+        Ok(results)
     }
 
     async fn write_object(

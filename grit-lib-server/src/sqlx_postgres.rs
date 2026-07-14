@@ -13,9 +13,9 @@ use crate::error::{Error, Result};
 use crate::ids::{RepositoryId, TenantId};
 use crate::storage::{
     BrowseIndex, CommitGraphStore, ConfigStore, ImportPublication, ImportPublicationResult,
-    ImportSession, ImportStateStore, ImportedPack, IndexedCommit, IndexedTreeEntry, ObjectStore,
-    PackMetadata, PackObjectIndex, PackStore, RefStore, ReflogEntry, ReflogStore, StoredObject,
-    StoredPack, StoredRef,
+    ImportSession, ImportStateStore, ImportedPack, IndexedCommit, IndexedTreeEntry,
+    ObjectReadResult, ObjectStore, PackMetadata, PackObjectIndex, PackStore, RefStore, ReflogEntry,
+    ReflogStore, StoredObject, StoredPack, StoredRef,
 };
 use crate::tree_block::{
     decode_tree_block, encode_tree_block, tree_block_prefix_range, TreeBlockEntry, TreeBlockError,
@@ -2083,6 +2083,170 @@ impl PgServerStorage {
     #[must_use]
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Resolve the newest packed representation for each requested object in one set query.
+    pub(crate) async fn find_packed_objects_batch_map(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        oids: &[ObjectId],
+    ) -> Result<HashMap<ObjectId, (PackMetadata, PackObjectIndex)>> {
+        if oids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        crate::storage::validate_object_read_batch(oids)?;
+        let mut oid_bytes = Vec::new();
+        oid_bytes
+            .try_reserve_exact(oids.len())
+            .map_err(|_| Error::Backend("cannot reserve packed object batch".to_owned()))?;
+        oid_bytes.extend(oids.iter().map(|oid| oid.as_bytes().to_vec()));
+        let rows = sqlx::query(
+            "select distinct on (o.oid_bytes)
+                    p.pack_checksum, p.index_checksum, p.object_count, p.size_bytes,
+                    p.storage_order, o.oid, o.kind, o.offset, o.size, o.compressed_size
+             from grit_repositories r
+             join grit_pack_objects o on o.repository_pk = r.repository_pk
+             join grit_packs p
+               on p.repository_pk = r.repository_pk
+              and p.pack_checksum = o.pack_checksum
+             where r.tenant_id = $1 and r.repository_id = $2
+               and o.oid_bytes = any($3::bytea[])
+               and octet_length(o.oid_bytes) = case r.hash_algo
+                   when 'sha1' then 20 when 'sha256' then 32 else -1 end
+             order by o.oid_bytes, p.storage_order desc",
+        )
+        .bind(tenant.as_str())
+        .bind(repository.as_str())
+        .bind(&oid_bytes)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut locations = HashMap::new();
+        locations
+            .try_reserve(rows.len())
+            .map_err(|_| Error::Backend("cannot reserve packed object batch".to_owned()))?;
+        for row in rows {
+            let index = row_to_pack_object_index(&row)?;
+            locations.insert(index.oid, (row_to_pack_metadata(&row)?, index));
+        }
+        Ok(locations)
+    }
+
+    async fn read_database_packed_objects_batch_map(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        locations: &HashMap<ObjectId, (PackMetadata, PackObjectIndex)>,
+    ) -> Result<HashMap<ObjectId, StoredObject>> {
+        if locations.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut checksum_set = HashSet::new();
+        checksum_set
+            .try_reserve(locations.len())
+            .map_err(|_| Error::Backend("cannot reserve packed object batch".to_owned()))?;
+        let mut checksums = Vec::new();
+        checksums
+            .try_reserve(locations.len())
+            .map_err(|_| Error::Backend("cannot reserve packed object batch".to_owned()))?;
+        for (metadata, _) in locations.values() {
+            let checksum = bytes_to_hex(&metadata.pack_checksum);
+            if checksum_set.insert(checksum.clone()) {
+                checksums.push(checksum);
+            }
+        }
+        let rows = sqlx::query(
+            "select p.pack_checksum, p.data, p.storage_backend, p.storage_key
+             from grit_repositories r
+             join grit_packs p on p.repository_pk = r.repository_pk
+             where r.tenant_id = $1 and r.repository_id = $2
+               and p.pack_checksum = any($3::text[])",
+        )
+        .bind(tenant.as_str())
+        .bind(repository.as_str())
+        .bind(&checksums)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut packs = HashMap::new();
+        packs
+            .try_reserve(rows.len())
+            .map_err(|_| Error::Backend("cannot reserve packed object batch".to_owned()))?;
+        for row in rows {
+            let checksum: String = row.try_get("pack_checksum")?;
+            let data: Option<Vec<u8>> = row.try_get("data")?;
+            let Some(data) = data else {
+                return Err(Error::Backend(
+                    "packed object requires the externalized storage adapter".to_owned(),
+                ));
+            };
+            packs.insert(checksum, data);
+        }
+        if packs.len() != checksums.len() {
+            return Err(Error::Backend(
+                "pack index points at missing pack data".to_owned(),
+            ));
+        }
+        let mut objects = HashMap::new();
+        objects
+            .try_reserve(locations.len())
+            .map_err(|_| Error::Backend("cannot reserve packed object batch".to_owned()))?;
+        for (oid, (metadata, index)) in locations {
+            let checksum = bytes_to_hex(&metadata.pack_checksum);
+            let data = packs.get(&checksum).ok_or_else(|| {
+                Error::Backend("pack index points at missing pack data".to_owned())
+            })?;
+            let object = crate::packfile::read_object_at_offset(data, index.offset, oid.algo())?;
+            if object.object_id(oid.algo()) != *oid {
+                return Err(Error::Protocol(
+                    "packed object does not match its index object id".to_owned(),
+                ));
+            }
+            objects.insert(*oid, object);
+        }
+        Ok(objects)
+    }
+
+    async fn read_packed_object_at_location(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        oid: &ObjectId,
+        metadata: &PackMetadata,
+        index: &PackObjectIndex,
+    ) -> Result<StoredObject> {
+        const PACK_OBJECT_HEADER_SLACK: u64 = 64;
+        let range_len = index
+            .compressed_size
+            .checked_add(PACK_OBJECT_HEADER_SLACK)
+            .ok_or_else(|| Error::Backend("pack object range length overflow".to_owned()))?;
+        let range = self
+            .read_pack_range(
+                tenant,
+                repository,
+                &metadata.pack_checksum,
+                index.offset,
+                range_len,
+            )
+            .await?
+            .ok_or_else(|| Error::Backend("pack index points at missing pack data".to_owned()))?;
+        match crate::packfile::read_object_from_pack_range(&range, oid, index.offset, oid.algo()) {
+            Ok(object) => return Ok(object),
+            Err(Error::Protocol(_)) => {}
+            Err(error) => return Err(error),
+        }
+        let data = self
+            .read_pack_data(tenant, repository, &metadata.pack_checksum)
+            .await?
+            .ok_or_else(|| Error::Backend("pack index points at missing pack data".to_owned()))?;
+        let object = crate::packfile::read_object_at_offset(&data, index.offset, oid.algo())?;
+        if object.object_id(oid.algo()) != *oid {
+            return Err(Error::Protocol(format!(
+                "pack object at offset {} does not match expected object {}",
+                index.offset,
+                oid.to_hex()
+            )));
+        }
+        Ok(object)
     }
 
     /// Create or read the migration session identified by an idempotency key.
@@ -9397,39 +9561,97 @@ impl ObjectStore for PgServerStorage {
         else {
             return Ok(None);
         };
-        const PACK_OBJECT_HEADER_SLACK: u64 = 64;
-        let range_len = index
-            .compressed_size
-            .checked_add(PACK_OBJECT_HEADER_SLACK)
-            .ok_or_else(|| Error::Backend("pack object range length overflow".to_owned()))?;
-        let range = self
-            .read_pack_range(
-                tenant,
-                repository,
-                &metadata.pack_checksum,
-                index.offset,
-                range_len,
-            )
-            .await?
-            .ok_or_else(|| Error::Backend("pack index points at missing pack data".to_owned()))?;
-        match crate::packfile::read_object_from_pack_range(&range, oid, index.offset, oid.algo()) {
-            Ok(object) => return Ok(Some(object)),
-            Err(Error::Protocol(_)) => {}
-            Err(error) => return Err(error),
+        self.read_packed_object_at_location(tenant, repository, oid, &metadata, &index)
+            .await
+            .map(Some)
+    }
+
+    async fn read_objects_batch(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        oids: &[ObjectId],
+    ) -> Result<Vec<ObjectReadResult>> {
+        crate::storage::validate_object_read_batch(oids)?;
+        let mut oid_bytes = Vec::new();
+        oid_bytes
+            .try_reserve_exact(oids.len())
+            .map_err(|_| Error::Backend("cannot reserve PostgreSQL object batch".to_owned()))?;
+        oid_bytes.extend(oids.iter().map(|oid| oid.as_bytes().to_vec()));
+        let rows = sqlx::query(
+            "select o.oid_bytes, o.kind, o.data, o.storage_backend, o.storage_key
+             from grit_repositories r
+             join grit_objects o on o.repository_pk = r.repository_pk
+             where r.tenant_id = $1 and r.repository_id = $2
+               and o.oid_bytes = any($3::bytea[])
+               and octet_length(o.oid_bytes) = case r.hash_algo
+                   when 'sha1' then 20 when 'sha256' then 32 else -1 end",
+        )
+        .bind(tenant.as_str())
+        .bind(repository.as_str())
+        .bind(&oid_bytes)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut loose = HashMap::new();
+        loose
+            .try_reserve(rows.len())
+            .map_err(|_| Error::Backend("cannot reserve PostgreSQL object batch".to_owned()))?;
+        for row in rows {
+            let oid = ObjectId::from_bytes(&row.try_get::<Vec<u8>, _>("oid_bytes")?)?;
+            let kind: String = row.try_get("kind")?;
+            let data: Option<Vec<u8>> = row.try_get("data")?;
+            let backend: String = row.try_get("storage_backend")?;
+            let key: Option<String> = row.try_get("storage_key")?;
+            let Some(data) = data else {
+                return Err(Error::Backend(format!(
+                    "object {} is stored in external backend {} at {}; use externalized storage",
+                    oid.to_hex(),
+                    backend,
+                    key.unwrap_or_else(|| "<missing key>".to_owned())
+                )));
+            };
+            loose.insert(
+                oid,
+                StoredObject {
+                    kind: name_to_kind(&kind)?,
+                    data,
+                },
+            );
         }
-        let data = self
-            .read_pack_data(tenant, repository, &metadata.pack_checksum)
-            .await?
-            .ok_or_else(|| Error::Backend("pack index points at missing pack data".to_owned()))?;
-        let object = crate::packfile::read_object_at_offset(&data, index.offset, oid.algo())?;
-        if object.object_id(oid.algo()) != *oid {
-            return Err(Error::Protocol(format!(
-                "pack object at offset {} does not match expected object {}",
-                index.offset,
-                oid.to_hex()
-            )));
+        let mut missing = Vec::new();
+        missing
+            .try_reserve(oids.len())
+            .map_err(|_| Error::Backend("cannot reserve PostgreSQL object batch".to_owned()))?;
+        let mut seen_missing = HashSet::new();
+        seen_missing
+            .try_reserve(oids.len())
+            .map_err(|_| Error::Backend("cannot reserve PostgreSQL object batch".to_owned()))?;
+        for oid in oids {
+            if !loose.contains_key(oid) && seen_missing.insert(*oid) {
+                missing.push(*oid);
+            }
         }
-        Ok(Some(object))
+        let packed = self
+            .find_packed_objects_batch_map(tenant, repository, &missing)
+            .await?;
+        let packed_objects = self
+            .read_database_packed_objects_batch_map(tenant, repository, &packed)
+            .await?;
+        let mut results = Vec::new();
+        results
+            .try_reserve_exact(oids.len())
+            .map_err(|_| Error::Backend("cannot reserve PostgreSQL object batch".to_owned()))?;
+        for oid in oids {
+            let object = if let Some(object) = loose.get(oid) {
+                Some(object.clone())
+            } else if let Some(object) = packed_objects.get(oid) {
+                Some(object.clone())
+            } else {
+                None
+            };
+            results.push(ObjectReadResult { oid: *oid, object });
+        }
+        Ok(results)
     }
 
     async fn write_object(

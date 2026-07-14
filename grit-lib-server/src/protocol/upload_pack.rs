@@ -644,10 +644,13 @@ where
 
     /// Stream a raw non-delta PACK v2 for a validated fetch plan.
     ///
-    /// Objects are read and emitted in the deterministic order stored by [`FetchPackPlan`]. The
-    /// method retains at most the current decoded object and one bounded compressed chunk; it does
-    /// not sideband-frame the raw PACK. Generic storage does not expose DB/S3/cache counters, so
-    /// callers should seed `recorder` with adapter observations they can measure honestly.
+    /// Objects are emitted in the deterministic order stored by [`FetchPackPlan`]. The generic
+    /// object-store boundary has no size-only preflight, so this path uses one-object waves: that
+    /// guarantees the decoded budget is exceeded only by the one oversized object explicitly
+    /// permitted by the contract. Backends may still use the positional batch API in callers that
+    /// have size metadata. The method does not sideband-frame the raw PACK. Generic storage does not expose
+    /// DB/S3/cache counters, so callers should seed `recorder` with adapter observations they can
+    /// measure honestly.
     ///
     /// # Errors
     ///
@@ -723,35 +726,78 @@ where
             finish_stream_writer_failure(recorder, &failure);
             return Err(UploadPackStreamFailure::Writer(failure));
         }
-        for oid in &plan.objects {
+        let read_wave_size = 1;
+        for oid_wave in plan.objects.chunks(read_wave_size) {
             if let Err(failure) = writer.checkpoint_before_read().await {
                 finish_stream_writer_failure(recorder, &failure);
                 return Err(UploadPackStreamFailure::Writer(failure));
             }
-            let object = match self.repo.read_object(oid).await {
-                Ok(Some(object)) => object,
-                Ok(None) => {
-                    let report = writer.abort(PackAbortReason::BackendFailure).await;
-                    finish_stream_backend_failure(recorder, &report);
-                    return Err(UploadPackStreamFailure::Backend {
-                        source: Error::ObjectNotFound(oid.to_hex()),
-                        report,
-                    });
-                }
+            let objects = match self.repo.read_objects_batch(oid_wave).await {
+                Ok(objects) => objects,
                 Err(source) => {
                     let report = writer.abort(PackAbortReason::BackendFailure).await;
                     finish_stream_backend_failure(recorder, &report);
                     return Err(UploadPackStreamFailure::Backend { source, report });
                 }
             };
-            let entry = match writer.write_object(&object).await {
-                Ok(entry) => entry,
-                Err(failure) => {
-                    finish_stream_writer_failure(recorder, &failure);
-                    return Err(UploadPackStreamFailure::Writer(failure));
+            if objects.len() != oid_wave.len() {
+                let source = Error::Backend(format!(
+                    "object batch returned {} rows for {} requested ids",
+                    objects.len(),
+                    oid_wave.len()
+                ));
+                let report = writer.abort(PackAbortReason::BackendFailure).await;
+                finish_stream_backend_failure(recorder, &report);
+                return Err(UploadPackStreamFailure::Backend { source, report });
+            }
+            let decoded_wave_bytes = match objects
+                .first()
+                .and_then(|entry| entry.object.as_ref())
+                .map_or(Ok(0), |object| u64::try_from(object.data.len()))
+            {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    let source = Error::Backend(
+                        "object batch decoded size cannot be represented".to_owned(),
+                    );
+                    let report = writer.abort(PackAbortReason::BackendFailure).await;
+                    finish_stream_backend_failure(recorder, &report);
+                    return Err(UploadPackStreamFailure::Backend { source, report });
                 }
             };
-            recorder.record_objects(entry.kind, 1, entry.decoded_bytes, entry.compressed_bytes);
+            recorder.observe_memory(CloneMemoryMetrics {
+                decoded_bytes: decoded_wave_bytes,
+                total_bytes: decoded_wave_bytes,
+                ..CloneMemoryMetrics::default()
+            });
+            for (expected_oid, entry) in oid_wave.iter().zip(objects) {
+                if entry.oid != *expected_oid {
+                    let source = Error::Backend(format!(
+                        "object batch returned {} at the position for {}",
+                        entry.oid.to_hex(),
+                        expected_oid.to_hex()
+                    ));
+                    let report = writer.abort(PackAbortReason::BackendFailure).await;
+                    finish_stream_backend_failure(recorder, &report);
+                    return Err(UploadPackStreamFailure::Backend { source, report });
+                }
+                let Some(object) = entry.object else {
+                    let report = writer.abort(PackAbortReason::BackendFailure).await;
+                    finish_stream_backend_failure(recorder, &report);
+                    return Err(UploadPackStreamFailure::Backend {
+                        source: Error::ObjectNotFound(expected_oid.to_hex()),
+                        report,
+                    });
+                };
+                let entry = match writer.write_object(&object).await {
+                    Ok(entry) => entry,
+                    Err(failure) => {
+                        finish_stream_writer_failure(recorder, &failure);
+                        return Err(UploadPackStreamFailure::Writer(failure));
+                    }
+                };
+                recorder.record_objects(entry.kind, 1, entry.decoded_bytes, entry.compressed_bytes);
+            }
         }
         let writer = match writer.finish().await {
             Ok(report) => report,

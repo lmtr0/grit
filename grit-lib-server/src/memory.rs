@@ -14,8 +14,8 @@ use crate::ids::{RepositoryId, TenantId};
 use crate::storage::{
     commit_time_from_identity, BrowseIndex, CommitGraphStore, ConfigStore, ImportPublication,
     ImportPublicationResult, ImportSession, ImportStateStore, ImportedPack, IndexedCommit,
-    IndexedTreeEntry, ObjectStore, PackMetadata, PackObjectIndex, PackStore, RefStore, ReflogEntry,
-    ReflogStore, StoredObject, StoredPack, StoredRef,
+    IndexedTreeEntry, ObjectReadResult, ObjectStore, PackMetadata, PackObjectIndex, PackStore,
+    RefStore, ReflogEntry, ReflogStore, StoredObject, StoredPack, StoredRef,
 };
 
 type TreeKey = (ObjectId, String);
@@ -492,6 +492,74 @@ impl ObjectStore for MemoryBackend {
             return Ok(None);
         };
         Self::read_object_from_state(&repo, oid)
+    }
+
+    async fn read_objects_batch(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        oids: &[ObjectId],
+    ) -> Result<Vec<ObjectReadResult>> {
+        crate::storage::validate_object_read_batch(oids)?;
+        let Some(repo) = self.existing_repo_state(tenant, repository)? else {
+            let mut missing = Vec::new();
+            missing
+                .try_reserve_exact(oids.len())
+                .map_err(|_| Error::Backend("cannot reserve memory object batch".to_owned()))?;
+            missing.extend(oids.iter().map(|oid| ObjectReadResult {
+                oid: *oid,
+                object: None,
+            }));
+            return Ok(missing);
+        };
+        let pack_locations = {
+            let packs = repo
+                .packs
+                .read()
+                .map_err(|_| Error::Backend("memory pack lock poisoned".to_owned()))?;
+            let mut locations = Vec::new();
+            locations
+                .try_reserve_exact(oids.len())
+                .map_err(|_| Error::Backend("cannot reserve memory object batch".to_owned()))?;
+            locations.extend(oids.iter().map(|oid| packs.newest_by_oid.get(oid).cloned()));
+            locations
+        };
+        let loose_objects = {
+            let objects = repo
+                .objects
+                .read()
+                .map_err(|_| Error::Backend("memory object lock poisoned".to_owned()))?;
+            let mut loose = Vec::new();
+            loose
+                .try_reserve_exact(oids.len())
+                .map_err(|_| Error::Backend("cannot reserve memory object batch".to_owned()))?;
+            loose.extend(oids.iter().zip(&pack_locations).map(|(oid, location)| {
+                if location.is_some() {
+                    None
+                } else {
+                    objects.get(oid).cloned()
+                }
+            }));
+            loose
+        };
+        let mut results = Vec::new();
+        results
+            .try_reserve_exact(oids.len())
+            .map_err(|_| Error::Backend("cannot reserve memory object batch".to_owned()))?;
+        for ((oid, location), loose) in oids.iter().zip(pack_locations).zip(loose_objects) {
+            let object = if let Some(location) = location {
+                let object = grit_lib::pack::read_object_from_pack_bytes(
+                    &location.pack.data,
+                    &location.pack.decode_index,
+                    oid.as_bytes(),
+                )?;
+                Some(StoredObject::new(object.kind, object.data))
+            } else {
+                loose
+            };
+            results.push(ObjectReadResult { oid: *oid, object });
+        }
+        Ok(results)
     }
 
     async fn write_object(

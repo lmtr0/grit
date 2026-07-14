@@ -28,6 +28,18 @@ pub struct StoredObject {
     pub data: Vec<u8>,
 }
 
+/// Maximum object ids accepted by one positional backend batch read.
+pub const MAX_OBJECT_READ_BATCH: usize = 4_096;
+
+/// One positional result from [`ObjectStore::read_objects_batch`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectReadResult {
+    /// Requested object id, including duplicates in caller order.
+    pub oid: ObjectId,
+    /// Stored object or `None` when the exact id is absent.
+    pub object: Option<StoredObject>,
+}
+
 /// Metadata for one stored packfile.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackMetadata {
@@ -179,6 +191,35 @@ pub trait ObjectStore: Send + Sync {
         repository: &RepositoryId,
         oid: &ObjectId,
     ) -> Result<Option<StoredObject>>;
+
+    /// Read a bounded object-id batch while preserving exact input order and duplicates.
+    ///
+    /// The default safely delegates one id at a time. Backend overrides may batch storage calls,
+    /// but must return exactly one positional row per requested id.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation, allocation, or backend error. Empty and oversized batches are
+    /// rejected before result allocation.
+    async fn read_objects_batch(
+        &self,
+        tenant: &TenantId,
+        repository: &RepositoryId,
+        oids: &[ObjectId],
+    ) -> Result<Vec<ObjectReadResult>> {
+        validate_object_read_batch(oids)?;
+        let mut results = Vec::new();
+        results.try_reserve_exact(oids.len()).map_err(|_| {
+            crate::error::Error::Backend("cannot reserve object read batch".to_owned())
+        })?;
+        for oid in oids {
+            results.push(ObjectReadResult {
+                oid: *oid,
+                object: self.read_object(tenant, repository, oid).await?,
+            });
+        }
+        Ok(results)
+    }
 
     /// Write an object under its computed id.
     async fn write_object(
@@ -785,6 +826,15 @@ pub trait ServerStorage:
     + Send
     + Sync
 {
+}
+
+pub(crate) fn validate_object_read_batch(oids: &[ObjectId]) -> Result<()> {
+    if oids.is_empty() || oids.len() > MAX_OBJECT_READ_BATCH {
+        return Err(crate::error::Error::Backend(
+            "object read batch must contain 1..=4096 ids".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 impl<T> ServerStorage for T where

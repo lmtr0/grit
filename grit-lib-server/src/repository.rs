@@ -18,8 +18,8 @@ use crate::protocol::upload_pack::{
     FetchPackPlan, FetchPackResponse, RefAdvertisement, UploadPackRequest, UploadPackService,
 };
 use crate::storage::{
-    commit_time_from_identity, IndexedCommit, IndexedTreeEntry, PackMetadata, PackedObject,
-    RepackPlan, ServerStorage, StoredObject, StoredRef,
+    commit_time_from_identity, IndexedCommit, IndexedTreeEntry, ObjectReadResult, PackMetadata,
+    PackedObject, RepackPlan, ServerStorage, StoredObject, StoredRef,
 };
 use crate::views::{
     BlobContentDelivery, BlobContentView, BlobDownloadOptions, BlobDownloadView, BlobMetadataView,
@@ -111,6 +111,19 @@ where
     pub async fn read_object(&self, oid: &ObjectId) -> Result<Option<StoredObject>> {
         self.storage
             .read_object(&self.tenant, &self.repository, oid)
+            .await
+    }
+
+    /// Read a bounded positional object batch through the backend's efficient batch path.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, allocation, or storage errors. The returned vector has exactly the
+    /// requested order and length, including duplicate and missing ids.
+    pub async fn read_objects_batch(&self, oids: &[ObjectId]) -> Result<Vec<ObjectReadResult>> {
+        crate::storage::validate_object_read_batch(oids)?;
+        self.storage
+            .read_objects_batch(&self.tenant, &self.repository, oids)
             .await
     }
 
