@@ -5,6 +5,7 @@
 //! supplies repository identity, storage traits, cache invalidation hooks, and backend
 //! implementations that can be adapted into protocol serving and UI browsing paths.
 
+pub mod admission;
 pub mod cache;
 pub mod cached;
 pub mod error;
@@ -36,6 +37,12 @@ pub mod views;
 
 /// Commonly used server-layer types.
 pub mod prelude {
+    pub use crate::admission::{
+        AdmissionConfigError, AdmissionController, AdmissionDecision, AdmissionIdentity,
+        AdmissionLimits, AdmissionPermit, AdmissionRejectReason, AdmissionRequest,
+        AdmissionSnapshot, AdmissionTicket, BackendPressure, ClassCapacities, ResourceClass,
+        ResourceWeights, RetryGuidance,
+    };
     pub use crate::cache::{
         apply_invalidation, Cache, CacheKey, CacheValue, CacheValueKind, EventPublisher,
         InvalidationEvent, InvalidationEventKind,
