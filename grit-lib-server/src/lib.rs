@@ -77,6 +77,16 @@ pub mod prelude {
         NoAuthorization, NoopAuditSink, PolicyActor, PolicyDecision, PolicyRefUpdate,
         RefUpdatePolicyContext, RepositoryPermission, RepositoryPolicy,
     };
+    pub use crate::protocol::canonical_clone::{
+        CanonicalCloneClaimResult, CanonicalCloneDeepen, CanonicalCloneError, CanonicalCloneFilter,
+        CanonicalCloneFlightState, CanonicalCloneGeneration, CanonicalCloneKey,
+        CanonicalCloneLease, CanonicalCloneLocator, CanonicalCloneManifest,
+        CanonicalCloneManifestState, CanonicalCloneMutationResult, CanonicalCloneReceiver,
+        CanonicalCloneRepresentation, CanonicalCloneScope, CanonicalCloneShallow,
+        CanonicalCloneShape, CanonicalCloneSingleflight, CanonicalCloneStore,
+        CanonicalCloneStoreCas, CanonicalCloneToken, CanonicalCloneVerification, ClonePackPurpose,
+        MAX_CANONICAL_CLONE_WANTS,
+    };
     pub use crate::protocol::clone_metrics::{
         CloneBackendKind, CloneBackendMetrics, CloneCacheMetrics, CloneCancellationMetrics,
         CloneLimitError, CloneLimits, CloneMemoryMetrics, CloneMetricsRecorder, CloneMetricsReport,
