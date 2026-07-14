@@ -48,6 +48,8 @@ pub const MIGRATIONS: &[&str] = &[
         add column if not exists ref_generation bigint not null default 0",
     "alter table grit_repositories
         add column if not exists history_generation bigint not null default 0",
+    "alter table grit_repositories
+        add column if not exists config_generation bigint not null default 0",
     "do $$ begin
         if not exists (
             select 1 from pg_constraint
@@ -72,6 +74,18 @@ pub const MIGRATIONS: &[&str] = &[
         end if;
      end $$",
     "alter table grit_repositories validate constraint grit_repositories_history_generation_nonnegative",
+    "do $$ begin
+        if not exists (
+            select 1 from pg_constraint
+            where conrelid = 'grit_repositories'::regclass
+              and conname = 'grit_repositories_config_generation_nonnegative'
+        ) then
+            alter table grit_repositories
+                add constraint grit_repositories_config_generation_nonnegative
+                check (config_generation >= 0) not valid;
+        end if;
+     end $$",
+    "alter table grit_repositories validate constraint grit_repositories_config_generation_nonnegative",
     "create sequence if not exists grit_repository_pk_seq",
     "alter table grit_repositories add column if not exists repository_pk bigint",
     "alter sequence grit_repository_pk_seq
@@ -192,6 +206,72 @@ pub const MIGRATIONS: &[&str] = &[
         check (latest_commit_oid is null or octet_length(latest_commit_oid) in (20, 32)),
         check (latest_commit_tree_oid is null or octet_length(latest_commit_tree_oid) in (20, 32))
     )",
+    "create sequence if not exists grit_cache_outbox_event_id_seq",
+    "create sequence if not exists grit_cache_outbox_claim_token_seq",
+    "create table if not exists grit_cache_invalidation_outbox (
+        event_id bigint not null default nextval('grit_cache_outbox_event_id_seq'),
+        repository_pk bigint not null,
+        tenant_id text not null,
+        repository_id text not null,
+        event_kind smallint not null,
+        ref_generation bigint,
+        config_generation bigint,
+        history_generation bigint,
+        claimed_by text,
+        claim_token bigint,
+        lease_expires_at timestamptz,
+        not_before timestamptz,
+        attempts integer not null default 0,
+        primary key (event_id),
+        check (event_id > 0),
+        check (repository_pk > 0),
+        check (
+            (event_kind = 1 and ref_generation is not null
+                and config_generation is null and history_generation is null)
+            or (event_kind = 2 and ref_generation is null
+                and config_generation is not null and history_generation is null)
+            or (event_kind = 3 and ref_generation is null
+                and config_generation is null and history_generation is not null)
+            or (event_kind = 4 and ref_generation is null
+                and config_generation is null and history_generation is null)
+        ),
+        check (ref_generation is null or ref_generation >= 0),
+        check (config_generation is null or config_generation >= 0),
+        check (history_generation is null or history_generation >= 0),
+        check (attempts >= 0),
+        check (claim_token is null or claim_token > 0),
+        check ((claimed_by is null) = (claim_token is null)),
+        check ((claimed_by is null) = (lease_expires_at is null))
+    )",
+    "alter sequence grit_cache_outbox_event_id_seq
+        owned by grit_cache_invalidation_outbox.event_id",
+    "do $$ begin
+        if not exists (
+            select 1 from pg_constraint
+            where conrelid = 'grit_cache_invalidation_outbox'::regclass
+              and conname = 'grit_cache_outbox_payload_shape'
+        ) then
+            alter table grit_cache_invalidation_outbox
+                add constraint grit_cache_outbox_payload_shape check (
+                    (event_kind = 1 and ref_generation is not null
+                        and config_generation is null and history_generation is null)
+                    or (event_kind = 2 and ref_generation is null
+                        and config_generation is not null and history_generation is null)
+                    or (event_kind = 3 and ref_generation is null
+                        and config_generation is null and history_generation is not null)
+                    or (event_kind = 4 and ref_generation is null
+                        and config_generation is null and history_generation is null)
+                ) not valid;
+        end if;
+     end $$",
+    "alter table grit_cache_invalidation_outbox
+        validate constraint grit_cache_outbox_payload_shape",
+    "create index if not exists grit_cache_outbox_claim_idx
+        on grit_cache_invalidation_outbox
+            (not_before, lease_expires_at, event_id)
+        where claimed_by is null or lease_expires_at is not null",
+    "create index if not exists grit_cache_outbox_repository_idx
+        on grit_cache_invalidation_outbox (repository_pk, event_id)",
     "create table if not exists grit_commits (
         tenant_id text not null,
         repository_id text not null,
@@ -480,6 +560,8 @@ pub struct PgRepositoryRow {
     pub ref_generation: u64,
     /// Durable generation advanced by commit-index or parent-graph mutations.
     pub history_generation: u64,
+    /// Durable generation advanced by repository-local config mutations.
+    pub config_generation: u64,
     /// Timestamp when the repository row was created.
     pub created_at: OffsetDateTime,
     /// Timestamp when repository metadata was last changed.
@@ -488,6 +570,89 @@ pub struct PgRepositoryRow {
     pub archived_at: Option<OffsetDateTime>,
     /// Timestamp when the repository was soft-deleted, if retained.
     pub deleted_at: Option<OffsetDateTime>,
+}
+
+/// Maximum number of invalidation events claimed in one PostgreSQL call.
+pub const MAX_CACHE_OUTBOX_CLAIM_BATCH: usize = 1_024;
+
+/// Typed durable mutation represented by one cache invalidation outbox event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PgCacheInvalidationKind {
+    /// The repository's visible ref generation advanced.
+    RefGenerationAdvanced {
+        /// New durable ref generation.
+        generation: u64,
+    },
+    /// The repository's config generation advanced.
+    ConfigGenerationAdvanced {
+        /// New durable config generation.
+        generation: u64,
+    },
+    /// The repository's indexed-history generation advanced.
+    HistoryGenerationAdvanced {
+        /// New durable history generation.
+        generation: u64,
+    },
+    /// A repository and all of its durable repository-scoped rows were deleted.
+    RepositoryDeleted,
+}
+
+/// One durable cache invalidation outbox event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgCacheInvalidationEvent {
+    /// Monotonic database-assigned event identifier.
+    pub event_id: u64,
+    /// Immutable numeric repository identity, retained after repository deletion.
+    pub repository_pk: RepositoryPk,
+    /// Tenant snapshot needed by legacy name-scoped cache consumers.
+    pub tenant: TenantId,
+    /// Repository-name snapshot at the time of the mutation.
+    pub repository: RepositoryId,
+    /// Typed durable mutation and its affected generation.
+    pub kind: PgCacheInvalidationKind,
+}
+
+/// Explicit limits and lease timestamps for one outbox claim call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgCacheOutboxClaimOptions {
+    /// Stable identity of the worker claiming events.
+    pub worker_id: String,
+    /// Caller-observed time used to decide whether prior leases and retry delays expired.
+    pub observed_at: OffsetDateTime,
+    /// Caller-selected exclusive end of the new lease.
+    pub lease_expires_at: OffsetDateTime,
+    /// Maximum number of events returned, in `1..=`[`MAX_CACHE_OUTBOX_CLAIM_BATCH`].
+    pub max_events: usize,
+    /// Maximum attempts permitted for any selected event; must be positive.
+    pub max_attempts: u32,
+}
+
+/// One outbox event leased to a specific worker and claim token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgCacheOutboxClaim {
+    /// Claimed durable invalidation event.
+    pub event: PgCacheInvalidationEvent,
+    /// Worker identity that owns this lease.
+    pub worker_id: String,
+    /// Fresh monotonic token fencing every preceding claim of the event.
+    pub claim_token: u64,
+    /// Exclusive end of this claim's lease.
+    pub lease_expires_at: OffsetDateTime,
+    /// Number of times this event has been claimed, including this claim.
+    pub attempts: u32,
+}
+
+/// Idempotent outcome of acknowledging, releasing, or retrying an outbox claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PgCacheOutboxClaimResult {
+    /// The requested state transition was applied.
+    Applied,
+    /// An acknowledgement was already durably applied and removed the event.
+    AlreadyAcknowledged,
+    /// The event is already available without a lease.
+    AlreadyReleased,
+    /// A newer or different worker claim owns the event, so no mutation was made.
+    ClaimLost,
 }
 
 /// Resolved default branch stored in a generation-scoped repository summary.
@@ -790,6 +955,214 @@ impl PgServerStorage {
     #[must_use]
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Claim a bounded oldest-first batch of durable cache invalidation events.
+    ///
+    /// The claim and fresh fencing-token assignment happen in one PostgreSQL statement. Locked
+    /// rows are skipped, and a crashed worker's events become eligible when the caller's
+    /// `observed_at` reaches their lease expiry. Events at `max_attempts` remain durable for
+    /// operator inspection but are not claimed again by this call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Backend`] when a bound, worker identity, timestamp relationship, or stored
+    /// event is invalid, or SQLx errors from PostgreSQL.
+    pub async fn claim_cache_invalidations(
+        &self,
+        options: PgCacheOutboxClaimOptions,
+    ) -> Result<Vec<PgCacheOutboxClaim>> {
+        validate_cache_outbox_claim_options(&options)?;
+        let max_events = i64::try_from(options.max_events)
+            .map_err(|_| Error::Backend("cache outbox batch exceeds i64".to_owned()))?;
+        let max_attempts = i32::try_from(options.max_attempts)
+            .map_err(|_| Error::Backend("cache outbox attempt limit exceeds i32".to_owned()))?;
+        let rows = sqlx::query(
+            "with candidates as (
+                 select event_id
+                 from grit_cache_invalidation_outbox
+                 where (claimed_by is null or lease_expires_at <= $2)
+                   and (not_before is null or not_before <= $2)
+                   and attempts < $5
+                 order by event_id
+                 limit $4
+                 for update skip locked
+             )
+             update grit_cache_invalidation_outbox event
+             set claimed_by = $1,
+                 claim_token = nextval('grit_cache_outbox_claim_token_seq'),
+                 lease_expires_at = $3,
+                 attempts = event.attempts + 1
+             from candidates
+             where event.event_id = candidates.event_id
+             returning event.event_id, event.repository_pk, event.tenant_id,
+                       event.repository_id, event.event_kind, event.ref_generation,
+                       event.config_generation, event.history_generation,
+                       event.claimed_by, event.claim_token,
+                       event.lease_expires_at, event.attempts",
+        )
+        .bind(&options.worker_id)
+        .bind(options.observed_at)
+        .bind(options.lease_expires_at)
+        .bind(max_events)
+        .bind(max_attempts)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut claims = rows
+            .iter()
+            .map(row_to_cache_outbox_claim)
+            .collect::<Result<Vec<_>>>()?;
+        claims.sort_unstable_by_key(|claim| claim.event.event_id);
+        Ok(claims)
+    }
+
+    /// Acknowledge and remove one owned cache invalidation event.
+    ///
+    /// Worker identity and claim token fence stale workers. Repeating a successful acknowledgement
+    /// returns [`PgCacheOutboxClaimResult::AlreadyAcknowledged`]. `observed_at` is supplied by the
+    /// caller so an expired worker cannot finish work without consulting an implicit clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Backend`] for an invalid claim or SQLx errors from PostgreSQL.
+    pub async fn acknowledge_cache_invalidation(
+        &self,
+        claim: &PgCacheOutboxClaim,
+        observed_at: OffsetDateTime,
+    ) -> Result<PgCacheOutboxClaimResult> {
+        self.finish_cache_outbox_claim(claim, observed_at, PgCacheOutboxFinish::Acknowledge)
+            .await
+    }
+
+    /// Release one owned event for immediate redelivery.
+    ///
+    /// The event remains durable and its attempt count is preserved. Worker identity and claim
+    /// token fence stale workers; repeating a successful release is idempotent. `observed_at` is
+    /// supplied by the caller and must still fall within the claim's lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Backend`] for an invalid claim or SQLx errors from PostgreSQL.
+    pub async fn release_cache_invalidation(
+        &self,
+        claim: &PgCacheOutboxClaim,
+        observed_at: OffsetDateTime,
+    ) -> Result<PgCacheOutboxClaimResult> {
+        self.finish_cache_outbox_claim(claim, observed_at, PgCacheOutboxFinish::Release)
+            .await
+    }
+
+    /// Release one owned event for retry no earlier than a caller-supplied timestamp.
+    ///
+    /// The event remains durable and its attempt count is preserved. The next claim still uses
+    /// its own caller-supplied observation time; PostgreSQL's wall clock is not consulted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Backend`] for an invalid claim or SQLx errors from PostgreSQL.
+    pub async fn retry_cache_invalidation(
+        &self,
+        claim: &PgCacheOutboxClaim,
+        observed_at: OffsetDateTime,
+        not_before: OffsetDateTime,
+    ) -> Result<PgCacheOutboxClaimResult> {
+        if not_before <= observed_at {
+            return Err(Error::Backend(
+                "cache outbox retry time must be after the observed time".to_owned(),
+            ));
+        }
+        self.finish_cache_outbox_claim(claim, observed_at, PgCacheOutboxFinish::Retry(not_before))
+            .await
+    }
+
+    async fn finish_cache_outbox_claim(
+        &self,
+        claim: &PgCacheOutboxClaim,
+        observed_at: OffsetDateTime,
+        finish: PgCacheOutboxFinish,
+    ) -> Result<PgCacheOutboxClaimResult> {
+        validate_cache_outbox_claim(claim)?;
+        if observed_at >= claim.lease_expires_at {
+            return Err(Error::Backend(
+                "cache outbox claim lease has expired".to_owned(),
+            ));
+        }
+        let event_id = i64::try_from(claim.event.event_id)
+            .map_err(|_| Error::Backend("cache outbox event id exceeds i64".to_owned()))?;
+        let claim_token = i64::try_from(claim.claim_token)
+            .map_err(|_| Error::Backend("cache outbox claim token exceeds i64".to_owned()))?;
+        let mut tx = self.pool.begin().await?;
+        let ownership = sqlx::query(
+            "select claimed_by, claim_token, lease_expires_at
+             from grit_cache_invalidation_outbox
+             where event_id = $1
+             for update",
+        )
+        .bind(event_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(ownership) = ownership else {
+            tx.commit().await?;
+            return Ok(PgCacheOutboxClaimResult::AlreadyAcknowledged);
+        };
+        let claimed_by = ownership.try_get::<Option<String>, _>("claimed_by")?;
+        let stored_token = ownership.try_get::<Option<i64>, _>("claim_token")?;
+        let stored_lease = ownership.try_get::<Option<OffsetDateTime>, _>("lease_expires_at")?;
+        if claimed_by.is_none() && stored_token.is_none() {
+            tx.commit().await?;
+            return Ok(PgCacheOutboxClaimResult::AlreadyReleased);
+        }
+        if claimed_by.as_deref() != Some(claim.worker_id.as_str())
+            || stored_token != Some(claim_token)
+            || stored_lease != Some(claim.lease_expires_at)
+            || stored_lease.is_some_and(|lease_expires_at| observed_at >= lease_expires_at)
+        {
+            tx.commit().await?;
+            return Ok(PgCacheOutboxClaimResult::ClaimLost);
+        }
+
+        match finish {
+            PgCacheOutboxFinish::Acknowledge => {
+                sqlx::query(
+                    "delete from grit_cache_invalidation_outbox
+                     where event_id = $1 and claimed_by = $2 and claim_token = $3",
+                )
+                .bind(event_id)
+                .bind(&claim.worker_id)
+                .bind(claim_token)
+                .execute(&mut *tx)
+                .await?;
+            }
+            PgCacheOutboxFinish::Release => {
+                sqlx::query(
+                    "update grit_cache_invalidation_outbox
+                     set claimed_by = null, claim_token = null, lease_expires_at = null,
+                         not_before = null
+                     where event_id = $1 and claimed_by = $2 and claim_token = $3",
+                )
+                .bind(event_id)
+                .bind(&claim.worker_id)
+                .bind(claim_token)
+                .execute(&mut *tx)
+                .await?;
+            }
+            PgCacheOutboxFinish::Retry(not_before) => {
+                sqlx::query(
+                    "update grit_cache_invalidation_outbox
+                     set claimed_by = null, claim_token = null, lease_expires_at = null,
+                         not_before = $4
+                     where event_id = $1 and claimed_by = $2 and claim_token = $3",
+                )
+                .bind(event_id)
+                .bind(&claim.worker_id)
+                .bind(claim_token)
+                .bind(not_before)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(PgCacheOutboxClaimResult::Applied)
     }
 
     /// Read at most one cached summary and validate it against the durable ref generation.
@@ -1800,7 +2173,7 @@ impl PgServerStorage {
              values ($1, $2, $3, now(), now())
              on conflict (tenant_id, repository_id) do nothing
              returning repository_pk, tenant_id, repository_id, hash_algo, ref_generation,
-                       history_generation, created_at, updated_at,
+                       history_generation, config_generation, created_at, updated_at,
                        archived_at, deleted_at",
         )
         .bind(tenant.as_str())
@@ -1832,7 +2205,7 @@ impl PgServerStorage {
     ) -> Result<Option<PgRepositoryRow>> {
         let row = sqlx::query(
             "select repository_pk, tenant_id, repository_id, hash_algo, ref_generation,
-                    history_generation, created_at, updated_at,
+                    history_generation, config_generation, created_at, updated_at,
                     archived_at, deleted_at
              from grit_repositories
              where tenant_id = $1 and repository_id = $2 and deleted_at is null",
@@ -1853,7 +2226,7 @@ impl PgServerStorage {
     pub async fn list_repositories(&self, tenant: &TenantId) -> Result<Vec<PgRepositoryRow>> {
         let rows = sqlx::query(
             "select repository_pk, tenant_id, repository_id, hash_algo, ref_generation,
-                    history_generation, created_at, updated_at,
+                    history_generation, config_generation, created_at, updated_at,
                     archived_at, deleted_at
              from grit_repositories
              where tenant_id = $1 and deleted_at is null
@@ -1902,7 +2275,7 @@ impl PgServerStorage {
              set archived_at = coalesce(archived_at, now()), updated_at = now()
              where tenant_id = $1 and repository_id = $2 and deleted_at is null
              returning repository_pk, tenant_id, repository_id, hash_algo, ref_generation,
-                       history_generation, created_at, updated_at,
+                       history_generation, config_generation, created_at, updated_at,
                        archived_at, deleted_at",
         )
         .bind(tenant.as_str())
@@ -2191,7 +2564,12 @@ impl PgServerStorageTransaction {
     ) -> Result<()> {
         self.bind_repository_scope(tenant, repository)?;
         lock_import_repository(&mut self.tx, tenant, repository).await?;
-        set_config_in_transaction(&mut self.tx, tenant, repository, key, value).await
+        let changed =
+            set_config_in_transaction(&mut self.tx, tenant, repository, key, value).await?;
+        if changed {
+            bump_config_generation_in_transaction(&mut self.tx, tenant, repository).await?;
+        }
+        Ok(())
     }
 
     /// Upsert tree entries within the transaction.
@@ -2295,6 +2673,7 @@ fn row_to_repository(row: &sqlx::postgres::PgRow) -> Result<PgRepositoryRow> {
         .ok_or_else(|| Error::Backend(format!("unknown hash algorithm '{hash_algo}'")))?;
     let ref_generation: i64 = row.try_get("ref_generation")?;
     let history_generation: i64 = row.try_get("history_generation")?;
+    let config_generation: i64 = row.try_get("config_generation")?;
     Ok(PgRepositoryRow {
         repository_pk,
         tenant: TenantId::new(tenant)?,
@@ -2304,6 +2683,8 @@ fn row_to_repository(row: &sqlx::postgres::PgRow) -> Result<PgRepositoryRow> {
             .map_err(|_| Error::Backend("ref generation is negative".to_owned()))?,
         history_generation: u64::try_from(history_generation)
             .map_err(|_| Error::Backend("history generation is negative".to_owned()))?,
+        config_generation: u64::try_from(config_generation)
+            .map_err(|_| Error::Backend("config generation is negative".to_owned()))?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         archived_at: row.try_get("archived_at")?,
@@ -2483,6 +2864,117 @@ fn ref_columns(value: &StoredRef) -> (Option<String>, Option<String>) {
     }
 }
 
+enum PgCacheOutboxFinish {
+    Acknowledge,
+    Release,
+    Retry(OffsetDateTime),
+}
+
+fn validate_cache_outbox_claim_options(options: &PgCacheOutboxClaimOptions) -> Result<()> {
+    if options.worker_id.trim().is_empty() {
+        return Err(Error::Backend(
+            "cache outbox worker identity must not be empty".to_owned(),
+        ));
+    }
+    if options.max_events == 0 || options.max_events > MAX_CACHE_OUTBOX_CLAIM_BATCH {
+        return Err(Error::Backend(format!(
+            "cache outbox batch size must be between 1 and {MAX_CACHE_OUTBOX_CLAIM_BATCH}"
+        )));
+    }
+    if options.max_attempts == 0 || options.max_attempts > i32::MAX as u32 {
+        return Err(Error::Backend(
+            "cache outbox maximum attempts must be between 1 and i32::MAX".to_owned(),
+        ));
+    }
+    if options.lease_expires_at <= options.observed_at {
+        return Err(Error::Backend(
+            "cache outbox lease expiry must be after the observed time".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cache_outbox_claim(claim: &PgCacheOutboxClaim) -> Result<()> {
+    if claim.worker_id.trim().is_empty() {
+        return Err(Error::Backend(
+            "cache outbox worker identity must not be empty".to_owned(),
+        ));
+    }
+    if claim.event.event_id == 0 || claim.claim_token == 0 || claim.attempts == 0 {
+        return Err(Error::Backend(
+            "cache outbox claim identifiers and attempt count must be positive".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn row_to_cache_outbox_claim(row: &sqlx::postgres::PgRow) -> Result<PgCacheOutboxClaim> {
+    let event_id = nonnegative_i64_to_u64(row.try_get("event_id")?, "cache outbox event id")?;
+    if event_id == 0 {
+        return Err(Error::Backend(
+            "cache outbox event id must be positive".to_owned(),
+        ));
+    }
+    let repository_pk = RepositoryPk::try_from(row.try_get::<i64, _>("repository_pk")?)
+        .map_err(|error| Error::Backend(error.to_string()))?;
+    let tenant = TenantId::new(row.try_get::<String, _>("tenant_id")?)?;
+    let repository = RepositoryId::new(row.try_get::<String, _>("repository_id")?)?;
+    let kind_code = row.try_get::<i16, _>("event_kind")?;
+    let ref_generation = row.try_get::<Option<i64>, _>("ref_generation")?;
+    let config_generation = row.try_get::<Option<i64>, _>("config_generation")?;
+    let history_generation = row.try_get::<Option<i64>, _>("history_generation")?;
+    let kind = match (
+        kind_code,
+        ref_generation,
+        config_generation,
+        history_generation,
+    ) {
+        (1, Some(generation), None, None) => PgCacheInvalidationKind::RefGenerationAdvanced {
+            generation: nonnegative_i64_to_u64(generation, "outbox ref generation")?,
+        },
+        (2, None, Some(generation), None) => PgCacheInvalidationKind::ConfigGenerationAdvanced {
+            generation: nonnegative_i64_to_u64(generation, "outbox config generation")?,
+        },
+        (3, None, None, Some(generation)) => PgCacheInvalidationKind::HistoryGenerationAdvanced {
+            generation: nonnegative_i64_to_u64(generation, "outbox history generation")?,
+        },
+        (4, None, None, None) => PgCacheInvalidationKind::RepositoryDeleted,
+        _ => {
+            return Err(Error::Backend(format!(
+                "invalid cache outbox payload for event kind {kind_code}"
+            )));
+        }
+    };
+    let worker_id = row
+        .try_get::<Option<String>, _>("claimed_by")?
+        .ok_or_else(|| Error::Backend("claimed cache outbox row has no worker".to_owned()))?;
+    let claim_token = nonnegative_i64_to_u64(
+        row.try_get::<Option<i64>, _>("claim_token")?
+            .ok_or_else(|| Error::Backend("claimed cache outbox row has no token".to_owned()))?,
+        "cache outbox claim token",
+    )?;
+    let lease_expires_at = row
+        .try_get::<Option<OffsetDateTime>, _>("lease_expires_at")?
+        .ok_or_else(|| Error::Backend("claimed cache outbox row has no lease expiry".to_owned()))?;
+    let attempts = u32::try_from(row.try_get::<i32, _>("attempts")?)
+        .map_err(|_| Error::Backend("cache outbox attempts are negative".to_owned()))?;
+    let claim = PgCacheOutboxClaim {
+        event: PgCacheInvalidationEvent {
+            event_id,
+            repository_pk,
+            tenant,
+            repository,
+            kind,
+        },
+        worker_id,
+        claim_token,
+        lease_expires_at,
+        attempts,
+    };
+    validate_cache_outbox_claim(&claim)?;
+    Ok(claim)
+}
+
 async fn rename_repository_in_transaction(
     tx: &mut Transaction<'static, Postgres>,
     tenant: &TenantId,
@@ -2534,7 +3026,7 @@ async fn rename_repository_in_transaction(
          set repository_id = $3, updated_at = now()
          where tenant_id = $1 and repository_id = $2 and deleted_at is null
          returning repository_pk, tenant_id, repository_id, hash_algo, ref_generation,
-                   history_generation, created_at, updated_at,
+                   history_generation, config_generation, created_at, updated_at,
                    archived_at, deleted_at",
     )
     .bind(tenant.as_str())
@@ -2585,8 +3077,8 @@ async fn delete_repository_in_transaction(
     repository: &RepositoryId,
 ) -> Result<()> {
     lock_repository_name(tx, tenant, repository).await?;
-    let row: Option<i32> = sqlx::query_scalar(
-        "select 1 from grit_repositories
+    let row: Option<i64> = sqlx::query_scalar(
+        "select repository_pk from grit_repositories
          where tenant_id = $1 and repository_id = $2 and deleted_at is null
          for update",
     )
@@ -2594,11 +3086,21 @@ async fn delete_repository_in_transaction(
     .bind(repository.as_str())
     .fetch_optional(&mut **tx)
     .await?;
-    if row.is_none() {
+    let Some(repository_pk) = row else {
         return Err(Error::RepositoryNotFound(repository_key(
             tenant, repository,
         )));
-    }
+    };
+    let repository_pk =
+        RepositoryPk::try_from(repository_pk).map_err(|error| Error::Backend(error.to_string()))?;
+    enqueue_cache_invalidation_in_transaction(
+        tx,
+        repository_pk,
+        tenant,
+        repository,
+        &PgCacheInvalidationKind::RepositoryDeleted,
+    )
+    .await?;
 
     for table in [
         "grit_objects",
@@ -2886,8 +3388,12 @@ async fn publish_import_in_transaction(
         return Err(stale_import_session(tenant, repository, session));
     }
 
+    let mut config_changed = false;
     for (key, value) in &publication.config_entries {
-        set_config_in_transaction(tx, tenant, repository, key, value).await?;
+        config_changed |= set_config_in_transaction(tx, tenant, repository, key, value).await?;
+    }
+    if config_changed {
+        bump_config_generation_in_transaction(tx, tenant, repository).await?;
     }
     let desired_refs = publication
         .refs
@@ -3202,20 +3708,32 @@ async fn bump_ref_generation_in_transaction(
     tenant: &TenantId,
     repository: &RepositoryId,
 ) -> Result<()> {
-    let rows = sqlx::query(
+    let row = sqlx::query(
         "update grit_repositories
          set ref_generation = ref_generation + 1, updated_at = now()
-         where tenant_id = $1 and repository_id = $2 and deleted_at is null",
+         where tenant_id = $1 and repository_id = $2 and deleted_at is null
+         returning repository_pk, ref_generation",
     )
     .bind(tenant.as_str())
     .bind(repository.as_str())
-    .execute(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await?;
-    if rows.rows_affected() != 1 {
+    let Some(row) = row else {
         return Err(Error::RepositoryNotFound(repository_key(
             tenant, repository,
         )));
-    }
+    };
+    let repository_pk = RepositoryPk::try_from(row.try_get::<i64, _>("repository_pk")?)
+        .map_err(|error| Error::Backend(error.to_string()))?;
+    let generation = nonnegative_i64_to_u64(row.try_get("ref_generation")?, "ref generation")?;
+    enqueue_cache_invalidation_in_transaction(
+        tx,
+        repository_pk,
+        tenant,
+        repository,
+        &PgCacheInvalidationKind::RefGenerationAdvanced { generation },
+    )
+    .await?;
     Ok(())
 }
 
@@ -3224,20 +3742,120 @@ async fn bump_history_generation_in_transaction(
     tenant: &TenantId,
     repository: &RepositoryId,
 ) -> Result<()> {
-    let rows = sqlx::query(
+    let row = sqlx::query(
         "update grit_repositories
          set history_generation = history_generation + 1, updated_at = now()
-         where tenant_id = $1 and repository_id = $2 and deleted_at is null",
+         where tenant_id = $1 and repository_id = $2 and deleted_at is null
+         returning repository_pk, history_generation",
     )
     .bind(tenant.as_str())
     .bind(repository.as_str())
-    .execute(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await?;
-    if rows.rows_affected() != 1 {
+    let Some(row) = row else {
         return Err(Error::RepositoryNotFound(repository_key(
             tenant, repository,
         )));
-    }
+    };
+    let repository_pk = RepositoryPk::try_from(row.try_get::<i64, _>("repository_pk")?)
+        .map_err(|error| Error::Backend(error.to_string()))?;
+    let generation =
+        nonnegative_i64_to_u64(row.try_get("history_generation")?, "history generation")?;
+    enqueue_cache_invalidation_in_transaction(
+        tx,
+        repository_pk,
+        tenant,
+        repository,
+        &PgCacheInvalidationKind::HistoryGenerationAdvanced { generation },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn bump_config_generation_in_transaction(
+    tx: &mut Transaction<'static, Postgres>,
+    tenant: &TenantId,
+    repository: &RepositoryId,
+) -> Result<()> {
+    let row = sqlx::query(
+        "update grit_repositories
+         set config_generation = config_generation + 1, updated_at = now()
+         where tenant_id = $1 and repository_id = $2 and deleted_at is null
+         returning repository_pk, config_generation",
+    )
+    .bind(tenant.as_str())
+    .bind(repository.as_str())
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Err(Error::RepositoryNotFound(repository_key(
+            tenant, repository,
+        )));
+    };
+    let repository_pk = RepositoryPk::try_from(row.try_get::<i64, _>("repository_pk")?)
+        .map_err(|error| Error::Backend(error.to_string()))?;
+    let generation =
+        nonnegative_i64_to_u64(row.try_get("config_generation")?, "config generation")?;
+    enqueue_cache_invalidation_in_transaction(
+        tx,
+        repository_pk,
+        tenant,
+        repository,
+        &PgCacheInvalidationKind::ConfigGenerationAdvanced { generation },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn enqueue_cache_invalidation_in_transaction(
+    tx: &mut Transaction<'static, Postgres>,
+    repository_pk: RepositoryPk,
+    tenant: &TenantId,
+    repository: &RepositoryId,
+    kind: &PgCacheInvalidationKind,
+) -> Result<()> {
+    let (kind_code, ref_generation, config_generation, history_generation) = match kind {
+        PgCacheInvalidationKind::RefGenerationAdvanced { generation } => (
+            1_i16,
+            Some(i64::try_from(*generation).map_err(|_| {
+                Error::Backend("cache outbox ref generation exceeds i64".to_owned())
+            })?),
+            None,
+            None,
+        ),
+        PgCacheInvalidationKind::ConfigGenerationAdvanced { generation } => (
+            2_i16,
+            None,
+            Some(i64::try_from(*generation).map_err(|_| {
+                Error::Backend("cache outbox config generation exceeds i64".to_owned())
+            })?),
+            None,
+        ),
+        PgCacheInvalidationKind::HistoryGenerationAdvanced { generation } => (
+            3_i16,
+            None,
+            None,
+            Some(i64::try_from(*generation).map_err(|_| {
+                Error::Backend("cache outbox history generation exceeds i64".to_owned())
+            })?),
+        ),
+        PgCacheInvalidationKind::RepositoryDeleted => (4_i16, None, None, None),
+    };
+    sqlx::query(
+        "insert into grit_cache_invalidation_outbox
+            (repository_pk, tenant_id, repository_id, event_kind,
+             ref_generation, config_generation, history_generation)
+         values ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(repository_pk.get())
+    .bind(tenant.as_str())
+    .bind(repository.as_str())
+    .bind(kind_code)
+    .bind(ref_generation)
+    .bind(config_generation)
+    .bind(history_generation)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
@@ -3300,13 +3918,14 @@ async fn set_config_in_transaction(
     repository: &RepositoryId,
     key: &str,
     value: &str,
-) -> Result<()> {
+) -> Result<bool> {
     lock_import_repository(tx, tenant, repository).await?;
-    sqlx::query(
+    let rows = sqlx::query(
         "insert into grit_config (tenant_id, repository_id, key, value)
          values ($1, $2, $3, $4)
          on conflict (tenant_id, repository_id, key)
-         do update set value = excluded.value",
+         do update set value = excluded.value
+         where grit_config.value is distinct from excluded.value",
     )
     .bind(tenant.as_str())
     .bind(repository.as_str())
@@ -3314,7 +3933,7 @@ async fn set_config_in_transaction(
     .bind(value)
     .execute(&mut **tx)
     .await?;
-    Ok(())
+    Ok(rows.rows_affected() == 1)
 }
 
 async fn upsert_tree_entries_in_transaction(
@@ -4095,7 +4714,10 @@ impl ConfigStore for PgServerStorage {
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         lock_import_repository(&mut tx, tenant, repository).await?;
-        set_config_in_transaction(&mut tx, tenant, repository, key, value).await?;
+        let changed = set_config_in_transaction(&mut tx, tenant, repository, key, value).await?;
+        if changed {
+            bump_config_generation_in_transaction(&mut tx, tenant, repository).await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -4592,6 +5214,64 @@ async fn insert_commit_parent_rows_in_transaction(
     Ok(())
 }
 
+async fn changed_commit_parent_indexes(
+    tx: &mut Transaction<'static, Postgres>,
+    tenant: &TenantId,
+    repository: &RepositoryId,
+    prepared: &[PgCommitRow<'_>],
+    final_row_indexes: &[usize],
+) -> Result<Vec<usize>> {
+    const POSTGRES_BIND_LIMIT: usize = 65_535;
+    const BINDS_PER_ROW: usize = 2;
+    let indexes_by_oid = final_row_indexes
+        .iter()
+        .map(|&index| (prepared[index].commit.oid.to_hex(), index))
+        .collect::<HashMap<_, _>>();
+    let mut changed = Vec::new();
+
+    for indexes in final_row_indexes.chunks((POSTGRES_BIND_LIMIT - BINDS_PER_ROW) / BINDS_PER_ROW) {
+        let mut query = QueryBuilder::<Postgres>::new("with desired(commit_oid, parent_oids) as (");
+        query.push_values(indexes, |mut values, &index| {
+            values
+                .push_bind(prepared[index].commit.oid.to_hex())
+                .push_bind(
+                    prepared[index]
+                        .commit
+                        .parents
+                        .iter()
+                        .map(ObjectId::to_hex)
+                        .collect::<Vec<_>>(),
+                );
+        });
+        query.push(
+            ") select desired.commit_oid
+               from desired
+               where desired.parent_oids is distinct from coalesce(
+                   (select array_agg(parent.parent_oid order by parent.parent_order)
+                    from grit_commit_parents parent
+                    where parent.tenant_id = ",
+        );
+        query
+            .push_bind(tenant.as_str())
+            .push(" and parent.repository_id = ")
+            .push_bind(repository.as_str())
+            .push(
+                " and parent.commit_oid = desired.commit_oid),
+                   array[]::text[])",
+            );
+        let rows = query.build().persistent(false).fetch_all(&mut **tx).await?;
+        for row in rows {
+            let oid: String = row.try_get("commit_oid")?;
+            let index = indexes_by_oid.get(&oid).copied().ok_or_else(|| {
+                Error::Backend("PostgreSQL returned an unrequested commit parent row".to_owned())
+            })?;
+            changed.push(index);
+        }
+    }
+    changed.sort_unstable();
+    Ok(changed)
+}
+
 #[async_trait]
 impl CommitGraphStore for PgServerStorage {
     async fn upsert_commits(
@@ -4615,6 +5295,7 @@ impl CommitGraphStore for PgServerStorage {
 
         let mut tx = self.pool.begin().await?;
         lock_import_repository(&mut tx, tenant, repository).await?;
+        let mut history_changed = false;
         for indexes in final_row_indexes.chunks(POSTGRES_BIND_LIMIT / COMMIT_BINDS_PER_ROW) {
             let mut query = QueryBuilder::<Postgres>::new(
                 "insert into grit_commits
@@ -4634,12 +5315,25 @@ impl CommitGraphStore for PgServerStorage {
                 " on conflict (tenant_id, repository_id, commit_oid)
                   do update set tree_oid = excluded.tree_oid,
                                 commit_time = excluded.commit_time,
-                                generation = excluded.generation",
+                                generation = excluded.generation
+                  where grit_commits.tree_oid is distinct from excluded.tree_oid
+                     or grit_commits.commit_time is distinct from excluded.commit_time
+                     or grit_commits.generation is distinct from excluded.generation",
             );
-            query.build().persistent(false).execute(&mut *tx).await?;
+            let rows = query.build().persistent(false).execute(&mut *tx).await?;
+            history_changed |= rows.rows_affected() > 0;
         }
 
-        for indexes in final_row_indexes.chunks(POSTGRES_BIND_LIMIT - DELETE_FIXED_BINDS) {
+        let changed_parent_indexes = changed_commit_parent_indexes(
+            &mut tx,
+            tenant,
+            repository,
+            &prepared,
+            &final_row_indexes,
+        )
+        .await?;
+        history_changed |= !changed_parent_indexes.is_empty();
+        for indexes in changed_parent_indexes.chunks(POSTGRES_BIND_LIMIT - DELETE_FIXED_BINDS) {
             let mut query = QueryBuilder::<Postgres>::new(
                 "delete from grit_commit_parents
                  where tenant_id = ",
@@ -4660,10 +5354,10 @@ impl CommitGraphStore for PgServerStorage {
         }
 
         let parent_rows_per_chunk = POSTGRES_BIND_LIMIT / PARENT_BINDS_PER_ROW;
-        let estimated_parent_edges = final_row_indexes.len().saturating_mul(2);
+        let estimated_parent_edges = changed_parent_indexes.len().saturating_mul(2);
         let mut parent_edges =
             Vec::with_capacity(parent_rows_per_chunk.min(estimated_parent_edges));
-        for &commit_index in &final_row_indexes {
+        for &commit_index in &changed_parent_indexes {
             for (parent_index, _) in prepared[commit_index].commit.parents.iter().enumerate() {
                 let parent_order = i32::try_from(parent_index)
                     .map_err(|_| Error::Backend("parent order exceeds i32".to_owned()))?;
@@ -4691,7 +5385,7 @@ impl CommitGraphStore for PgServerStorage {
             )
             .await?;
         }
-        if !final_row_indexes.is_empty() {
+        if history_changed {
             bump_history_generation_in_transaction(&mut tx, tenant, repository).await?;
         }
         tx.commit().await?;
