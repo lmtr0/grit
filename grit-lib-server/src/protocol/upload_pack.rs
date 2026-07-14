@@ -6,6 +6,9 @@ use grit_lib::objects::{parse_commit, parse_tag, parse_tree, HashAlgo, ObjectId,
 use grit_lib::pkt_line;
 
 use crate::error::{Error, Result};
+use crate::protocol::clone_metrics::{
+    CloneLimits, CloneMemoryMetrics, CloneMetricsRecorder, CloneMetricsReport, CloneOutcome,
+};
 use crate::repository::ServerRepository;
 use crate::storage::{ServerStorage, StoredRef};
 
@@ -248,6 +251,8 @@ pub struct FetchPackResponse {
     pub wire_response: Vec<u8>,
     /// Whether the pack was side-band-64k framed in [`Self::wire_response`].
     pub sideband: bool,
+    /// Metrics the current service can measure without backend-specific instrumentation.
+    pub metrics: CloneMetricsReport,
 }
 
 /// Upload-pack service bound to one server-backed repository.
@@ -317,8 +322,34 @@ where
     /// Returns [`Error::ObjectNotFound`] for missing wants, or backend/object parsing errors while
     /// computing reachability.
     pub async fn negotiate_fetch(&self, request: UploadPackRequest) -> Result<FetchPackPlan> {
+        self.negotiate_fetch_with_limits(request, CloneLimits::default())
+            .await
+    }
+
+    /// Negotiate a fetch while bounding request and reachability state before it grows.
+    ///
+    /// # Errors
+    ///
+    /// Returns limit, missing-object, backend, or object parsing errors.
+    pub async fn negotiate_fetch_with_limits(
+        &self,
+        request: UploadPackRequest,
+        limits: CloneLimits,
+    ) -> Result<FetchPackPlan> {
+        let limits = limits
+            .validate()
+            .map_err(|error| Error::Protocol(error.to_string()))?;
+        limits
+            .validate_request_shape(request.wants.len(), request.haves.len())
+            .map_err(|error| Error::Protocol(error.to_string()))?;
         let mut seen_wants = HashSet::new();
         let mut wants = Vec::new();
+        seen_wants
+            .try_reserve(request.wants.len())
+            .map_err(|_| Error::Backend("cannot reserve bounded clone wants".to_owned()))?;
+        wants
+            .try_reserve(request.wants.len())
+            .map_err(|_| Error::Backend("cannot reserve bounded clone wants".to_owned()))?;
         for want in &request.wants {
             if !seen_wants.insert(*want) {
                 continue;
@@ -335,9 +366,11 @@ where
         }
 
         let common_haves = self.common_haves(&request.haves).await?;
-        let have_closure = self.reachable_set(&common_haves, true).await?;
+        let have_closure = self
+            .reachable_set(&common_haves, true, limits.max_selected_objects)
+            .await?;
         let objects = self
-            .collect_reachable_excluding(&wants, &have_closure, false)
+            .collect_reachable_excluding(&wants, &have_closure, false, limits.max_selected_objects)
             .await?;
 
         Ok(FetchPackPlan {
@@ -353,32 +386,172 @@ where
     ///
     /// Returns backend, object parsing, compression, hashing, or pkt-line framing errors.
     pub async fn build_fetch_pack(&self, plan: FetchPackPlan) -> Result<FetchPackResponse> {
-        let pack = self.serialize_pack(&plan.objects).await?;
+        let mut recorder = CloneMetricsRecorder::default();
+        self.build_fetch_pack_with_metrics(plan, CloneLimits::default(), &mut recorder)
+            .await
+    }
+
+    /// Build a fetch response under validated limits and extend caller-supplied metrics.
+    ///
+    /// This buffered compatibility path reports selected objects, pack bytes, known non-delta
+    /// shape, and retained encoded/sideband buffers. Backend adapters should populate database,
+    /// external-service, cache, decoded-byte, and caller-timed phase observations. Request and
+    /// selected-object limits are enforced before their corresponding repository traversal;
+    /// because [`ServerRepository::build_pack`] returns one completed buffer, output bytes can only
+    /// be rejected after encoding on this path. Streaming adapters must enforce the remaining
+    /// worker, duration, in-flight byte, spill, coalescing, and concurrency contracts directly.
+    /// The recorder is borrowed so every return path leaves its terminal outcome observable.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, object-count, output-byte, backend, pack, or framing errors.
+    pub async fn build_fetch_pack_with_metrics(
+        &self,
+        plan: FetchPackPlan,
+        limits: CloneLimits,
+        recorder: &mut CloneMetricsRecorder,
+    ) -> Result<FetchPackResponse> {
+        let limits = match limits.validate() {
+            Ok(limits) => limits,
+            Err(error) => {
+                let _ = recorder.finish(CloneOutcome::Rejected);
+                return Err(Error::Protocol(error.to_string()));
+            }
+        };
+        if let Err(error) =
+            limits.validate_request_shape(plan.request.wants.len(), plan.request.haves.len())
+        {
+            let _ = recorder.finish(CloneOutcome::Rejected);
+            return Err(Error::Protocol(error.to_string()));
+        }
+        if plan.objects.len() > limits.max_selected_objects {
+            let _ = recorder.finish(CloneOutcome::Rejected);
+            return Err(Error::Protocol(
+                "clone selection exceeds object limit".to_owned(),
+            ));
+        }
+        let pack = match self.serialize_pack(&plan.objects).await {
+            Ok(pack) => pack,
+            Err(error) => {
+                finish_clone_error(recorder, &error);
+                return Err(error);
+            }
+        };
+        let pack_bytes = match u64::try_from(pack.len()) {
+            Ok(size) => size,
+            Err(_) => {
+                let _ = recorder.finish(CloneOutcome::Rejected);
+                return Err(Error::Protocol(
+                    "clone output size cannot be represented".to_owned(),
+                ));
+            }
+        };
+        if pack_bytes > limits.max_output_bytes {
+            let _ = recorder.finish(CloneOutcome::Rejected);
+            return Err(Error::Protocol(
+                "clone output exceeds byte limit".to_owned(),
+            ));
+        }
         let sideband = plan.request.wants_sideband64k();
         let mut wire_response = Vec::new();
+        let Some(framing_overhead) = pack
+            .len()
+            .checked_div(60_000)
+            .and_then(|chunks| chunks.checked_add(1))
+            .and_then(|chunks| chunks.checked_mul(5))
+            .and_then(|overhead| overhead.checked_add(1_024))
+        else {
+            let _ = recorder.finish(CloneOutcome::Rejected);
+            return Err(Error::Protocol(
+                "clone response size overflows usize".to_owned(),
+            ));
+        };
+        let Some(response_capacity) = pack.len().checked_add(framing_overhead) else {
+            let _ = recorder.finish(CloneOutcome::Rejected);
+            return Err(Error::Protocol(
+                "clone response size overflows usize".to_owned(),
+            ));
+        };
+        if wire_response.try_reserve(response_capacity).is_err() {
+            let _ = recorder.finish(CloneOutcome::Rejected);
+            return Err(Error::Backend(
+                "cannot reserve bounded clone response".to_owned(),
+            ));
+        }
         if let Some(common) = plan.common_haves.last() {
-            pkt_line::write_line(&mut wire_response, &format!("ACK {}", common.to_hex()))?;
+            if let Err(error) =
+                pkt_line::write_line(&mut wire_response, &format!("ACK {}", common.to_hex()))
+            {
+                let error = Error::from(error);
+                finish_clone_error(recorder, &error);
+                return Err(error);
+            }
         } else {
-            pkt_line::write_line(&mut wire_response, "NAK")?;
+            if let Err(error) = pkt_line::write_line(&mut wire_response, "NAK") {
+                let error = Error::from(error);
+                finish_clone_error(recorder, &error);
+                return Err(error);
+            }
         }
         if sideband {
-            pkt_line::write_sideband_channel1_64k(&mut wire_response, &pack)?;
-            pkt_line::write_flush(&mut wire_response)?;
+            if let Err(error) = pkt_line::write_sideband_channel1_64k(&mut wire_response, &pack) {
+                let error = Error::from(error);
+                finish_clone_error(recorder, &error);
+                return Err(error);
+            }
+            if let Err(error) = pkt_line::write_flush(&mut wire_response) {
+                let error = Error::from(error);
+                finish_clone_error(recorder, &error);
+                return Err(error);
+            }
         } else {
             wire_response.extend_from_slice(&pack);
         }
 
+        let selected_objects = match u64::try_from(plan.objects.len()) {
+            Ok(selected) => selected,
+            Err(_) => {
+                let _ = recorder.finish(CloneOutcome::Rejected);
+                return Err(Error::Protocol(
+                    "clone object count cannot be represented".to_owned(),
+                ));
+            }
+        };
+        let response_bytes = match u64::try_from(wire_response.len()) {
+            Ok(size) => size,
+            Err(_) => {
+                let _ = recorder.finish(CloneOutcome::Rejected);
+                return Err(Error::Protocol(
+                    "clone response size cannot be represented".to_owned(),
+                ));
+            }
+        };
+        recorder.record_selected_objects(selected_objects);
+        let _ = recorder.record_pack(pack_bytes, 0, 0);
+        recorder.observe_memory(CloneMemoryMetrics {
+            encoded_bytes: pack_bytes,
+            response_bytes,
+            total_bytes: pack_bytes.saturating_add(response_bytes),
+            ..CloneMemoryMetrics::default()
+        });
+        let metrics = recorder.finish(CloneOutcome::Success);
         Ok(FetchPackResponse {
             plan,
             pack,
             wire_response,
             sideband,
+            metrics,
         })
     }
 
     async fn common_haves(&self, haves: &[ObjectId]) -> Result<Vec<ObjectId>> {
         let mut seen = HashSet::new();
         let mut common = Vec::new();
+        seen.try_reserve(haves.len())
+            .map_err(|_| Error::Backend("cannot reserve bounded clone haves".to_owned()))?;
+        common
+            .try_reserve(haves.len())
+            .map_err(|_| Error::Backend("cannot reserve bounded clone haves".to_owned()))?;
         for have in haves {
             if !seen.insert(*have) {
                 continue;
@@ -397,12 +570,17 @@ where
         &self,
         roots: &[ObjectId],
         skip_missing: bool,
+        max_objects: usize,
     ) -> Result<HashSet<ObjectId>> {
-        Ok(self
-            .collect_reachable_excluding(roots, &HashSet::new(), skip_missing)
-            .await?
-            .into_iter()
-            .collect())
+        let objects = self
+            .collect_reachable_excluding(roots, &HashSet::new(), skip_missing, max_objects)
+            .await?;
+        let mut reachable = HashSet::new();
+        reachable
+            .try_reserve(objects.len())
+            .map_err(|_| Error::Backend("cannot reserve bounded clone closure".to_owned()))?;
+        reachable.extend(objects);
+        Ok(reachable)
     }
 
     async fn collect_reachable_excluding(
@@ -410,12 +588,30 @@ where
         roots: &[ObjectId],
         exclude: &HashSet<ObjectId>,
         skip_missing: bool,
+        max_objects: usize,
     ) -> Result<Vec<ObjectId>> {
         let mut visited = HashSet::new();
         let mut ordered = Vec::new();
         let mut queue = VecDeque::new();
+        let initial_capacity = roots.len().min(max_objects);
+        visited
+            .try_reserve(initial_capacity)
+            .map_err(|_| Error::Backend("cannot reserve bounded clone closure".to_owned()))?;
+        ordered
+            .try_reserve(initial_capacity)
+            .map_err(|_| Error::Backend("cannot reserve bounded clone closure".to_owned()))?;
+        queue
+            .try_reserve(initial_capacity)
+            .map_err(|_| Error::Backend("cannot reserve bounded clone closure".to_owned()))?;
         for root in roots {
-            enqueue(*root, exclude, &mut visited, &mut ordered, &mut queue);
+            enqueue(
+                *root,
+                exclude,
+                &mut visited,
+                &mut ordered,
+                &mut queue,
+                max_objects,
+            )?;
         }
 
         while let Some(oid) = queue.pop_front() {
@@ -429,20 +625,48 @@ where
                 ObjectKind::Commit => {
                     let commit = parse_commit(&object.data)?;
                     for parent in commit.parents {
-                        enqueue(parent, exclude, &mut visited, &mut ordered, &mut queue);
+                        enqueue(
+                            parent,
+                            exclude,
+                            &mut visited,
+                            &mut ordered,
+                            &mut queue,
+                            max_objects,
+                        )?;
                     }
-                    enqueue(commit.tree, exclude, &mut visited, &mut ordered, &mut queue);
+                    enqueue(
+                        commit.tree,
+                        exclude,
+                        &mut visited,
+                        &mut ordered,
+                        &mut queue,
+                        max_objects,
+                    )?;
                 }
                 ObjectKind::Tree => {
                     for entry in parse_tree(&object.data)? {
                         if entry.mode != 0o160000 {
-                            enqueue(entry.oid, exclude, &mut visited, &mut ordered, &mut queue);
+                            enqueue(
+                                entry.oid,
+                                exclude,
+                                &mut visited,
+                                &mut ordered,
+                                &mut queue,
+                                max_objects,
+                            )?;
                         }
                     }
                 }
                 ObjectKind::Tag => {
                     let tag = parse_tag(&object.data)?;
-                    enqueue(tag.object, exclude, &mut visited, &mut ordered, &mut queue);
+                    enqueue(
+                        tag.object,
+                        exclude,
+                        &mut visited,
+                        &mut ordered,
+                        &mut queue,
+                        max_objects,
+                    )?;
                 }
                 ObjectKind::Blob => {}
             }
@@ -514,12 +738,40 @@ fn enqueue(
     visited: &mut HashSet<ObjectId>,
     ordered: &mut Vec<ObjectId>,
     queue: &mut VecDeque<ObjectId>,
-) {
+    max_objects: usize,
+) -> Result<()> {
     if exclude.contains(&oid) {
-        return;
+        return Ok(());
     }
-    if visited.insert(oid) {
-        ordered.push(oid);
-        queue.push_back(oid);
+    if visited.contains(&oid) {
+        return Ok(());
     }
+    if ordered.len() >= max_objects {
+        return Err(Error::Protocol(
+            "clone selection exceeds object limit".to_owned(),
+        ));
+    }
+    visited
+        .try_reserve(1)
+        .map_err(|_| Error::Backend("cannot grow bounded clone closure".to_owned()))?;
+    ordered
+        .try_reserve(1)
+        .map_err(|_| Error::Backend("cannot grow bounded clone closure".to_owned()))?;
+    queue
+        .try_reserve(1)
+        .map_err(|_| Error::Backend("cannot grow bounded clone closure".to_owned()))?;
+    visited.insert(oid);
+    ordered.push(oid);
+    queue.push_back(oid);
+    Ok(())
+}
+
+fn finish_clone_error(recorder: &mut CloneMetricsRecorder, error: &Error) {
+    let outcome = match error {
+        Error::Backend(_) | Error::ObjectNotFound(_) | Error::RepositoryNotFound(_) => {
+            CloneOutcome::BackendFailure
+        }
+        _ => CloneOutcome::ProtocolFailure,
+    };
+    let _ = recorder.finish(outcome);
 }

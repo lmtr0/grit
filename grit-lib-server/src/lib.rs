@@ -77,6 +77,12 @@ pub mod prelude {
         NoAuthorization, NoopAuditSink, PolicyActor, PolicyDecision, PolicyRefUpdate,
         RefUpdatePolicyContext, RepositoryPermission, RepositoryPolicy,
     };
+    pub use crate::protocol::clone_metrics::{
+        CloneBackendKind, CloneBackendMetrics, CloneCacheMetrics, CloneCancellationMetrics,
+        CloneLimitError, CloneLimits, CloneMemoryMetrics, CloneMetricsRecorder, CloneMetricsReport,
+        CloneObjectKindMetrics, CloneObjectMetrics, CloneOutcome, ClonePackMetrics, ClonePhase,
+        ClonePhaseMetrics,
+    };
     pub use crate::protocol::receive_pack::{
         AllowAllPushPolicy, ProtectedRefPolicy, PushCommandKind, PushCommandStatus, PushPlan,
         PushPolicy, PushPolicyContext, QuarantinedObject, ReceivePackAdvertisedRef,
