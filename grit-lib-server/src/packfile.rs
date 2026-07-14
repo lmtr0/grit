@@ -274,7 +274,7 @@ fn object_kind_from_pack_type(type_code: u8) -> Result<ObjectKind> {
     }
 }
 
-fn pack_type_code(kind: ObjectKind) -> u8 {
+pub(crate) fn pack_type_code(kind: ObjectKind) -> u8 {
     match kind {
         ObjectKind::Commit => 1,
         ObjectKind::Tree => 2,
@@ -283,7 +283,7 @@ fn pack_type_code(kind: ObjectKind) -> u8 {
     }
 }
 
-fn encode_pack_object_header(buf: &mut Vec<u8>, type_code: u8, payload_len: usize) {
+pub(crate) fn encode_pack_object_header(buf: &mut Vec<u8>, type_code: u8, payload_len: usize) {
     let mut size = payload_len;
     let first = ((type_code & 0x7) << 4) | (size & 0x0f) as u8;
     size >>= 4;

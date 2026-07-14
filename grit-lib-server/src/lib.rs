@@ -88,6 +88,10 @@ pub mod prelude {
         PackAbortReason, PackCancellationToken, PackChunkSink, PackSinkOperation, PackSinkState,
         PackStreamError, PackStreamLimits, PackStreamReport,
     };
+    pub use crate::protocol::pack_writer::{
+        IncrementalPackWriter, PackObjectWriteReport, PackWriterError, PackWriterFailure,
+        PackWriterReport, PackWriterState,
+    };
     pub use crate::protocol::receive_pack::{
         AllowAllPushPolicy, ProtectedRefPolicy, PushCommandKind, PushCommandStatus, PushPlan,
         PushPolicy, PushPolicyContext, QuarantinedObject, ReceivePackAdvertisedRef,
@@ -96,7 +100,8 @@ pub mod prelude {
     };
     pub use crate::protocol::upload_pack::{
         AdvertisedRef, FetchPackPlan, FetchPackResponse, GitProtocolVersion, RefAdvertisement,
-        UploadPackCapability, UploadPackRequest, UploadPackService,
+        UploadPackCapability, UploadPackRequest, UploadPackService, UploadPackStreamFailure,
+        UploadPackStreamPreflightError, UploadPackStreamReport,
     };
     #[cfg(feature = "redis")]
     pub use crate::redis_cache::{RedisCache, RedisCacheOptions};

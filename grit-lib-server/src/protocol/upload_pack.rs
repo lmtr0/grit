@@ -7,7 +7,14 @@ use grit_lib::pkt_line;
 
 use crate::error::{Error, Result};
 use crate::protocol::clone_metrics::{
-    CloneLimits, CloneMemoryMetrics, CloneMetricsRecorder, CloneMetricsReport, CloneOutcome,
+    CloneLimitError, CloneLimits, CloneMemoryMetrics, CloneMetricsRecorder, CloneMetricsReport,
+    CloneOutcome,
+};
+use crate::protocol::pack_stream::{
+    CancellationProbe, PackAbortReason, PackChunkSink, PackStreamError, PackStreamLimits,
+};
+use crate::protocol::pack_writer::{
+    IncrementalPackWriter, PackWriterError, PackWriterFailure, PackWriterReport,
 };
 use crate::repository::ServerRepository;
 use crate::storage::{ServerStorage, StoredRef};
@@ -253,6 +260,58 @@ pub struct FetchPackResponse {
     pub sideband: bool,
     /// Metrics the current service can measure without backend-specific instrumentation.
     pub metrics: CloneMetricsReport,
+}
+
+/// Successful raw incremental PACK response report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UploadPackStreamReport {
+    /// Writer, sink, memory, and cancellation counters.
+    pub writer: PackWriterReport,
+    /// Clone metrics populated by generic upload-pack and caller adapters.
+    pub metrics: CloneMetricsReport,
+}
+
+/// Preflight rejection raised before the PACK header is sent.
+#[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum UploadPackStreamPreflightError {
+    /// Clone execution limits are invalid.
+    #[error("invalid clone streaming limits: {0}")]
+    CloneLimits(CloneLimitError),
+    /// Pack stream limits are invalid.
+    #[error("invalid pack stream limits: {0}")]
+    StreamLimits(PackStreamError),
+    /// Wants or haves exceed the validated request shape.
+    #[error("clone request exceeds want/have limits")]
+    RequestShape,
+    /// Planned closure exceeds the validated selection limit.
+    #[error("clone plan exceeds selected-object limit")]
+    SelectedObjects,
+    /// Planned closure cannot be represented by PACK v2.
+    #[error("clone plan object count exceeds u32")]
+    ObjectCount,
+    /// Validated inputs could not construct the writer.
+    #[error("incremental pack writer configuration failed: {0}")]
+    WriterConfiguration(PackWriterError),
+}
+
+/// Raw streaming failure with post-start counters preserved.
+#[derive(Debug, thiserror::Error)]
+pub enum UploadPackStreamFailure {
+    /// Validation failed before response bytes were sent.
+    #[error(transparent)]
+    Preflight(#[from] UploadPackStreamPreflightError),
+    /// Incremental encoding, cancellation, limit, or sink failure.
+    #[error(transparent)]
+    Writer(#[from] PackWriterFailure),
+    /// An object read failed after the header was emitted.
+    #[error("upload-pack backend read failed")]
+    Backend {
+        /// Original storage error retained for internal handling.
+        #[source]
+        source: Error,
+        /// Writer and sink state after best-effort abort.
+        report: PackWriterReport,
+    },
 }
 
 /// Upload-pack service bound to one server-backed repository.
@@ -544,6 +603,129 @@ where
         })
     }
 
+    /// Stream a raw non-delta PACK v2 for a validated fetch plan.
+    ///
+    /// Objects are read and emitted in the deterministic order stored by [`FetchPackPlan`]. The
+    /// method retains at most the current decoded object and one bounded compressed chunk; it does
+    /// not sideband-frame the raw PACK. Generic storage does not expose DB/S3/cache counters, so
+    /// callers should seed `recorder` with adapter observations they can measure honestly.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed preflight errors before output, or a failure retaining writer counters after
+    /// best-effort abort when reads, compression, cancellation, limits, or the sink fail. The
+    /// borrowed recorder is finalized on every return path, including partial-output failures.
+    pub async fn stream_raw_fetch_pack<P: CancellationProbe>(
+        &self,
+        plan: FetchPackPlan,
+        sink: &mut dyn PackChunkSink,
+        clone_limits: CloneLimits,
+        stream_limits: PackStreamLimits,
+        cancellation: P,
+        recorder: &mut CloneMetricsRecorder,
+    ) -> std::result::Result<UploadPackStreamReport, UploadPackStreamFailure> {
+        let clone_limits = match clone_limits.validate() {
+            Ok(limits) => limits,
+            Err(error) => {
+                return Err(finish_stream_preflight(
+                    recorder,
+                    UploadPackStreamPreflightError::CloneLimits(error),
+                ));
+            }
+        };
+        let stream_limits = match stream_limits.validate() {
+            Ok(limits) => limits,
+            Err(error) => {
+                return Err(finish_stream_preflight(
+                    recorder,
+                    UploadPackStreamPreflightError::StreamLimits(error),
+                ));
+            }
+        };
+        if clone_limits
+            .validate_request_shape(plan.request.wants.len(), plan.request.haves.len())
+            .is_err()
+        {
+            return Err(finish_stream_preflight(
+                recorder,
+                UploadPackStreamPreflightError::RequestShape,
+            ));
+        }
+        if plan.objects.len() > clone_limits.max_selected_objects {
+            return Err(finish_stream_preflight(
+                recorder,
+                UploadPackStreamPreflightError::SelectedObjects,
+            ));
+        }
+        if u32::try_from(plan.objects.len()).is_err() {
+            return Err(finish_stream_preflight(
+                recorder,
+                UploadPackStreamPreflightError::ObjectCount,
+            ));
+        }
+
+        let mut writer = match IncrementalPackWriter::new(
+            sink,
+            plan.objects.len(),
+            self.repo.hash_algo(),
+            stream_limits,
+            clone_limits,
+            cancellation,
+        ) {
+            Ok(writer) => writer,
+            Err(error) => {
+                return Err(finish_stream_preflight(
+                    recorder,
+                    UploadPackStreamPreflightError::WriterConfiguration(error),
+                ));
+            }
+        };
+        if let Err(failure) = writer.start().await {
+            finish_stream_writer_failure(recorder, &failure);
+            return Err(UploadPackStreamFailure::Writer(failure));
+        }
+        for oid in &plan.objects {
+            if let Err(failure) = writer.checkpoint_before_read().await {
+                finish_stream_writer_failure(recorder, &failure);
+                return Err(UploadPackStreamFailure::Writer(failure));
+            }
+            let object = match self.repo.read_object(oid).await {
+                Ok(Some(object)) => object,
+                Ok(None) => {
+                    let report = writer.abort(PackAbortReason::BackendFailure).await;
+                    finish_stream_backend_failure(recorder, &report);
+                    return Err(UploadPackStreamFailure::Backend {
+                        source: Error::ObjectNotFound(oid.to_hex()),
+                        report,
+                    });
+                }
+                Err(source) => {
+                    let report = writer.abort(PackAbortReason::BackendFailure).await;
+                    finish_stream_backend_failure(recorder, &report);
+                    return Err(UploadPackStreamFailure::Backend { source, report });
+                }
+            };
+            let entry = match writer.write_object(&object).await {
+                Ok(entry) => entry,
+                Err(failure) => {
+                    finish_stream_writer_failure(recorder, &failure);
+                    return Err(UploadPackStreamFailure::Writer(failure));
+                }
+            };
+            recorder.record_objects(entry.kind, 1, entry.decoded_bytes, entry.compressed_bytes);
+        }
+        let writer = match writer.finish().await {
+            Ok(report) => report,
+            Err(failure) => {
+                finish_stream_writer_failure(recorder, &failure);
+                return Err(UploadPackStreamFailure::Writer(failure));
+            }
+        };
+        record_stream_metrics(recorder, &writer);
+        let metrics = recorder.finish(CloneOutcome::Success);
+        Ok(UploadPackStreamReport { writer, metrics })
+    }
+
     async fn common_haves(&self, haves: &[ObjectId]) -> Result<Vec<ObjectId>> {
         let mut seen = HashSet::new();
         let mut common = Vec::new();
@@ -774,4 +956,48 @@ fn finish_clone_error(recorder: &mut CloneMetricsRecorder, error: &Error) {
         _ => CloneOutcome::ProtocolFailure,
     };
     let _ = recorder.finish(outcome);
+}
+
+fn finish_stream_preflight(
+    recorder: &mut CloneMetricsRecorder,
+    error: UploadPackStreamPreflightError,
+) -> UploadPackStreamFailure {
+    let _ = recorder.finish(CloneOutcome::Rejected);
+    UploadPackStreamFailure::Preflight(error)
+}
+
+fn finish_stream_writer_failure(recorder: &mut CloneMetricsRecorder, failure: &PackWriterFailure) {
+    record_stream_metrics(recorder, &failure.report);
+    let outcome = match failure.error {
+        PackWriterError::Cancelled => CloneOutcome::Cancelled,
+        PackWriterError::ObjectCount
+        | PackWriterError::InvalidLimits
+        | PackWriterError::TooManyObjects
+        | PackWriterError::ObjectCountMismatch
+        | PackWriterError::OutputLimit => CloneOutcome::Rejected,
+        PackWriterError::InvalidState(_)
+        | PackWriterError::ByteOverflow
+        | PackWriterError::Allocation
+        | PackWriterError::Compression
+        | PackWriterError::Sink(_) => CloneOutcome::ProtocolFailure,
+    };
+    let _ = recorder.finish(outcome);
+}
+
+fn finish_stream_backend_failure(recorder: &mut CloneMetricsRecorder, report: &PackWriterReport) {
+    record_stream_metrics(recorder, report);
+    let _ = recorder.finish(CloneOutcome::BackendFailure);
+}
+
+fn record_stream_metrics(recorder: &mut CloneMetricsRecorder, writer: &PackWriterReport) {
+    recorder.record_selected_objects(u64::from(writer.planned_objects));
+    let _ = recorder.record_pack(writer.stream.emitted_bytes, 0, 0);
+    recorder.observe_memory(CloneMemoryMetrics {
+        decoded_bytes: writer.peak_decoded_object_bytes,
+        encoded_bytes: writer.peak_compressed_chunk_bytes,
+        total_bytes: writer
+            .peak_decoded_object_bytes
+            .saturating_add(writer.peak_compressed_chunk_bytes),
+        ..CloneMemoryMetrics::default()
+    });
 }
