@@ -10,6 +10,7 @@ pub mod pack_entry_reuse;
 pub mod pack_stream;
 pub mod pack_writer;
 pub mod push_metrics;
+pub mod push_quarantine;
 pub mod receive_pack;
 pub mod receive_pack_stream;
 pub mod upload_pack;

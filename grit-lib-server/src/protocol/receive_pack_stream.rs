@@ -8,7 +8,7 @@
 use std::collections::VecDeque;
 
 use async_trait::async_trait;
-use grit_lib::objects::HashAlgo;
+use grit_lib::objects::{HashAlgo, ObjectId};
 use sha1::{Digest as Sha1Digest, Sha1};
 use sha2::{Digest as Sha2Digest, Sha256};
 use time::{Duration, OffsetDateTime};
@@ -379,6 +379,8 @@ pub struct ReceivePackStreamReport {
     pub pack_bytes: u64,
     /// Declared PACK object count, or zero for a no-pack request.
     pub declared_objects: u32,
+    /// Verified PACK body checksum and trailer, or `None` for a no-pack request.
+    pub pack_checksum: Option<ObjectId>,
     /// Whether the request carried no PACK body.
     pub empty: bool,
 }
@@ -683,7 +685,7 @@ impl ReceivePackChunkSink for BoundedReceivePackCollector {
     }
 
     async fn abort(&mut self, _reason: ReceivePackAbortReason) {
-        self.bytes.clear();
+        self.bytes = Vec::new();
         self.state = CollectorState::Aborted;
     }
 }
@@ -825,9 +827,12 @@ impl PackPrefixValidator {
         if !expected.iter().copied().eq(self.trailer) {
             return Err(ReceivePackStreamError::Checksum);
         }
+        let pack_checksum =
+            ObjectId::from_bytes(&expected).map_err(|_| ReceivePackStreamError::Checksum)?;
         Ok(ReceivePackStreamReport {
             pack_bytes,
             declared_objects: self.declared_objects.unwrap_or_default(),
+            pack_checksum: Some(pack_checksum),
             empty: false,
         })
     }
