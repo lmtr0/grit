@@ -132,6 +132,12 @@ pub mod prelude {
         IncrementalPackWriter, PackObjectWriteReport, PackWriterError, PackWriterFailure,
         PackWriterReport, PackWriterState,
     };
+    pub use crate::protocol::push_fix_thin::{
+        plan_fix_thin_pack, rewrite_fix_thin_pack, AuthorizedThinBase, AuthorizedThinBaseProvider,
+        FixThinBase, FixThinControl, FixThinError, FixThinObservation, FixThinOptions, FixThinPlan,
+        FixThinReport, FixThinWork, FixThinWorkLimit, FixedThinPack, ThinBaseAuthorization,
+        ThinBaseSourceError,
+    };
     pub use crate::protocol::push_metrics::{
         PushBackendFailureReason, PushBackendMetrics, PushCancellationReason, PushMemoryMetrics,
         PushMetricCounter, PushMetricsError, PushMetricsRecorder, PushMetricsReport, PushOutcome,
